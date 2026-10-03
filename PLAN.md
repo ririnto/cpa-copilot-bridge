@@ -11,7 +11,9 @@ Provide opt-in Codex summary compaction with authenticated replay when the upstr
 
 The project owns its source, tests, documentation, configuration examples, and local build artifacts.
 The existing CLIProxyAPI checkout and running proxy configuration are reference inputs.
-Remote publication, production installation, and account login are outside this delivery.
+Private repository publication, issue and pull request delivery, and merging into `main` are authorized.
+An isolated account login is authorized and keeps auth storage outside the checkout.
+Production installation remains outside this delivery.
 
 ## Design
 
@@ -20,13 +22,15 @@ Use the official v8 SDK and native C ABI.
 Own upstream execution to avoid Codex-specific ID and encrypted-content sanitizers.
 Choose endpoints from provider model capabilities and explicit protocol overrides.
 Preserve native same-format traffic and use scoped translation for cross-format traffic.
-Keep reasoning replay scoped to endpoint, model, credential, and conversation history.
+Keep reasoning replay scoped to endpoint, model, credential, session, agent, and exact tool calls.
 
 ## Owners
 
 Main owns integration, configuration, build tooling, commits, documentation, and acceptance evidence.
 Delegates inspect the existing plugin, SDK hook contracts, and client protocol requirements.
 Implementation assignments give each package one writer.
+The working branch is `codex/copilot-protocol-compat` and the target branch is `main`.
+Use current branch changes and upstream release tags as durable review references.
 
 ## Delivery Units
 
@@ -50,4 +54,12 @@ Report live-provider behavior as unverified unless a real provider call is expli
 
 - Imported upstream v0.3.3, preserving its MIT license.
 - Adapted module and SDK references to CLIProxyAPI v8.0.13.
-- Protocol and client contract investigations are in progress.
+- Implemented native protocol preservation, reversible Claude carriers, scoped reasoning replay, and optional compaction.
+- Replaced Makefile tooling with module-managed Task and set Go 1.26.8 as the supported minimum.
+- Verified native loading and Responses, Messages, and Chat Completions requests with a disposable v8 host.
+- Completed GitHub device login through the isolated proxy with private auth storage outside the checkout.
+- Passed formatting, race tests, vet, and native builds on Go 1.26.8.
+- Passed eight native host integration cases, including missing-ID restoration, cancellation, and both compaction routes.
+- Completed independent pull request review with no confirmed blockers.
+- Recorded downstream tool identifier limits as follow-up issue #5.
+- Ready for pull request integration into `main`.

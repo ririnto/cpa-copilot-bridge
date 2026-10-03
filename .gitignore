@@ -1,6 +1,10 @@
 /build/
 /.runtime/
 /plugins/
+/auths/
+/config.yaml
+/.env
+/.env.*
 *.dylib
 *.so
 *.dll

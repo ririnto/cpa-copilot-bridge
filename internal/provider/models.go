@@ -64,11 +64,12 @@ type modelLimits struct {
 }
 
 type modelCacheEntry struct {
-	Fingerprint string
-	APIBaseURL  string
-	ExpiresAt   time.Time
-	Models      []upstreamModel
-	ByID        map[string]upstreamModel
+	Fingerprint      string
+	APIBaseURL       string
+	ConfigGeneration uint64
+	ExpiresAt        time.Time
+	Models           []upstreamModel
+	ByID             map[string]upstreamModel
 }
 
 func (s *Service) StaticModels() pluginapi.ModelResponse {
@@ -102,7 +103,7 @@ func (s *Service) models(ctx context.Context, callbackID, authID string, storage
 		s.modelMu.Lock()
 		cached, ok := s.modelEntries[key]
 		s.modelMu.Unlock()
-		if ok && cached.Fingerprint == fingerprint && cached.APIBaseURL == token.APIBaseURL && cached.ExpiresAt.After(now) {
+		if ok && cached.Fingerprint == fingerprint && cached.APIBaseURL == token.APIBaseURL && cached.ConfigGeneration == token.ConfigGeneration && cached.ExpiresAt.After(now) {
 			return cloneUpstreamModels(cached.Models), token, nil
 		}
 	}
@@ -137,7 +138,11 @@ func (s *Service) models(ctx context.Context, callbackID, authID string, storage
 	if errUnmarshal := json.Unmarshal(resp.Body, &list); errUnmarshal != nil {
 		return nil, copilotTokenEntry{}, fmt.Errorf("decode Copilot models response: %w", errUnmarshal)
 	}
-	cleaned := filterModels(normalizeModels(list.Data), s.Config().ExcludedModelPrefixes)
+	cfg, generation := s.configSnapshot()
+	if generation != token.ConfigGeneration {
+		return nil, copilotTokenEntry{}, fmt.Errorf("Copilot configuration changed during model discovery")
+	}
+	cleaned := filterModels(normalizeModels(list.Data), cfg.ExcludedModelPrefixes)
 	if len(cleaned) == 0 {
 		return nil, copilotTokenEntry{}, fmt.Errorf("Copilot models endpoint returned no usable models")
 	}
@@ -146,49 +151,54 @@ func (s *Service) models(ctx context.Context, callbackID, authID string, storage
 	for _, model := range cleaned {
 		byID[strings.ToLower(model.ID)] = model
 	}
+	s.configMu.RLock()
+	if s.configGeneration != token.ConfigGeneration {
+		s.configMu.RUnlock()
+		return nil, copilotTokenEntry{}, fmt.Errorf("Copilot configuration changed during model discovery")
+	}
 	s.modelMu.Lock()
 	s.modelEntries[key] = modelCacheEntry{
-		Fingerprint: fingerprint,
-		APIBaseURL:  token.APIBaseURL,
-		ExpiresAt:   now.Add(s.Config().modelCacheTTL()),
-		Models:      cloneUpstreamModels(cleaned),
-		ByID:        byID,
+		Fingerprint:      fingerprint,
+		APIBaseURL:       token.APIBaseURL,
+		ConfigGeneration: token.ConfigGeneration,
+		ExpiresAt:        now.Add(cfg.modelCacheTTL()),
+		Models:           cloneUpstreamModels(cleaned),
+		ByID:             byID,
 	}
 	s.modelMu.Unlock()
+	s.configMu.RUnlock()
 	return cleaned, token, nil
 }
 
-func (s *Service) endpointForModel(ctx context.Context, callbackID, authID string, storage authStorage, modelID string) (string, copilotTokenEntry, error) {
+func (s *Service) endpointForModel(ctx context.Context, callbackID, authID string, storage authStorage, modelID, sourceFormat string) (string, copilotTokenEntry, error) {
 	modelID = strings.TrimSpace(modelID)
 	if modelID == "" {
 		return "", copilotTokenEntry{}, statusError("invalid_request", "model is required", http.StatusBadRequest)
 	}
+	if endpoint := s.endpointOverride(modelID); endpoint != "" {
+		token, errToken := s.copilotToken(ctx, callbackID, authID, storage)
+		return endpoint, token, errToken
+	}
 	models, token, errModels := s.models(ctx, callbackID, authID, storage, false)
 	if errModels != nil {
-		if endpoint, ok := specialResponsesModel(modelID); ok {
-			token, errToken := s.copilotToken(ctx, callbackID, authID, storage)
-			return endpoint, token, errToken
-		}
 		return "", copilotTokenEntry{}, errModels
 	}
 	for _, model := range models {
 		if strings.EqualFold(model.ID, modelID) {
-			endpoint, errEndpoint := selectEndpoint(model)
+			endpoint, errEndpoint := selectEndpoint(model, sourceFormat)
 			return endpoint, token, errEndpoint
 		}
-	}
-	if endpoint, ok := specialResponsesModel(modelID); ok {
-		return endpoint, token, nil
 	}
 	return "", token, statusError("model_not_found", "Copilot model is not present in the authenticated model catalog", http.StatusNotFound)
 }
 
-func selectEndpoint(model upstreamModel) (string, error) {
-	if endpoint, ok := specialResponsesModel(model.ID); ok {
-		return endpoint, nil
-	}
+func (s *Service) endpointOverride(modelID string) string {
+	return s.Config().ModelEndpointOverrides[strings.ToLower(strings.TrimSpace(modelID))]
+}
+
+func selectEndpoint(model upstreamModel, sourceFormat string) (string, error) {
 	endpoints := normalizeEndpoints(model.SupportedEndpoints)
-	for _, preferred := range []string{translate.EndpointResponses, translate.EndpointChatCompletions, translate.EndpointMessages} {
+	for _, preferred := range endpointPreferences(sourceFormat) {
 		for _, endpoint := range endpoints {
 			if endpoint == preferred {
 				return preferred, nil
@@ -198,12 +208,14 @@ func selectEndpoint(model upstreamModel) (string, error) {
 	return "", statusError("unsupported_model_endpoint", "Copilot model exposes no supported chat endpoint", http.StatusUnprocessableEntity)
 }
 
-func specialResponsesModel(modelID string) (string, bool) {
-	switch strings.ToLower(strings.TrimSpace(modelID)) {
-	case "gpt-5.6-sol", "gpt-5.6-terra":
-		return translate.EndpointResponses, true
+func endpointPreferences(sourceFormat string) []string {
+	switch normalizeRequestFormat(sourceFormat) {
+	case "claude":
+		return []string{translate.EndpointMessages, translate.EndpointResponses, translate.EndpointChatCompletions}
+	case "openai":
+		return []string{translate.EndpointChatCompletions, translate.EndpointResponses, translate.EndpointMessages}
 	default:
-		return "", false
+		return []string{translate.EndpointResponses, translate.EndpointChatCompletions, translate.EndpointMessages}
 	}
 }
 
@@ -225,9 +237,6 @@ func normalizeModels(models []upstreamModel) []upstreamModel {
 		model.Version = strings.TrimSpace(model.Version)
 		model.Object = strings.TrimSpace(model.Object)
 		model.SupportedEndpoints = normalizeEndpoints(model.SupportedEndpoints)
-		if endpoint, ok := specialResponsesModel(model.ID); ok && !contains(model.SupportedEndpoints, endpoint) {
-			model.SupportedEndpoints = append(model.SupportedEndpoints, endpoint)
-		}
 		out = append(out, model)
 	}
 	sort.SliceStable(out, func(i, j int) bool {

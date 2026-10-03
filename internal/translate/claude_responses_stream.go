@@ -16,14 +16,19 @@ type responsesClaudeStreamState struct {
 }
 
 type responsesClaudeBlock struct {
-	Index        int
-	Kind         string
-	Open         bool
-	SawDelta     bool
-	Accumulated  string
-	Encrypted    string
-	FunctionID   string
-	FunctionName string
+	Index           int
+	Kind            string
+	Open            bool
+	SawDelta        bool
+	Accumulated     string
+	TextAccumulated string
+	SignatureSent   bool
+	RedactedSent    bool
+	Encrypted       string
+	FunctionID      string
+	FunctionItemID  string
+	FunctionCallID  string
+	FunctionName    string
 }
 
 func responsesStreamToClaude(model string, frame []byte, state *any) ([][]byte, error) {
@@ -87,11 +92,11 @@ func responsesStreamToClaude(model string, frame []byte, state *any) ([][]byte, 
 		switch stringValue(item["type"]) {
 		case "reasoning":
 			block := streamState.block(key, "thinking")
-			block.Encrypted = stringValue(item["encrypted_content"])
+			block.Encrypted = rawStringValue(item["encrypted_content"])
 			out = append(out, streamState.openThinking(block)...)
 		case "function_call", "custom_tool_call":
 			block := streamState.block(key, "tool_use")
-			block.FunctionID = firstString(item, "call_id", "id")
+			setResponsesFunction(block, item)
 			block.FunctionName = stringValue(item["name"])
 			out = append(out, streamState.openTool(block)...)
 		}
@@ -120,7 +125,7 @@ func responsesStreamToClaude(model string, frame []byte, state *any) ([][]byte, 
 	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
 		block := streamState.block(itemKey(payload), "tool_use")
 		if block.FunctionID == "" {
-			block.FunctionID = firstNonEmptyString(stringValue(payload["call_id"]), stringValue(payload["item_id"]))
+			block.FunctionID = firstNonEmptyString(rawStringValue(payload["call_id"]), rawStringValue(payload["item_id"]))
 		}
 		if block.FunctionName == "" {
 			block.FunctionName = stringValue(payload["name"])
@@ -139,24 +144,34 @@ func responsesStreamToClaude(model string, frame []byte, state *any) ([][]byte, 
 			switch stringValue(item["type"]) {
 			case "reasoning":
 				block = streamState.block(key, "thinking")
+				block.Encrypted = rawStringValue(item["encrypted_content"])
 				out = append(out, streamState.openThinking(block)...)
 			case "function_call", "custom_tool_call":
 				block = streamState.block(key, "tool_use")
-				block.FunctionID = firstString(item, "call_id", "id")
-				block.FunctionName = stringValue(item["name"])
-				out = append(out, streamState.openTool(block)...)
 			}
 		}
 		if block != nil {
+			if block.Kind == "thinking" {
+				out = append(out, streamState.openThinking(block)...)
+			}
+			if block.Kind == "tool_use" {
+				setResponsesFunction(block, item)
+				block.FunctionName = stringValue(item["name"])
+				out = append(out, streamState.openTool(block)...)
+			}
 			switch block.Kind {
 			case "thinking":
 				fullText := responsesReasoningText(item)
 				if !block.SawDelta && fullText != "" {
 					out = append(out, streamState.delta(block, "thinking_delta", "thinking", fullText)...)
 				}
-				block.Encrypted = firstNonEmptyString(stringValue(item["encrypted_content"]), block.Encrypted)
+				if encrypted := rawStringValue(item["encrypted_content"]); encrypted != "" {
+					block.Encrypted = encrypted
+				}
 				if block.Encrypted != "" && !strings.HasPrefix(block.Encrypted, redactedThinkingPrefix) {
-					out = append(out, streamState.delta(block, "signature_delta", "signature", block.Encrypted)...)
+					if !block.SignatureSent {
+						out = append(out, streamState.delta(block, "signature_delta", "signature", block.Encrypted)...)
+					}
 				}
 			case "tool_use":
 				arguments := firstRawString(item, "arguments", "input")
@@ -172,6 +187,7 @@ func responsesStreamToClaude(model string, frame []byte, state *any) ([][]byte, 
 				return nil, errFailure
 			}
 		}
+		out = append(out, streamState.reconcileTerminalOutput(responseObject)...)
 		out = append(out, streamState.finish(responseObject)...)
 	}
 	return out, nil
@@ -197,6 +213,9 @@ func (s *responsesClaudeStreamState) start(response, payload map[string]any) [][
 			"input_tokens":  numberValue(usage["input_tokens"]),
 			"output_tokens": 0,
 		},
+	}
+	if cached, ok := objectValue(usage["input_tokens_details"])["cached_tokens"]; ok {
+		message["usage"].(map[string]any)["cache_read_input_tokens"] = numberValue(cached)
 	}
 	return [][]byte{claudeSSE("message_start", map[string]any{"type": "message_start", "message": message})}
 }
@@ -233,6 +252,7 @@ func (s *responsesClaudeStreamState) openThinking(block *responsesClaudeBlock) [
 	block.Open = true
 	contentBlock := map[string]any{"type": "thinking", "thinking": ""}
 	if strings.HasPrefix(block.Encrypted, redactedThinkingPrefix) {
+		block.RedactedSent = true
 		contentBlock = map[string]any{
 			"type": "redacted_thinking",
 			"data": strings.TrimPrefix(block.Encrypted, redactedThinkingPrefix),
@@ -268,6 +288,12 @@ func (s *responsesClaudeStreamState) delta(block *responsesClaudeBlock, deltaTyp
 	}
 	block.SawDelta = true
 	block.Accumulated += value
+	if deltaType == "text_delta" || deltaType == "thinking_delta" {
+		block.TextAccumulated += value
+	}
+	if deltaType == "signature_delta" {
+		block.SignatureSent = true
+	}
 	return [][]byte{claudeSSE("content_block_delta", map[string]any{
 		"type":  "content_block_delta",
 		"index": block.Index,
@@ -287,6 +313,149 @@ func (s *responsesClaudeStreamState) closeBlock(key string) [][]byte {
 	})}
 }
 
+func (s *responsesClaudeStreamState) reconcileTerminalOutput(response map[string]any) [][]byte {
+	if s.Stopped {
+		return nil
+	}
+	var out [][]byte
+	for outputIndex, rawItem := range arrayValue(response["output"]) {
+		item, ok := rawItem.(map[string]any)
+		if !ok {
+			continue
+		}
+		key := fmt.Sprintf("item:%d", outputIndex)
+		switch stringValue(item["type"]) {
+		case "message":
+			for contentIndex, rawPart := range arrayValue(item["content"]) {
+				part, okPart := rawPart.(map[string]any)
+				if !okPart {
+					continue
+				}
+				if stringValue(part["type"]) != "output_text" && stringValue(part["type"]) != "text" && stringValue(part["type"]) != "refusal" {
+					continue
+				}
+				text := firstRawString(part, "text", "refusal")
+				contentKey := fmt.Sprintf("%s:content:%d", key, contentIndex)
+				out = append(out, s.reconcileText(contentKey, text)...)
+			}
+		case "reasoning":
+			out = append(out, s.reconcileReasoning(key, item)...)
+		case "function_call", "custom_tool_call":
+			out = append(out, s.reconcileFunction(key, item)...)
+		}
+	}
+	return out
+}
+
+func (s *responsesClaudeStreamState) reconcileText(key, text string) [][]byte {
+	block := s.Blocks[key]
+	remainder := text
+	if block != nil && block.SawDelta {
+		if !strings.HasPrefix(text, block.TextAccumulated) {
+			return nil
+		}
+		remainder = strings.TrimPrefix(text, block.TextAccumulated)
+	}
+	if remainder == "" {
+		return nil
+	}
+	target, targetKey := terminalBlock(s, key, "text", block)
+	out := s.openText(target)
+	out = append(out, s.delta(target, "text_delta", "text", remainder)...)
+	out = append(out, s.closeBlock(targetKey)...)
+	return out
+}
+
+func (s *responsesClaudeStreamState) reconcileReasoning(key string, item map[string]any) [][]byte {
+	block := s.Blocks[key]
+	fullText := responsesReasoningText(item)
+	textRemainder := fullText
+	if block != nil && block.TextAccumulated != "" {
+		if !strings.HasPrefix(fullText, block.TextAccumulated) {
+			textRemainder = ""
+		} else {
+			textRemainder = strings.TrimPrefix(fullText, block.TextAccumulated)
+		}
+	}
+	encrypted := rawStringValue(item["encrypted_content"])
+	redacted := strings.HasPrefix(encrypted, redactedThinkingPrefix)
+	needsRedacted := redacted && (block == nil || !block.RedactedSent)
+	needsSignature := encrypted != "" && !redacted && (block == nil || !block.SignatureSent)
+	if textRemainder == "" && !needsRedacted && !needsSignature {
+		return nil
+	}
+	target, targetKey := terminalBlock(s, key, "thinking", block)
+	if redacted && needsRedacted && block != nil && block.Open && !block.RedactedSent {
+		targetKey = key + ":terminal"
+		target = s.block(targetKey, "thinking")
+	}
+	if redacted && !target.RedactedSent {
+		target.Encrypted = encrypted
+	}
+	out := s.openThinking(target)
+	out = append(out, s.delta(target, "thinking_delta", "thinking", textRemainder)...)
+	if needsSignature && !target.SignatureSent {
+		out = append(out, s.delta(target, "signature_delta", "signature", encrypted)...)
+	}
+	out = append(out, s.closeBlock(targetKey)...)
+	return out
+}
+
+func (s *responsesClaudeStreamState) reconcileFunction(key string, item map[string]any) [][]byte {
+	block := s.Blocks[key]
+	arguments := responsesFunctionArguments(item)
+	argumentRemainder := arguments
+	if block != nil && block.SawDelta {
+		if !strings.HasPrefix(arguments, block.Accumulated) {
+			argumentRemainder = ""
+		} else {
+			argumentRemainder = strings.TrimPrefix(arguments, block.Accumulated)
+		}
+	}
+	if block != nil && argumentRemainder == "" {
+		return nil
+	}
+	target, targetKey := terminalBlock(s, key, "tool_use", block)
+	setResponsesFunction(target, item)
+	target.FunctionName = stringValue(item["name"])
+	out := s.openTool(target)
+	out = append(out, s.delta(target, "input_json_delta", "partial_json", argumentRemainder)...)
+	out = append(out, s.closeBlock(targetKey)...)
+	return out
+}
+
+func terminalBlock(s *responsesClaudeStreamState, key, kind string, current *responsesClaudeBlock) (*responsesClaudeBlock, string) {
+	if current == nil {
+		return s.block(key, kind), key
+	}
+	if current.Open {
+		return current, key
+	}
+	terminalKey := key + ":terminal"
+	return s.block(terminalKey, kind), terminalKey
+}
+
+func setResponsesFunction(block *responsesClaudeBlock, item map[string]any) {
+	itemID := rawStringValue(item["id"])
+	callID := rawStringValue(item["call_id"])
+	block.FunctionItemID = itemID
+	block.FunctionCallID = callID
+	block.FunctionID = encodeClaudeToolID(itemID, callID)
+}
+
+func responsesFunctionArguments(item map[string]any) string {
+	if arguments := rawStringValue(item["arguments"]); arguments != "" {
+		return arguments
+	}
+	if input, ok := item["input"]; ok {
+		encoded, err := json.Marshal(input)
+		if err == nil {
+			return string(encoded)
+		}
+	}
+	return ""
+}
+
 func (s *responsesClaudeStreamState) finish(response map[string]any) [][]byte {
 	if s.Stopped {
 		return nil
@@ -300,13 +469,20 @@ func (s *responsesClaudeStreamState) finish(response map[string]any) [][]byte {
 		out = append(out, s.closeBlock(key)...)
 	}
 	usage := objectValue(response["usage"])
+	finalUsage := map[string]any{"output_tokens": numberValue(usage["output_tokens"])}
+	if inputTokens, ok := usage["input_tokens"]; ok {
+		finalUsage["input_tokens"] = numberValue(inputTokens)
+	}
+	if cachedTokens, ok := objectValue(usage["input_tokens_details"])["cached_tokens"]; ok {
+		finalUsage["cache_read_input_tokens"] = numberValue(cachedTokens)
+	}
 	out = append(out, claudeSSE("message_delta", map[string]any{
 		"type": "message_delta",
 		"delta": map[string]any{
 			"stop_reason":   responsesStopReason(response, hasToolUse),
 			"stop_sequence": nil,
 		},
-		"usage": map[string]any{"output_tokens": numberValue(usage["output_tokens"])},
+		"usage": finalUsage,
 	}))
 	out = append(out, claudeSSE("message_stop", map[string]any{"type": "message_stop"}))
 	s.Stopped = true

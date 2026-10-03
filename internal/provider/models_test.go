@@ -10,35 +10,41 @@ func TestSelectEndpoint(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name      string
-		model     upstreamModel
-		want      string
-		wantError bool
+		name         string
+		model        upstreamModel
+		sourceFormat string
+		want         string
+		wantError    bool
 	}{
 		{
-			name:  "responses preferred",
-			model: upstreamModel{ID: "model-a", SupportedEndpoints: []string{"/chat/completions", "/responses"}},
-			want:  translate.EndpointResponses,
+			name:         "responses source preserves native endpoint",
+			model:        upstreamModel{ID: "model-a", SupportedEndpoints: []string{"/chat/completions", "/responses"}},
+			sourceFormat: "openai-response",
+			want:         translate.EndpointResponses,
 		},
 		{
-			name:  "messages fallback",
-			model: upstreamModel{ID: "model-b", SupportedEndpoints: []string{"messages"}},
-			want:  translate.EndpointMessages,
+			name:         "Claude prefers native Messages endpoint",
+			model:        upstreamModel{ID: "model-b", SupportedEndpoints: []string{"/responses", "messages"}},
+			sourceFormat: "claude",
+			want:         translate.EndpointMessages,
 		},
 		{
-			name:  "sol forced to responses",
-			model: upstreamModel{ID: "gpt-5.6-sol", SupportedEndpoints: []string{"/chat/completions"}},
-			want:  translate.EndpointResponses,
+			name:         "chat source prefers native Chat endpoint",
+			model:        upstreamModel{ID: "model-c", SupportedEndpoints: []string{"/responses", "/chat/completions"}},
+			sourceFormat: "openai",
+			want:         translate.EndpointChatCompletions,
 		},
 		{
-			name:  "terra forced to responses",
-			model: upstreamModel{ID: "GPT-5.6-TERRA"},
-			want:  translate.EndpointResponses,
+			name:         "Claude falls back to Responses",
+			model:        upstreamModel{ID: "model-d", SupportedEndpoints: []string{"/chat/completions", "/responses"}},
+			sourceFormat: "claude",
+			want:         translate.EndpointResponses,
 		},
 		{
-			name:      "unsupported",
-			model:     upstreamModel{ID: "embedding-model", SupportedEndpoints: []string{"/embeddings"}},
-			wantError: true,
+			name:         "unsupported",
+			model:        upstreamModel{ID: "embedding-model", SupportedEndpoints: []string{"/embeddings"}},
+			sourceFormat: "openai-response",
+			wantError:    true,
 		},
 	}
 
@@ -46,7 +52,7 @@ func TestSelectEndpoint(t *testing.T) {
 		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := selectEndpoint(test.model)
+			got, err := selectEndpoint(test.model, test.sourceFormat)
 			if test.wantError {
 				if err == nil {
 					t.Fatal("expected an endpoint selection error")
@@ -63,12 +69,12 @@ func TestSelectEndpoint(t *testing.T) {
 	}
 }
 
-func TestNormalizeModelsAddsResponsesMetadata(t *testing.T) {
+func TestNormalizeModelsDoesNotInventUnsupportedEndpoints(t *testing.T) {
 	t.Parallel()
 
 	models := normalizeModels([]upstreamModel{
 		{
-			ID:                 "gpt-5.6-sol",
+			ID:                 "model-a",
 			SupportedEndpoints: []string{"/chat/completions"},
 			Capabilities: modelCapabilities{
 				Supports: modelSupports{Streaming: true, ToolCalls: true, Vision: true},
@@ -76,12 +82,12 @@ func TestNormalizeModelsAddsResponsesMetadata(t *testing.T) {
 			},
 		},
 	})
-	if len(models) != 1 || !contains(models[0].SupportedEndpoints, translate.EndpointResponses) {
-		t.Fatalf("responses endpoint was not added: %#v", models)
+	if len(models) != 1 || contains(models[0].SupportedEndpoints, translate.EndpointResponses) {
+		t.Fatalf("unsupported responses endpoint was invented: %#v", models)
 	}
 	info := modelInfos(models)[0]
-	if !contains(info.SupportedGenerationMethods, translate.EndpointResponses) {
-		t.Fatalf("model metadata omits responses endpoint: %#v", info.SupportedGenerationMethods)
+	if contains(info.SupportedGenerationMethods, translate.EndpointResponses) {
+		t.Fatalf("model metadata invented responses endpoint: %#v", info.SupportedGenerationMethods)
 	}
 	if !contains(info.SupportedInputModalities, "IMAGE") {
 		t.Fatalf("model metadata omits image support: %#v", info.SupportedInputModalities)
