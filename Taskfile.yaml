@@ -1,0 +1,68 @@
+version: '3'
+
+vars:
+  VERSION: '{{.VERSION | default "0.1.0"}}'
+  GOOS:
+    sh: go env GOOS
+  GOARCH:
+    sh: go env GOARCH
+  EXT: '{{if eq .GOOS "darwin"}}dylib{{else if eq .GOOS "windows"}}dll{{else}}so{{end}}'
+  ARTIFACT: 'build/plugins/{{.GOOS}}/{{.GOARCH}}/cpa-copilot-bridge.{{.EXT}}'
+
+tasks:
+  fmt:
+    desc: Format Go source
+    cmds:
+      - gofmt -w .
+
+  fmt-check:
+    desc: Check Go formatting
+    cmds:
+      - |
+        set -eu
+        unformatted=$(gofmt -l .)
+        if [ -n "$unformatted" ]; then
+          printf '%s\n' "$unformatted"
+          exit 1
+        fi
+
+  test:
+    desc: Run package tests with synthetic fixtures
+    cmds:
+      - go test ./...
+
+  test-race:
+    desc: Run package tests with the race detector
+    cmds:
+      - go test -race ./...
+
+  vet:
+    desc: Run Go static checks
+    cmds:
+      - go vet ./...
+
+  build:
+    desc: Build the native shared library for the current platform
+    env:
+      CGO_ENABLED: '1'
+    cmds:
+      - mkdir -p 'build/plugins/{{.GOOS}}/{{.GOARCH}}'
+      - go build -trimpath -buildvcs=false -buildmode=c-shared -ldflags '-X main.pluginVersion={{.VERSION}}' -o '{{.ARTIFACT}}' ./cmd/cpa-copilot-bridge
+      - rm -f 'build/plugins/{{.GOOS}}/{{.GOARCH}}/cpa-copilot-bridge.h'
+
+  integration:
+    desc: Load the plugin in a supplied CLIProxyAPI v8 host with a mock upstream
+    preconditions:
+      - sh: test -n "$CPA_BINARY"
+        msg: Set CPA_BINARY to a built CLIProxyAPI v8 server
+    cmds:
+      - task: build
+      - go test -count=1 -v ./integration
+
+  check:
+    desc: Run formatting, tests, static checks, and the native build
+    cmds:
+      - task: fmt-check
+      - task: test-race
+      - task: vet
+      - task: build
