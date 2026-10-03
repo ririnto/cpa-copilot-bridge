@@ -11,7 +11,7 @@
 ## Privacy and Git
 
 - Keep machine paths, credentials, tokens, real auth files, and private provider payloads out of committed content.
-- Use synthetic credentials and local mock servers for tests and examples.
+- Keep tests and examples independent of operator data.
 - Preserve user-authored commit authorship and committer metadata.
 - Use the current Git configuration for new commits and do not rewrite existing history.
 - Use branch names or release tags as durable review references instead of relying on a commit hash alone.
