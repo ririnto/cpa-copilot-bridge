@@ -58,4 +58,8 @@ Report live-provider behavior as unverified unless a real provider call is expli
 - Replaced Makefile tooling with module-managed Task and set Go 1.26.8 as the supported minimum.
 - Verified native loading and Responses, Messages, and Chat Completions requests with a disposable v8 host.
 - Completed GitHub device login through the isolated proxy with private auth storage outside the checkout.
-- Final checks and independent pull request review remain.
+- Passed formatting, race tests, vet, and native builds on Go 1.26.8.
+- Passed eight native host integration cases, including missing-ID restoration, cancellation, and both compaction routes.
+- Completed independent pull request review with no confirmed blockers.
+- Recorded downstream tool identifier limits as follow-up issue #5.
+- Ready for pull request integration into `main`.
