@@ -63,6 +63,21 @@ type pollDecision struct {
 	Terminal     bool
 }
 
+func validateGitHubVerificationURL(raw, configuredBase string, allowInsecure bool) (string, error) {
+	loginURL, errLogin := url.Parse(strings.TrimSpace(raw))
+	baseURL, errBase := url.Parse(strings.TrimSpace(configuredBase))
+	if errLogin != nil || errBase != nil || loginURL.Hostname() == "" || loginURL.User != nil || loginURL.Fragment != "" || baseURL.Hostname() == "" || baseURL.User != nil {
+		return "", fmt.Errorf("GitHub device flow returned an invalid verification URL")
+	}
+	if !strings.EqualFold(loginURL.Scheme, baseURL.Scheme) || !strings.EqualFold(loginURL.Host, baseURL.Host) {
+		return "", fmt.Errorf("GitHub device flow returned a verification URL outside the configured GitHub origin")
+	}
+	if loginURL.Scheme != "https" && !(allowInsecure && loginURL.Scheme == "http") {
+		return "", fmt.Errorf("GitHub device verification URL must use HTTPS")
+	}
+	return loginURL.String(), nil
+}
+
 func (s *Service) ParseAuth(req pluginapi.AuthParseRequest) (pluginapi.AuthParseResponse, error) {
 	if req.Provider != "" && !strings.EqualFold(req.Provider, providerID) {
 		return pluginapi.AuthParseResponse{Handled: false}, nil
@@ -129,6 +144,21 @@ func (s *Service) StartLogin(ctx context.Context, callbackID string) (pluginapi.
 	if device.Interval < 5 {
 		device.Interval = 5
 	}
+	loginURL := device.VerificationURIComplete
+	if loginURL == "" {
+		parsed, errParse := url.Parse(device.VerificationURI)
+		if errParse != nil {
+			return pluginapi.AuthLoginStartResponse{}, fmt.Errorf("parse GitHub verification URL")
+		}
+		query := parsed.Query()
+		query.Set("user_code", device.UserCode)
+		parsed.RawQuery = query.Encode()
+		loginURL = parsed.String()
+	}
+	loginURL, errLoginURL := validateGitHubVerificationURL(loginURL, cfg.GitHubBaseURL, cfg.AllowInsecureBaseURLs)
+	if errLoginURL != nil {
+		return pluginapi.AuthLoginStartResponse{}, errLoginURL
+	}
 	state, errState := randomIdentifier(24)
 	if errState != nil {
 		return pluginapi.AuthLoginStartResponse{}, fmt.Errorf("generate OAuth state: %w", errState)
@@ -146,17 +176,6 @@ func (s *Service) StartLogin(ctx context.Context, callbackID string) (pluginapi.
 	s.oauthSession[state] = session
 	s.oauthMu.Unlock()
 
-	loginURL := device.VerificationURIComplete
-	if loginURL == "" {
-		parsed, errParse := url.Parse(device.VerificationURI)
-		if errParse != nil {
-			return pluginapi.AuthLoginStartResponse{}, fmt.Errorf("parse GitHub verification URL: %w", errParse)
-		}
-		query := parsed.Query()
-		query.Set("user_code", device.UserCode)
-		parsed.RawQuery = query.Encode()
-		loginURL = parsed.String()
-	}
 	return pluginapi.AuthLoginStartResponse{
 		Provider:  providerID,
 		URL:       loginURL,
@@ -189,6 +208,7 @@ func (s *Service) PollLogin(ctx context.Context, callbackID, state string) (plug
 	}
 	session.Polling = true
 	deviceCode := session.DeviceCode
+	userCode := session.UserCode
 	clientID := session.ClientID
 	interval := session.Interval
 	s.oauthMu.Unlock()
@@ -225,7 +245,7 @@ func (s *Service) PollLogin(ctx context.Context, callbackID, state string) (plug
 	}
 	if decision.Status == pluginapi.AuthLoginStatusError {
 		s.finishPoll(state, interval, decision.Terminal)
-		return pluginapi.AuthLoginPollResponse{Status: decision.Status, Message: decision.Message}, nil
+		return pluginapi.AuthLoginPollResponse{Status: decision.Status, Message: redact.ErrorBody([]byte(decision.Message), deviceCode, userCode)}, nil
 	}
 
 	user, errUser := s.fetchGitHubUser(ctx, callbackID, token.AccessToken)

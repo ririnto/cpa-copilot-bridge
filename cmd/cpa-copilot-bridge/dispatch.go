@@ -12,7 +12,7 @@ import (
 )
 
 var pluginService = provider.New(hostTransport{})
-var pluginVersion = "0.3.3"
+var pluginVersion = "0.1.0"
 
 type lifecycleRequest struct {
 	ConfigYAML []byte `json:"config_yaml"`
@@ -96,7 +96,7 @@ func dispatch(method string, request []byte) (any, error) {
 		}
 		return pluginService.ModelsForAuth(ctx, req.HostCallbackID, req.AuthModelRequest)
 	case pluginabi.MethodAuthIdentifier, pluginabi.MethodExecutorIdentifier:
-		return identifierResponse{Identifier: "copilot"}, nil
+		return identifierResponse{Identifier: "copilot-bridge"}, nil
 	case pluginabi.MethodAuthParse:
 		var req pluginapi.AuthParseRequest
 		if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
@@ -162,9 +162,9 @@ func pluginRegistration() registration {
 	return registration{
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
-			Name:             "GitHub Copilot subscription provider",
+			Name:             "Copilot Bridge",
 			Version:          pluginVersion,
-			Author:           "self-owned",
+			Author:           "ririnto",
 			GitHubRepository: "https://github.com/ririnto/cpa-copilot-bridge",
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "github_client_id", Type: pluginapi.ConfigFieldTypeString, Description: "Public GitHub OAuth application client identifier used for device flow."},
@@ -176,6 +176,10 @@ func pluginRegistration() registration {
 				{Name: "model_cache_ttl_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "In-memory Copilot model catalog cache lifetime."},
 				{Name: "token_expiry_buffer_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "Refresh Copilot API tokens this long before expiration."},
 				{Name: "excluded_model_prefixes", Type: pluginapi.ConfigFieldTypeArray, Description: "Case-insensitive model ID prefixes omitted from Copilot discovery to prevent collisions with native providers."},
+				{Name: "model_endpoint_overrides", Type: pluginapi.ConfigFieldTypeObject, Description: "Exact model ID to endpoint mapping for Responses, Chat Completions, or Messages."},
+				{Name: "compaction_models", Type: pluginapi.ConfigFieldTypeArray, Description: "Exact model IDs that enable plugin-managed Responses summary compaction."},
+				{Name: "prompt_cache_key", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Derive a cache key from a stable session identity when the caller provides none."},
+				{Name: "reasoning_replay", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Restore missing reasoning for exact tool calls in the same authenticated session; enabled by default."},
 			},
 		},
 		Capabilities: registrationCapability{
@@ -183,8 +187,8 @@ func pluginRegistration() registration {
 			AuthProvider:          true,
 			Executor:              true,
 			ExecutorModelScope:    pluginapi.ExecutorModelScopeOAuth,
-			ExecutorInputFormats:  []string{"openai-response", "claude"},
-			ExecutorOutputFormats: []string{"openai-response", "claude"},
+			ExecutorInputFormats:  []string{"openai-response", "claude", "openai"},
+			ExecutorOutputFormats: []string{"openai-response", "claude", "openai"},
 		},
 	}
 }

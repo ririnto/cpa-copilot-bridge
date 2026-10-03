@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/ririnto/cpa-copilot-bridge/internal/compact"
 	"github.com/ririnto/cpa-copilot-bridge/internal/redact"
 	"github.com/ririnto/cpa-copilot-bridge/internal/sse"
 	"github.com/ririnto/cpa-copilot-bridge/internal/translate"
@@ -42,21 +43,86 @@ func (s *Service) Execute(ctx context.Context, req ExecuteRequest) (pluginapi.Ex
 	if errParse != nil {
 		return pluginapi.ExecutorResponse{}, errParse
 	}
-	endpoint, token, errEndpoint := s.endpointForModel(ctx, req.HostCallbackID, req.AuthID, storage, req.Model)
+	v1Compact := strings.EqualFold(strings.TrimSpace(req.Alt), "responses/compact")
+	v2Compact := hasCompactionTrigger(req.Payload) || hasCompactionTrigger(req.OriginalRequest)
+	if (v1Compact || v2Compact) && sourceFormat != "openai-response" {
+		return pluginapi.ExecutorResponse{}, statusError("unsupported_compaction_format", "Responses compaction requires the OpenAI Responses format", http.StatusUnprocessableEntity)
+	}
+	if (v1Compact || v2Compact) && !s.compactionEnabled(req.Model) {
+		return pluginapi.ExecutorResponse{}, statusError("compaction_not_enabled", "Responses compaction is not enabled for this model", http.StatusUnprocessableEntity)
+	}
+	endpointFormat := sourceFormat
+	if v1Compact {
+		endpointFormat = "openai-response"
+	}
+	endpoint, token, errEndpoint := s.endpointForModel(ctx, req.HostCallbackID, req.AuthID, storage, req.Model, endpointFormat)
 	if errEndpoint != nil {
 		return pluginapi.ExecutorResponse{}, errEndpoint
+	}
+	if (v1Compact || v2Compact) && endpoint != translate.EndpointResponses {
+		return pluginapi.ExecutorResponse{}, statusError("unsupported_compaction_endpoint", "Responses compaction requires the Copilot Responses endpoint", http.StatusUnprocessableEntity)
 	}
 	requestBody, errTranslate := translate.RequestForEndpointFrom(sourceFormat, req.Model, req.Payload, false, endpoint)
 	if errTranslate != nil {
 		return pluginapi.ExecutorResponse{}, statusError("translation_error", errTranslate.Error(), http.StatusUnprocessableEntity)
 	}
+	sessionPayload := req.OriginalRequest
+	if len(sessionPayload) == 0 {
+		sessionPayload = req.Payload
+	}
+	sessionID, agentID := protocolSessionIdentity(sessionPayload, req.Headers, req.Metadata)
+	scopeKey := protocolScopeKey(req.AuthID, storage.GitHubAccessToken, req.Model, token.APIBaseURL, endpoint, sessionID, agentID, token.ConfigGeneration)
+	if endpoint == translate.EndpointResponses {
+		if sourceFormat == "claude" {
+			requestBody = s.restoreReasoningReplay(scopeKey, req.OriginalRequest, requestBody)
+		} else if sourceFormat == "openai-response" {
+			requestBody = s.restoreNativeResponsesReplay(scopeKey, requestBody)
+		}
+	}
+	compactionScope, compactionSecret := compactionKeyMaterial(req.AuthID, storage.GitHubAccessToken, req.Model, endpoint, token.APIBaseURL, token.ConfigGeneration)
+	compactionRequested := false
+	if s.compactionEnabled(req.Model) && endpoint == translate.EndpointResponses {
+		if v1Compact {
+			requestBody, errTranslate = addCompactionTrigger(requestBody)
+			if errTranslate != nil {
+				return pluginapi.ExecutorResponse{}, statusError("invalid_compaction_request", errTranslate.Error(), http.StatusBadRequest)
+			}
+		}
+		requestBody, compactionRequested, errTranslate = compact.Prepare(requestBody, compactionScope, compactionSecret)
+		if errTranslate != nil {
+			return pluginapi.ExecutorResponse{}, statusError("invalid_compaction_request", errTranslate.Error(), http.StatusBadRequest)
+		}
+	}
+	cacheKey := explicitPromptCacheKey(req.OriginalRequest, req.Metadata)
+	if cacheKey == "" {
+		cacheKey = explicitPromptCacheKey(req.Payload, req.Metadata)
+	}
+	if cacheKey == "" && s.Config().PromptCacheKey {
+		cacheKey = derivedPromptCacheKey(scopeKey)
+	}
+	if endpoint == translate.EndpointResponses && cacheKey != "" {
+		requestBody, errTranslate = setPromptCacheKey(requestBody, cacheKey)
+		if errTranslate != nil {
+			return pluginapi.ExecutorResponse{}, statusError("translation_error", errTranslate.Error(), http.StatusUnprocessableEntity)
+		}
+	}
 	resp, token, errDo := s.doModelRequest(ctx, req.HostCallbackID, req.AuthID, storage, token, endpoint, requestBody, false)
 	if errDo != nil {
 		return pluginapi.ExecutorResponse{}, errDo
 	}
+	if compactionRequested {
+		body, errComplete := compact.Complete(resp.Body, compactionScope, compactionSecret)
+		if errComplete != nil {
+			return pluginapi.ExecutorResponse{}, statusError("compaction_error", redact.ErrorBody([]byte(errComplete.Error()), token.Token, storage.GitHubAccessToken), http.StatusBadGateway)
+		}
+		return pluginapi.ExecutorResponse{Payload: body, Headers: filterResponseHeaders(resp.Headers)}, nil
+	}
 	body, errResponse := translate.ResponseFromEndpoint(ctx, endpoint, sourceFormat, req.Model, req.OriginalRequest, requestBody, resp.Body)
 	if errResponse != nil {
 		return pluginapi.ExecutorResponse{}, statusError("translation_error", errResponse.Error(), http.StatusBadGateway)
+	}
+	if endpoint == translate.EndpointResponses {
+		s.recordReasoningReplay(scopeKey, resp.Body)
 	}
 	return pluginapi.ExecutorResponse{
 		Payload: body,
@@ -80,7 +146,18 @@ func (s *Service) ExecuteStream(ctx context.Context, req ExecuteRequest) (http.H
 	if errParse != nil {
 		return nil, errParse
 	}
-	endpoint, token, errEndpoint := s.endpointForModel(ctx, req.HostCallbackID, req.AuthID, storage, req.Model)
+	v1Compact := strings.EqualFold(strings.TrimSpace(req.Alt), "responses/compact")
+	v2Compact := hasCompactionTrigger(req.Payload) || hasCompactionTrigger(req.OriginalRequest)
+	if (v1Compact || v2Compact) && sourceFormat != "openai-response" {
+		return nil, statusError("unsupported_compaction_format", "Responses compaction requires the OpenAI Responses format", http.StatusUnprocessableEntity)
+	}
+	if (v1Compact || v2Compact) && !s.compactionEnabled(req.Model) {
+		return nil, statusError("compaction_not_enabled", "Responses compaction is not enabled for this model", http.StatusUnprocessableEntity)
+	}
+	if v1Compact || v2Compact {
+		return nil, statusError("compaction_stream_unsupported", "Responses compaction does not support streaming", http.StatusBadRequest)
+	}
+	endpoint, token, errEndpoint := s.endpointForModel(ctx, req.HostCallbackID, req.AuthID, storage, req.Model, sourceFormat)
 	if errEndpoint != nil {
 		return nil, errEndpoint
 	}
@@ -88,18 +165,44 @@ func (s *Service) ExecuteStream(ctx context.Context, req ExecuteRequest) (http.H
 	if errTranslate != nil {
 		return nil, statusError("translation_error", errTranslate.Error(), http.StatusUnprocessableEntity)
 	}
+	sessionPayload := req.OriginalRequest
+	if len(sessionPayload) == 0 {
+		sessionPayload = req.Payload
+	}
+	sessionID, agentID := protocolSessionIdentity(sessionPayload, req.Headers, req.Metadata)
+	scopeKey := protocolScopeKey(req.AuthID, storage.GitHubAccessToken, req.Model, token.APIBaseURL, endpoint, sessionID, agentID, token.ConfigGeneration)
+	if endpoint == translate.EndpointResponses {
+		if sourceFormat == "claude" {
+			requestBody = s.restoreReasoningReplay(scopeKey, req.OriginalRequest, requestBody)
+		} else if sourceFormat == "openai-response" {
+			requestBody = s.restoreNativeResponsesReplay(scopeKey, requestBody)
+		}
+	}
+	cacheKey := explicitPromptCacheKey(req.OriginalRequest, req.Metadata)
+	if cacheKey == "" {
+		cacheKey = explicitPromptCacheKey(req.Payload, req.Metadata)
+	}
+	if cacheKey == "" && s.Config().PromptCacheKey {
+		cacheKey = derivedPromptCacheKey(scopeKey)
+	}
+	if endpoint == translate.EndpointResponses && cacheKey != "" {
+		requestBody, errTranslate = setPromptCacheKey(requestBody, cacheKey)
+		if errTranslate != nil {
+			return nil, statusError("translation_error", errTranslate.Error(), http.StatusUnprocessableEntity)
+		}
+	}
 	upstream, token, errOpen := s.openModelStream(ctx, req.HostCallbackID, req.AuthID, storage, token, endpoint, requestBody)
 	if errOpen != nil {
 		return nil, errOpen
 	}
 	if upstream.StatusCode < 200 || upstream.StatusCode >= 300 {
-		body, errCollect := s.collectStreamError(ctx, upstream)
+		body, errCollect := s.collectStreamError(ctx, upstream, token.Token, storage.GitHubAccessToken)
 		if errCollect != nil {
 			return nil, errCollect
 		}
 		return nil, upstreamStatusError(upstream.StatusCode, redact.ErrorBody(body, token.Token, storage.GitHubAccessToken))
 	}
-	go s.pumpStream(req.StreamID, endpoint, sourceFormat, req.Model, req.OriginalRequest, requestBody, upstream)
+	go s.pumpStream(ctx, req.StreamID, endpoint, sourceFormat, req.Model, req.OriginalRequest, requestBody, upstream, scopeKey, token.Token, storage.GitHubAccessToken)
 	headers := filterResponseHeaders(upstream.Headers)
 	headers.Set("Content-Type", "text/event-stream")
 	headers.Set("Cache-Control", "no-cache")
@@ -166,17 +269,28 @@ func (s *Service) openModelStream(ctx context.Context, callbackID, authID string
 	return stream, token, nil
 }
 
-func (s *Service) collectStreamError(ctx context.Context, stream transport.Stream) ([]byte, error) {
-	defer func() { _ = s.host.CloseStream(context.Background(), stream.ID) }()
+func (s *Service) collectStreamError(ctx context.Context, stream transport.Stream, copilotToken, githubToken string) ([]byte, error) {
+	defer func() { _ = s.host.CloseStream(context.WithoutCancel(ctx), stream.ID) }()
 	var body []byte
 	for {
 		chunk, errRead := s.host.ReadStream(ctx, stream.ID)
 		if errRead != nil {
-			return nil, fmt.Errorf("read Copilot error stream: %w", errRead)
+			return nil, fmt.Errorf("read Copilot error stream: %s", redact.ErrorBody([]byte(errRead.Error()), copilotToken, githubToken))
 		}
-		body = append(body, chunk.Payload...)
 		if chunk.Error != "" {
-			return nil, fmt.Errorf("read Copilot error stream: %s", redact.Text(chunk.Error))
+			return nil, fmt.Errorf("read Copilot error stream: %s", redact.ErrorBody([]byte(chunk.Error), copilotToken, githubToken))
+		}
+		const maxUpstreamErrorStreamBytes = 1 << 20
+		remaining := maxUpstreamErrorStreamBytes - len(body)
+		if remaining > 0 {
+			if len(chunk.Payload) > remaining {
+				body = append(body, chunk.Payload[:remaining]...)
+				return body, nil
+			}
+			body = append(body, chunk.Payload...)
+			if len(body) == maxUpstreamErrorStreamBytes {
+				return body, nil
+			}
 		}
 		if chunk.Done {
 			return body, nil
@@ -184,16 +298,16 @@ func (s *Service) collectStreamError(ctx context.Context, stream transport.Strea
 	}
 }
 
-func (s *Service) pumpStream(outputID, endpoint, destination, model string, original, translated []byte, upstream transport.Stream) {
-	ctx := context.Background()
+func (s *Service) pumpStream(ctx context.Context, outputID, endpoint, destination, model string, original, translated []byte, upstream transport.Stream, scopeKey, copilotToken, githubToken string) {
 	var terminalErr error
+	var terminal streamTerminal
 	defer func() {
-		_ = s.host.CloseStream(ctx, upstream.ID)
+		_ = s.host.CloseStream(context.WithoutCancel(ctx), upstream.ID)
 		message := ""
 		if terminalErr != nil {
-			message = redact.Text(terminalErr.Error())
+			message = redact.ErrorBody([]byte(terminalErr.Error()), copilotToken, githubToken)
 		}
-		s.host.CloseOutput(ctx, outputID, message)
+		s.host.CloseOutput(context.WithoutCancel(ctx), outputID, message)
 	}()
 
 	decoder := &sse.Decoder{}
@@ -215,26 +329,57 @@ func (s *Service) pumpStream(outputID, endpoint, destination, model string, orig
 	}
 
 	for {
+		if errContext := ctx.Err(); errContext != nil {
+			terminalErr = fmt.Errorf("Copilot stream canceled: %w", errContext)
+			return
+		}
 		chunk, errRead := s.host.ReadStream(ctx, upstream.ID)
 		if errRead != nil {
-			terminalErr = fmt.Errorf("read Copilot stream: %w", errRead)
+			terminalErr = fmt.Errorf("read Copilot stream: %s", redact.ErrorBody([]byte(errRead.Error()), copilotToken, githubToken))
 			return
 		}
 		if chunk.Error != "" {
-			terminalErr = fmt.Errorf("Copilot stream error: %s", redact.Text(chunk.Error))
+			terminalErr = fmt.Errorf("Copilot stream error: %s", redact.ErrorBody([]byte(chunk.Error), copilotToken, githubToken))
 			return
 		}
 		for _, frame := range decoder.Feed(chunk.Payload) {
+			completed, errTerminal := terminal.observe(endpoint, frame, copilotToken, githubToken)
+			if errTerminal != nil {
+				terminalErr = errTerminal
+				return
+			}
 			if errEmit := emit(frame); errEmit != nil {
-				terminalErr = fmt.Errorf("translate Copilot stream: %w", errEmit)
+				terminalErr = fmt.Errorf("translate Copilot stream: %s", redact.ErrorBody([]byte(errEmit.Error()), copilotToken, githubToken))
+				return
+			}
+			if completed {
+				if endpoint == translate.EndpointResponses {
+					s.recordReasoningReplay(scopeKey, terminal.response)
+				}
 				return
 			}
 		}
 		if chunk.Done {
 			if trailing := decoder.Flush(); len(trailing) > 0 {
-				if errEmit := emit(trailing); errEmit != nil {
-					terminalErr = fmt.Errorf("translate final Copilot stream frame: %w", errEmit)
+				completed, errTerminal := terminal.observe(endpoint, trailing, copilotToken, githubToken)
+				if errTerminal != nil {
+					terminalErr = errTerminal
+					return
 				}
+				if errEmit := emit(trailing); errEmit != nil {
+					terminalErr = fmt.Errorf("translate final Copilot stream frame: %s", redact.ErrorBody([]byte(errEmit.Error()), copilotToken, githubToken))
+					return
+				}
+				if completed {
+					if endpoint == translate.EndpointResponses {
+						s.recordReasoningReplay(scopeKey, terminal.response)
+					}
+					return
+				}
+			}
+			if !terminal.completed {
+				terminalErr = fmt.Errorf("Copilot stream ended without a successful terminal event")
+				return
 			}
 			return
 		}
@@ -245,6 +390,8 @@ func normalizeRequestFormat(value string) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "", "responses", "openai-response", "openai-responses":
 		return "openai-response"
+	case "openai", "chat", "chat-completions", "chat/completions":
+		return "openai"
 	case "claude", "anthropic":
 		return "claude"
 	default:
