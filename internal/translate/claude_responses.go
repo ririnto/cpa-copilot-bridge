@@ -127,15 +127,15 @@ func claudeRequestToResponses(model string, body []byte, stream bool) ([]byte, e
 				flushMessage()
 				item := map[string]any{
 					"type":    "reasoning",
-					"summary": []any{map[string]any{"type": "summary_text", "text": stringValue(part["thinking"])}},
+					"summary": []any{map[string]any{"type": "summary_text", "text": rawStringValue(part["thinking"])}},
 				}
-				if signature := stringValue(part["signature"]); signature != "" {
+				if signature := rawStringValue(part["signature"]); signature != "" {
 					item["encrypted_content"] = signature
 				}
 				input = append(input, item)
 			case "redacted_thinking":
 				flushMessage()
-				if data := stringValue(part["data"]); data != "" {
+				if data := rawStringValue(part["data"]); data != "" {
 					input = append(input, map[string]any{
 						"type":              "reasoning",
 						"summary":           []any{},
@@ -148,21 +148,27 @@ func claudeRequestToResponses(model string, body []byte, stream bool) ([]byte, e
 				if errArguments != nil {
 					return nil, fmt.Errorf("encode Claude tool input: %w", errArguments)
 				}
-				input = append(input, map[string]any{
+				itemID, callID := responsesToolIDsFromClaude(firstRawString(part, "id", "tool_use_id"))
+				functionCall := map[string]any{
 					"type":      "function_call",
-					"call_id":   firstString(part, "id", "tool_use_id"),
+					"call_id":   callID,
 					"name":      stringValue(part["name"]),
 					"arguments": string(arguments),
-				})
+				}
+				if itemID != "" {
+					functionCall["id"] = itemID
+				}
+				input = append(input, functionCall)
 			case "tool_result":
 				flushMessage()
 				output, errOutput := claudeToolResultOutput(part["content"])
 				if errOutput != nil {
 					return nil, errOutput
 				}
+				_, callID := responsesToolIDsFromClaude(rawStringValue(part["tool_use_id"]))
 				input = append(input, map[string]any{
 					"type":    "function_call_output",
-					"call_id": stringValue(part["tool_use_id"]),
+					"call_id": callID,
 					"output":  output,
 				})
 			}
@@ -202,7 +208,7 @@ func responsesResponseToClaude(model string, body []byte) ([]byte, error) {
 			}
 		case "reasoning":
 			thinking := responsesReasoningText(item)
-			encrypted := stringValue(item["encrypted_content"])
+			encrypted := rawStringValue(item["encrypted_content"])
 			if strings.HasPrefix(encrypted, redactedThinkingPrefix) {
 				content = append(content, map[string]any{
 					"type": "redacted_thinking",
@@ -225,7 +231,7 @@ func responsesResponseToClaude(model string, body []byte) ([]byte, error) {
 			}
 			content = append(content, map[string]any{
 				"type":  "tool_use",
-				"id":    firstString(item, "call_id", "id"),
+				"id":    claudeToolIDFromResponses(item),
 				"name":  stringValue(item["name"]),
 				"input": input,
 			})
@@ -237,8 +243,8 @@ func responsesResponseToClaude(model string, body []byte) ([]byte, error) {
 		"input_tokens":  numberValue(objectValue(root["usage"])["input_tokens"]),
 		"output_tokens": numberValue(objectValue(root["usage"])["output_tokens"]),
 	}
-	if cached := numberValue(objectValue(objectValue(root["usage"])["input_tokens_details"])["cached_tokens"]); cached != nil {
-		usage["cache_read_input_tokens"] = cached
+	if cached, ok := objectValue(objectValue(root["usage"])["input_tokens_details"])["cached_tokens"]; ok {
+		usage["cache_read_input_tokens"] = numberValue(cached)
 	}
 	out := map[string]any{
 		"id":            firstString(root, "id"),
@@ -379,7 +385,7 @@ func responsesReasoningText(item map[string]any) string {
 			case string:
 				builder.WriteString(part)
 			case map[string]any:
-				builder.WriteString(stringValue(part["text"]))
+				builder.WriteString(rawStringValue(part["text"]))
 			}
 		}
 		if builder.Len() > 0 {
