@@ -79,7 +79,7 @@ func (s *Service) Execute(ctx context.Context, req ExecuteRequest) (pluginapi.Ex
 			requestBody = s.restoreNativeResponsesReplay(scopeKey, requestBody)
 		}
 	}
-	compactionScope, compactionSecret := compactionKeyMaterial(req.AuthID, storage.GitHubAccessToken, req.Model, endpoint, token.APIBaseURL, token.ConfigGeneration)
+	compactionScope, compactionSecret := compactionKeyMaterial(req.AuthID, storage.GitHubAccessToken, req.Model, endpoint, token.APIBaseURL)
 	compactionRequested := false
 	if s.compactionEnabled(req.Model) && endpoint == translate.EndpointResponses {
 		if v1Compact {
@@ -135,6 +135,9 @@ func (s *Service) Execute(ctx context.Context, req ExecuteRequest) (pluginapi.Ex
 }
 
 func (s *Service) ExecuteStream(ctx context.Context, req ExecuteRequest) (http.Header, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if strings.TrimSpace(req.StreamID) == "" {
 		return nil, statusError("invalid_request", "stream_id is required", http.StatusBadRequest)
 	}
@@ -155,7 +158,22 @@ func (s *Service) ExecuteStream(ctx context.Context, req ExecuteRequest) (http.H
 		return nil, statusError("compaction_not_enabled", "Responses compaction is not enabled for this model", http.StatusUnprocessableEntity)
 	}
 	if v1Compact || v2Compact {
-		return nil, statusError("compaction_stream_unsupported", "Responses compaction does not support streaming", http.StatusBadRequest)
+		response, errExecute := s.Execute(ctx, req)
+		if errExecute != nil {
+			return nil, errExecute
+		}
+		frames, errFrames := buildResponsesCompactionFrames(response.Payload)
+		if errFrames != nil {
+			return nil, statusError("invalid_compaction_response", errFrames.Error(), http.StatusBadGateway)
+		}
+		if errContext := ctx.Err(); errContext != nil {
+			return nil, errContext
+		}
+		go s.pumpCompactionStream(ctx, req.StreamID, frames)
+		headers := cloneHeader(response.Headers)
+		headers.Set("Content-Type", "text/event-stream")
+		headers.Set("Cache-Control", "no-cache")
+		return headers, nil
 	}
 	endpoint, token, errEndpoint := s.endpointForModel(ctx, req.HostCallbackID, req.AuthID, storage, req.Model, sourceFormat)
 	if errEndpoint != nil {
@@ -207,6 +225,21 @@ func (s *Service) ExecuteStream(ctx context.Context, req ExecuteRequest) (http.H
 	headers.Set("Content-Type", "text/event-stream")
 	headers.Set("Cache-Control", "no-cache")
 	return headers, nil
+}
+
+func (s *Service) pumpCompactionStream(ctx context.Context, outputID string, frames [][]byte) {
+	terminalError := ""
+	defer func() { s.host.CloseOutput(context.WithoutCancel(ctx), outputID, terminalError) }()
+	for _, frame := range frames {
+		if ctx.Err() != nil {
+			terminalError = "Responses compaction stream canceled"
+			return
+		}
+		if err := s.host.Emit(ctx, outputID, frame); err != nil {
+			terminalError = "Responses compaction stream emit failed"
+			return
+		}
+	}
 }
 
 func (s *Service) doModelRequest(ctx context.Context, callbackID, authID string, storage authStorage, token copilotTokenEntry, endpoint string, body []byte, stream bool) (transport.Response, copilotTokenEntry, error) {

@@ -143,7 +143,81 @@ func TestNativeHostProtocolRoundTrips(t *testing.T) {
 		captured, path := lastUpstreamRequest(t, state)
 		assertCompactionRequest(t, captured, path)
 		capsule := assertSingleCompaction(t, response)
-		assertCompactionReplay(t, base, state, capsule, "Continue the bridge task.")
+		assertCompactionReplay(t, base, state, capsule, "Continue the bridge task.", false)
+	})
+	t.Run("ResponsesCompactionTriggerStreamingRoundTrip", func(t *testing.T) {
+		history := []any{map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "Remember the active goal: finish the native host bridge."}}}}
+		input := append(append([]any(nil), history...), map[string]any{"type": "compaction_trigger"})
+		stream := callProxy(t, base+"/v1/responses", map[string]any{"model": "bridge-responses", "stream": true, "input": input})
+		captured, path := lastUpstreamRequest(t, state)
+		assertCompactionRequest(t, captured, path)
+		events := parseSSEDataEvents(t, stream)
+		if len(events) < 4 {
+			t.Fatalf("compaction stream has too few events: %s", stream)
+		}
+		assertEventType(t, events[0], "response.created")
+		assertEventType(t, events[1], "response.in_progress")
+		for i, event := range events {
+			assertEqualJSON(t, event["sequence_number"], i)
+		}
+		terminal := events[len(events)-1]
+		assertEventType(t, terminal, "response.completed")
+		completed, ok := terminal["response"].(map[string]any)
+		if !ok {
+			t.Fatalf("completed event has no response object: %+v", terminal)
+		}
+		if completed["id"] != "resp_fixture" || completed["status"] != "completed" {
+			t.Fatalf("completed response metadata changed: %+v", completed)
+		}
+		usage, ok := completed["usage"].(map[string]any)
+		if !ok {
+			t.Fatalf("completed response usage has type %T", completed["usage"])
+		}
+		assertEqualJSON(t, usage["input_tokens"], 1)
+		assertEqualJSON(t, usage["output_tokens"], 1)
+		assertEqualJSON(t, usage["total_tokens"], 2)
+		completedBody, err := json.Marshal(completed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		capsule := assertSingleCompaction(t, completedBody)
+		output, ok := completed["output"].([]any)
+		if !ok {
+			t.Fatalf("completed response output has type %T", completed["output"])
+		}
+		if len(events) != 3+2*len(output) {
+			t.Fatalf("stream emitted %d events for %d output items: %s", len(events), len(output), stream)
+		}
+		var summaryFound bool
+		var capsuleDoneCount int
+		for i, item := range output {
+			added := events[2+2*i]
+			done := events[3+2*i]
+			assertEventType(t, added, "response.output_item.added")
+			assertEventType(t, done, "response.output_item.done")
+			assertEqualJSON(t, added["output_index"], i)
+			assertEqualJSON(t, done["output_index"], i)
+			assertEqualJSON(t, added["item"], item)
+			assertEqualJSON(t, done["item"], item)
+			itemMap, ok := item.(map[string]any)
+			if !ok {
+				t.Fatalf("completed output item %d has type %T", i, item)
+			}
+			if itemMap["id"] == "msg_summary" {
+				summaryFound = true
+				assertEqualJSON(t, itemMap, map[string]any{"type": "message", "id": "msg_summary", "status": "completed", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "The active goal is to finish the native host bridge. The next step is integration."}}})
+			}
+			if itemMap["type"] == "compaction" {
+				capsuleDoneCount++
+				if itemMap["encrypted_content"] != capsule || doneItemType(done) != "compaction" {
+					t.Fatalf("terminal compaction item differs from its done event: output=%+v done=%+v", itemMap, done)
+				}
+			}
+		}
+		if !summaryFound || capsuleDoneCount != 1 {
+			t.Fatalf("stream did not preserve the summary and exactly one completed capsule: summary=%v capsules=%d", summaryFound, capsuleDoneCount)
+		}
+		assertCompactionReplay(t, base, state, capsule, "Continue the streamed bridge task.", true)
 	})
 	t.Run("ResponsesCompactRouteRoundTrip", func(t *testing.T) {
 		request := map[string]any{
@@ -154,7 +228,7 @@ func TestNativeHostProtocolRoundTrips(t *testing.T) {
 		captured, path := lastUpstreamRequest(t, state)
 		assertCompactionRequest(t, captured, path)
 		capsule := assertSingleCompaction(t, response)
-		assertCompactionReplay(t, base, state, capsule, "Continue after the compact route.")
+		assertCompactionReplay(t, base, state, capsule, "Continue after the compact route.", false)
 	})
 }
 
@@ -409,27 +483,70 @@ func assertSingleCompaction(t *testing.T, response []byte) string {
 	return capsule
 }
 
-func assertCompactionReplay(t *testing.T, base string, state *fixture, capsule, continuation string) {
+func assertCompactionReplay(t *testing.T, base string, state *fixture, capsule, continuation string, includeTrigger bool) {
 	t.Helper()
-	request := map[string]any{"model": "bridge-responses", "input": []any{
+	replayInput := []any{
 		map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": continuation}}},
 		map[string]any{"type": "compaction", "encrypted_content": capsule},
-	}}
+	}
+	if includeTrigger {
+		replayInput = append(replayInput, map[string]any{"type": "compaction_trigger"})
+	}
+	request := map[string]any{"model": "bridge-responses", "input": replayInput}
 	callProxy(t, base+"/v1/responses", request)
 	captured, path := lastUpstreamRequest(t, state)
 	if path != "/responses" {
 		t.Fatalf("replay request used upstream path %q", path)
 	}
-	input, err := json.Marshal(captured["input"])
+	capturedInput, err := json.Marshal(captured["input"])
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Contains(input, []byte(capsule)) || bytes.Contains(input, []byte("cpa-copilot-bridge:compaction:")) || bytes.Contains(input, []byte(`"type":"compaction"`)) {
-		t.Fatalf("replay request retained opaque capsule: %s", input)
+	if bytes.Contains(capturedInput, []byte(capsule)) || bytes.Contains(capturedInput, []byte("cpa-copilot-bridge:compaction:")) || bytes.Contains(capturedInput, []byte(`"type":"compaction"`)) || bytes.Contains(capturedInput, []byte("compaction_trigger")) {
+		t.Fatalf("replay request retained opaque capsule or trigger: %s", capturedInput)
 	}
-	if !bytes.Contains(input, []byte("The active goal is to finish the native host bridge")) || !bytes.Contains(input, []byte(continuation)) {
-		t.Fatalf("replay request omitted prior summary or continuation: %s", input)
+	if !bytes.Contains(capturedInput, []byte("The active goal is to finish the native host bridge")) || !bytes.Contains(capturedInput, []byte(continuation)) {
+		t.Fatalf("replay request omitted prior summary or continuation: %s", capturedInput)
 	}
+}
+
+func parseSSEDataEvents(t *testing.T, stream []byte) []map[string]any {
+	t.Helper()
+	var events []map[string]any
+	blocks := strings.Split(strings.ReplaceAll(string(stream), "\r\n", "\n"), "\n\n")
+	for _, block := range blocks {
+		for _, line := range strings.Split(block, "\n") {
+			if !strings.HasPrefix(line, "data:") {
+				continue
+			}
+			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if data == "[DONE]" {
+				t.Fatal("Responses V2 compaction stream must end with response.completed, without [DONE]")
+			}
+			var event map[string]any
+			if err := json.Unmarshal([]byte(data), &event); err != nil {
+				t.Fatalf("decode SSE data event: %v: %s", err, data)
+			}
+			events = append(events, event)
+		}
+	}
+	if len(events) == 0 {
+		t.Fatalf("stream contained no SSE data events: %s", stream)
+	}
+	return events
+}
+
+func assertEventType(t *testing.T, event map[string]any, expected string) {
+	t.Helper()
+	if event["type"] != expected {
+		t.Fatalf("event type = %v, want %s", event["type"], expected)
+	}
+}
+
+func doneItemType(event map[string]any) string {
+	item, _ := event["item"].(map[string]any)
+	typeName, _ := item["type"].(string)
+	return typeName
 }
 
 func assertEqualJSON(t *testing.T, actual, expected any) {
