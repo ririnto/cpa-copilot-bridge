@@ -2,6 +2,7 @@ package provider
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/ririnto/cpa-copilot-bridge/internal/compact"
 	"github.com/ririnto/cpa-copilot-bridge/internal/translate"
+	"github.com/ririnto/cpa-copilot-bridge/internal/transport"
 	"github.com/tidwall/gjson"
 )
 
@@ -47,6 +49,49 @@ func TestStreamTerminalRequiresSourceSuccessEvent(t *testing.T) {
 				t.Fatalf("terminal response = %s", terminal.response)
 			}
 		})
+	}
+}
+
+func TestStreamTerminalErrorsWithholdProviderPayload(t *testing.T) {
+	t.Parallel()
+	promptSentinel := "operator-prompt-sentinel-73d2"
+	secretSentinel := "unrecognized-secret-sentinel-81af"
+	tests := []struct {
+		name     string
+		endpoint string
+		frame    string
+	}{
+		{name: "Responses", endpoint: translate.EndpointResponses, frame: "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"operator-prompt-sentinel-73d2 unrecognized-secret-sentinel-81af\"}}\n\n"},
+		{name: "Chat Completions", endpoint: translate.EndpointChatCompletions, frame: "data: {\"error\":{\"message\":\"operator-prompt-sentinel-73d2 unrecognized-secret-sentinel-81af\"}}\n\n"},
+		{name: "Messages", endpoint: translate.EndpointMessages, frame: "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"operator-prompt-sentinel-73d2 unrecognized-secret-sentinel-81af\"}}\n\n"},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			var terminal streamTerminal
+			_, err := terminal.observe(test.endpoint, []byte(test.frame), "copilot-token", "github-token")
+			if err == nil || !strings.Contains(err.Error(), "upstream stream error details withheld") {
+				t.Fatalf("terminal error = %v, want generic provider error", err)
+			}
+			if strings.Contains(err.Error(), promptSentinel) || strings.Contains(err.Error(), secretSentinel) {
+				t.Fatalf("terminal error exposed provider payload: %v", err)
+			}
+		})
+	}
+}
+
+func TestPumpStreamCloseOutputWithholdsProviderPayload(t *testing.T) {
+	promptSentinel := "operator-prompt-sentinel-73d2"
+	secretSentinel := "unrecognized-secret-sentinel-81af"
+	frame := []byte("event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"" + promptSentinel + " " + secretSentinel + "\"}}\n\n")
+	host := &errorStreamHost{chunk: transport.StreamChunk{Payload: frame}}
+	service := New(host)
+	service.pumpStream(context.Background(), "output", translate.EndpointResponses, "openai-response", "model", nil, nil, transport.Stream{ID: "upstream"}, "scope", "copilot-token", "github-token")
+	if host.closedOutputMessage == "" || !strings.Contains(host.closedOutputMessage, "upstream stream error details withheld") {
+		t.Fatalf("close output error = %q, want generic provider error", host.closedOutputMessage)
+	}
+	if strings.Contains(host.closedOutputMessage, promptSentinel) || strings.Contains(host.closedOutputMessage, secretSentinel) {
+		t.Fatalf("close output exposed provider payload: %q", host.closedOutputMessage)
 	}
 }
 

@@ -9,7 +9,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/ririnto/cpa-copilot-bridge/internal/redact"
 	"github.com/ririnto/cpa-copilot-bridge/internal/translate"
 )
 
@@ -310,6 +309,6 @@ func parseSSEFrame(frame []byte) (string, string) {
 	return event, strings.Join(data, "\n")
 }
 
-func redactStreamError(value, copilotToken, githubToken string) string {
-	return redact.ErrorBody([]byte(value), copilotToken, githubToken)
+func redactStreamError(_, _, _ string) string {
+	return "upstream stream error details withheld"
 }

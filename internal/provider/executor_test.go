@@ -18,9 +18,10 @@ import (
 )
 
 type errorStreamHost struct {
-	chunk   transport.StreamChunk
-	readErr error
-	closed  bool
+	chunk               transport.StreamChunk
+	readErr             error
+	closed              bool
+	closedOutputMessage string
 }
 
 func (h *errorStreamHost) Do(context.Context, string, transport.Request) (transport.Response, error) {
@@ -42,7 +43,9 @@ func (h *errorStreamHost) CloseStream(context.Context, string) error {
 
 func (h *errorStreamHost) Emit(context.Context, string, []byte) error { return nil }
 
-func (h *errorStreamHost) CloseOutput(context.Context, string, string) {}
+func (h *errorStreamHost) CloseOutput(_ context.Context, _ string, message string) {
+	h.closedOutputMessage = message
+}
 
 type compactionStreamHost struct {
 	responseBody []byte
