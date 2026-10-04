@@ -302,6 +302,9 @@ func (s *Service) doModelRequest(ctx context.Context, callbackID, authID string,
 		if errToken != nil {
 			return transport.Response{}, token, errToken
 		}
+		if !sameCopilotAPIBaseURL(token.APIBaseURL, refreshed.APIBaseURL) {
+			return transport.Response{}, refreshed, statusError("copilot_origin_changed", "Copilot API origin changed after token refresh", http.StatusConflict)
+		}
 		token = refreshed
 		request.URL = token.APIBaseURL + endpoint
 		request.Headers = copilotHeaders(token.Token, stream)
@@ -334,6 +337,9 @@ func (s *Service) openModelStream(ctx context.Context, callbackID, authID string
 		if errToken != nil {
 			return transport.Stream{}, token, errToken
 		}
+		if !sameCopilotAPIBaseURL(token.APIBaseURL, refreshed.APIBaseURL) {
+			return transport.Stream{}, refreshed, statusError("copilot_origin_changed", "Copilot API origin changed after token refresh", http.StatusConflict)
+		}
 		token = refreshed
 		request.URL = token.APIBaseURL + endpoint
 		request.Headers = copilotHeaders(token.Token, true)
@@ -343,6 +349,10 @@ func (s *Service) openModelStream(ctx context.Context, callbackID, authID string
 		}
 	}
 	return stream, token, nil
+}
+
+func sameCopilotAPIBaseURL(left, right string) bool {
+	return strings.TrimRight(strings.TrimSpace(left), "/") == strings.TrimRight(strings.TrimSpace(right), "/")
 }
 
 func (s *Service) collectStreamError(ctx context.Context, stream transport.Stream, copilotToken, githubToken string) ([]byte, error) {

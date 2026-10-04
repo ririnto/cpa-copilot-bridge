@@ -21,6 +21,7 @@ type refreshTestHost struct {
 	oauthCallbackID   string
 	oauthRequest      transport.Request
 	copilotTokenCalls int
+	tokenAPIBaseURLs  []string
 	modelStatuses     []int
 	modelRequests     []transport.Request
 	streamStatuses    []int
@@ -43,7 +44,15 @@ func (h *refreshTestHost) Do(ctx context.Context, callbackID string, request tra
 	}
 	if strings.HasSuffix(request.URL, "/copilot_internal/v2/token") {
 		h.copilotTokenCalls++
-		body, err := json.Marshal(map[string]any{"token": fmt.Sprintf("copilot-token-%d", h.copilotTokenCalls), "expires_at": time.Now().Add(time.Hour).Unix()})
+		apiBaseURL := "https://api.example"
+		if index := h.copilotTokenCalls - 1; index < len(h.tokenAPIBaseURLs) {
+			apiBaseURL = h.tokenAPIBaseURLs[index]
+		}
+		body, err := json.Marshal(map[string]any{
+			"token":      fmt.Sprintf("copilot-token-%d", h.copilotTokenCalls),
+			"expires_at": time.Now().Add(time.Hour).Unix(),
+			"endpoints":  map[string]string{"api": apiBaseURL},
+		})
 		if err != nil {
 			return transport.Response{}, err
 		}
@@ -247,5 +256,99 @@ func TestModelEndpoint401RetriesAreBounded(t *testing.T) {
 				t.Fatalf("retry authorization headers = %v, want old then refreshed token", requests)
 			}
 		})
+	}
+}
+
+func TestModelEndpoint401RejectsChangedAPIBaseAndUsesItOnFreshRequest(t *testing.T) {
+	for _, operation := range []string{"nonstream", "stream"} {
+		t.Run(operation, func(t *testing.T) {
+			host := &refreshTestHost{tokenAPIBaseURLs: []string{"https://new-api.example"}}
+			service := New(host)
+			storage := authStorage{GitHubAccessToken: "github-access-secret"}
+			initial := copilotTokenEntry{Token: "copilot-old-secret", APIBaseURL: "https://old-api.example", ExpiresAt: time.Now().Add(time.Hour), Fingerprint: tokenFingerprint(storage.GitHubAccessToken)}
+			payload := []byte(`{"prompt":"body-secret"}`)
+			if operation == "stream" {
+				host.streamStatuses = []int{http.StatusUnauthorized, http.StatusOK}
+				_, _, err := service.openModelStream(context.Background(), "callback", "auth-id", storage, initial, "/responses", payload)
+				assertChangedOriginError(t, err)
+				host.mu.Lock()
+				firstRequests := append([]transport.Request(nil), host.streamRequests...)
+				closed := append([]string(nil), host.closedStreamIDs...)
+				tokenCalls := host.copilotTokenCalls
+				host.mu.Unlock()
+				if len(firstRequests) != 1 || firstRequests[0].URL != "https://old-api.example/responses" || string(firstRequests[0].Body) != string(payload) {
+					t.Fatalf("first stream attempts = %#v, want one request to the old base", firstRequests)
+				}
+				if len(closed) != 1 || closed[0] != "stream-1" {
+					t.Fatalf("closed unauthorized streams = %v, want [stream-1]", closed)
+				}
+				if tokenCalls != 1 {
+					t.Fatalf("token exchanges after changed origin = %d, want 1", tokenCalls)
+				}
+				fresh, err := service.copilotToken(context.Background(), "callback", "auth-id", storage)
+				if err != nil || fresh.APIBaseURL != "https://new-api.example" {
+					t.Fatalf("cached refreshed token = %#v, err=%v", fresh, err)
+				}
+				stream, _, err := service.openModelStream(context.Background(), "callback", "auth-id", storage, fresh, "/responses", payload)
+				if err != nil || stream.StatusCode != http.StatusOK {
+					t.Fatalf("fresh stream request = %#v, err=%v", stream, err)
+				}
+				host.mu.Lock()
+				requests := append([]transport.Request(nil), host.streamRequests...)
+				tokenCalls = host.copilotTokenCalls
+				host.mu.Unlock()
+				if len(requests) != 2 || requests[1].URL != "https://new-api.example/responses" || tokenCalls != 1 {
+					t.Fatalf("fresh stream requests=%#v token exchanges=%d", requests, tokenCalls)
+				}
+				return
+			}
+			host.modelStatuses = []int{http.StatusUnauthorized, http.StatusOK}
+			_, refreshed, err := service.doModelRequest(context.Background(), "callback", "auth-id", storage, initial, "/responses", payload, false)
+			assertChangedOriginError(t, err)
+			host.mu.Lock()
+			firstRequests := append([]transport.Request(nil), host.modelRequests...)
+			tokenCalls := host.copilotTokenCalls
+			host.mu.Unlock()
+			if len(firstRequests) != 1 || firstRequests[0].URL != "https://old-api.example/responses" || string(firstRequests[0].Body) != string(payload) {
+				t.Fatalf("first model attempts = %#v, want one request to the old base", firstRequests)
+			}
+			if tokenCalls != 1 || refreshed.APIBaseURL != "https://new-api.example" {
+				t.Fatalf("refreshed token = %#v, token exchanges=%d", refreshed, tokenCalls)
+			}
+			fresh, err := service.copilotToken(context.Background(), "callback", "auth-id", storage)
+			if err != nil || fresh.APIBaseURL != "https://new-api.example" {
+				t.Fatalf("cached refreshed token = %#v, err=%v", fresh, err)
+			}
+			response, _, err := service.doModelRequest(context.Background(), "callback", "auth-id", storage, fresh, "/responses", payload, false)
+			if err != nil || response.StatusCode != http.StatusOK {
+				t.Fatalf("fresh model request = %#v, err=%v", response, err)
+			}
+			host.mu.Lock()
+			requests := append([]transport.Request(nil), host.modelRequests...)
+			tokenCalls = host.copilotTokenCalls
+			host.mu.Unlock()
+			if len(requests) != 2 || requests[1].URL != "https://new-api.example/responses" || tokenCalls != 1 {
+				t.Fatalf("fresh model requests=%#v token exchanges=%d", requests, tokenCalls)
+			}
+		})
+	}
+}
+
+func assertChangedOriginError(t *testing.T, err error) {
+	t.Helper()
+	statusErr, ok := err.(*StatusError)
+	if !ok || statusErr.Code != "copilot_origin_changed" || statusErr.HTTPStatus != http.StatusConflict || statusErr.Message != "Copilot API origin changed after token refresh" {
+		t.Fatalf("changed-origin error = %#v", err)
+	}
+	for _, secret := range []string{"old-api.example", "new-api.example", "copilot-old-secret", "github-access-secret", "body-secret"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("changed-origin error leaked %q", secret)
+		}
+	}
+}
+
+func TestSameCopilotAPIBaseURLUsesScopeTrimming(t *testing.T) {
+	if !sameCopilotAPIBaseURL(" https://api.example/// ", "https://api.example/") {
+		t.Fatal("trailing spaces and slashes changed the API base scope")
 	}
 }
