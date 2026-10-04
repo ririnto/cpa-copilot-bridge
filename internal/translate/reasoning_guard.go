@@ -2,6 +2,7 @@ package translate
 
 import (
 	"fmt"
+	"strings"
 
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
@@ -16,7 +17,10 @@ func rejectOpaqueReasoningRequest(from, to sdktranslator.Format, body []byte) er
 			return fmt.Errorf("cannot translate signed or redacted Claude reasoning from %s to %s because this route cannot preserve verification data", from, to)
 		}
 	case sdktranslator.FormatOpenAIResponse:
-		if to != sdktranslator.FormatOpenAIResponse && containsResponsesOpaqueReasoning(body) {
+		if to == sdktranslator.FormatOpenAI && containsForeignResponsesOpaqueReasoning(body) {
+			return fmt.Errorf("cannot translate foreign encrypted Responses reasoning to Copilot Chat")
+		}
+		if to != sdktranslator.FormatOpenAIResponse && to != sdktranslator.FormatOpenAI && to != sdktranslator.FormatClaude && containsResponsesOpaqueReasoning(body) {
 			return fmt.Errorf("cannot translate encrypted Responses reasoning from %s to %s because this route cannot preserve verification data", from, to)
 		}
 	}
@@ -93,6 +97,34 @@ func containsClaudeOpaqueValue(value any) bool {
 func containsResponsesOpaqueReasoning(body []byte) bool {
 	root, err := decodeObject(body)
 	return err == nil && containsResponsesOpaqueValue(root)
+}
+
+func containsForeignResponsesOpaqueReasoning(body []byte) bool {
+	root, err := decodeObject(body)
+	return err == nil && containsForeignResponsesOpaqueValue(root)
+}
+
+func containsForeignResponsesOpaqueValue(value any) bool {
+	switch current := value.(type) {
+	case map[string]any:
+		if rawStringValue(current["type"]) == "reasoning" {
+			if encrypted := rawStringValue(current["encrypted_content"]); encrypted != "" && !strings.HasPrefix(encrypted, copilotOpaquePrefix) {
+				return true
+			}
+		}
+		for _, nested := range current {
+			if containsForeignResponsesOpaqueValue(nested) {
+				return true
+			}
+		}
+	case []any:
+		for _, nested := range current {
+			if containsForeignResponsesOpaqueValue(nested) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func containsResponsesOpaqueValue(value any) bool {

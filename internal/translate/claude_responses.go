@@ -25,8 +25,13 @@ func claudeRequestToResponses(model string, body []byte, stream bool) ([]byte, e
 	copyField(out, root, "temperature", "temperature")
 	copyField(out, root, "top_p", "top_p")
 	copyField(out, root, "metadata", "metadata")
+	copyField(out, root, "prompt_cache_key", "prompt_cache_key")
 
-	if instructions := claudeSystemText(root["system"]); instructions != "" {
+	instructions, systemMessage, err := claudeSystemToResponses(root["system"])
+	if err != nil {
+		return nil, err
+	}
+	if instructions != "" {
 		out["instructions"] = instructions
 	}
 	if tools, ok := root["tools"].([]any); ok {
@@ -43,6 +48,9 @@ func claudeRequestToResponses(model string, body []byte, stream bool) ([]byte, e
 			}
 			if description := stringValue(tool["description"]); description != "" {
 				item["description"] = description
+			}
+			if cacheControl, exists := tool["cache_control"]; exists {
+				item["cache_control"] = cacheControl
 			}
 			converted = append(converted, item)
 		}
@@ -81,17 +89,43 @@ func claudeRequestToResponses(model string, body []byte, stream bool) ([]byte, e
 	}
 
 	input := make([]any, 0)
+	if systemMessage != nil {
+		input = append(input, systemMessage)
+	}
 	messages, _ := root["messages"].([]any)
 	for _, rawMessage := range messages {
 		message, okMessage := rawMessage.(map[string]any)
 		if !okMessage {
+			if hasMeaningfulValue(rawMessage) {
+				return nil, fmt.Errorf("Claude messages contain an unsupported non-object entry")
+			}
 			continue
 		}
 		role := stringValue(message["role"])
 		if role != "user" && role != "assistant" {
+			if role != "" || hasMeaningfulValue(message["content"]) {
+				return nil, fmt.Errorf("unsupported Claude message role %q", role)
+			}
 			continue
 		}
-		parts := claudeContentParts(message["content"])
+		parts, err := claudeContentPartsStrict(message["content"])
+		if err != nil {
+			return nil, err
+		}
+		if cacheControl, exists := message["cache_control"]; exists {
+			lastText := -1
+			for index := range parts {
+				if stringValue(parts[index]["type"]) == "text" {
+					lastText = index
+				}
+			}
+			if lastText < 0 {
+				return nil, fmt.Errorf("Claude message cache_control has no text block to preserve")
+			}
+			if _, exists := parts[lastText]["cache_control"]; !exists {
+				parts[lastText]["cache_control"] = cacheControl
+			}
+		}
 		pending := make([]any, 0)
 		flushMessage := func() {
 			if len(pending) == 0 {
@@ -112,7 +146,11 @@ func claudeRequestToResponses(model string, body []byte, stream bool) ([]byte, e
 				if role == "assistant" {
 					contentType = "output_text"
 				}
-				pending = append(pending, map[string]any{"type": contentType, "text": stringValue(part["text"])})
+				item := map[string]any{"type": contentType, "text": rawStringValue(part["text"])}
+				if cacheControl, exists := part["cache_control"]; exists {
+					item["cache_control"] = cacheControl
+				}
+				pending = append(pending, item)
 			case "image":
 				image, errImage := claudeImageToResponses(part)
 				if errImage != nil {
@@ -146,7 +184,11 @@ func claudeRequestToResponses(model string, body []byte, stream bool) ([]byte, e
 				}
 			case "tool_use", "server_tool_use":
 				flushMessage()
-				arguments, errArguments := json.Marshal(objectValue(part["input"]))
+				toolInput, okInput := part["input"].(map[string]any)
+				if !okInput {
+					return nil, fmt.Errorf("Claude tool_use input must be an object")
+				}
+				arguments, errArguments := json.Marshal(toolInput)
 				if errArguments != nil {
 					return nil, fmt.Errorf("encode Claude tool input: %w", errArguments)
 				}
@@ -168,11 +210,19 @@ func claudeRequestToResponses(model string, body []byte, stream bool) ([]byte, e
 					return nil, errOutput
 				}
 				_, callID := responsesToolIDsFromClaude(rawStringValue(part["tool_use_id"]))
-				input = append(input, map[string]any{
+				functionOutput := map[string]any{
 					"type":    "function_call_output",
 					"call_id": callID,
 					"output":  output,
-				})
+				}
+				if cacheControl, exists := part["cache_control"]; exists {
+					functionOutput["cache_control"] = cacheControl
+				}
+				input = append(input, functionOutput)
+			default:
+				if hasMeaningfulClaudePart(part) {
+					return nil, fmt.Errorf("unsupported nonempty Claude content block type %q", partType)
+				}
 			}
 		}
 		flushMessage()
@@ -269,10 +319,56 @@ func claudeSystemText(value any) string {
 	for _, rawPart := range arrayValue(value) {
 		part, ok := rawPart.(map[string]any)
 		if ok && stringValue(part["type"]) == "text" {
-			blocks = append(blocks, stringValue(part["text"]))
+			blocks = append(blocks, rawStringValue(part["text"]))
 		}
 	}
 	return strings.Join(blocks, "\n")
+}
+
+func claudeSystemToResponses(value any) (string, any, error) {
+	if text, ok := value.(string); ok {
+		return text, nil, nil
+	}
+	if value == nil {
+		return "", nil, nil
+	}
+	blocks, ok := value.([]any)
+	if !ok {
+		return "", nil, fmt.Errorf("Claude system content must be text or text blocks")
+	}
+	var texts []string
+	content := make([]any, 0, len(blocks))
+	hasCacheControl := false
+	for _, rawBlock := range blocks {
+		block, okBlock := rawBlock.(map[string]any)
+		if !okBlock {
+			if hasMeaningfulValue(rawBlock) {
+				return "", nil, fmt.Errorf("Claude system content contains an unsupported non-object block")
+			}
+			continue
+		}
+		if stringValue(block["type"]) != "text" {
+			if hasMeaningfulClaudePart(block) {
+				return "", nil, fmt.Errorf("unsupported nonempty Claude system block type %q", stringValue(block["type"]))
+			}
+			continue
+		}
+		text, okText := block["text"].(string)
+		if !okText {
+			return "", nil, fmt.Errorf("Claude system text block has no string text")
+		}
+		texts = append(texts, text)
+		item := map[string]any{"type": "input_text", "text": text}
+		if cacheControl, exists := block["cache_control"]; exists {
+			item["cache_control"] = cacheControl
+			hasCacheControl = true
+		}
+		content = append(content, item)
+	}
+	if !hasCacheControl {
+		return strings.Join(texts, "\n"), nil, nil
+	}
+	return "", map[string]any{"type": "message", "role": "system", "content": content}, nil
 }
 
 func claudeReasoningEffort(root map[string]any) string {
@@ -314,6 +410,57 @@ func claudeContentParts(value any) []map[string]any {
 	return out
 }
 
+func claudeContentPartsStrict(value any) ([]map[string]any, error) {
+	if text, ok := value.(string); ok {
+		return []map[string]any{{"type": "text", "text": text}}, nil
+	}
+	if value == nil {
+		return nil, nil
+	}
+	values, ok := value.([]any)
+	if !ok {
+		return nil, fmt.Errorf("Claude content must be text or content blocks")
+	}
+	parts := make([]map[string]any, 0, len(values))
+	for _, rawPart := range values {
+		part, okPart := rawPart.(map[string]any)
+		if !okPart {
+			if hasMeaningfulValue(rawPart) {
+				return nil, fmt.Errorf("Claude content contains an unsupported non-object block")
+			}
+			continue
+		}
+		parts = append(parts, part)
+	}
+	return parts, nil
+}
+
+func hasMeaningfulClaudePart(part map[string]any) bool {
+	for key, value := range part {
+		if key != "type" && hasMeaningfulValue(value) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasMeaningfulValue(value any) bool {
+	switch current := value.(type) {
+	case nil:
+		return false
+	case string:
+		return current != ""
+	case []any:
+		return len(current) > 0
+	case map[string]any:
+		return len(current) > 0
+	case bool:
+		return current
+	default:
+		return true
+	}
+}
+
 func claudeImageToResponses(part map[string]any) (map[string]any, error) {
 	source, ok := part["source"].(map[string]any)
 	if !ok {
@@ -322,12 +469,16 @@ func claudeImageToResponses(part map[string]any) (map[string]any, error) {
 	switch stringValue(source["type"]) {
 	case "base64":
 		mediaType := firstNonEmptyString(stringValue(source["media_type"]), "application/octet-stream")
-		return map[string]any{
+		item := map[string]any{
 			"type":      "input_image",
-			"image_url": "data:" + mediaType + ";base64," + stringValue(source["data"]),
-		}, nil
+			"image_url": "data:" + mediaType + ";base64," + rawStringValue(source["data"]),
+		}
+		copyCacheControl(item, part)
+		return item, nil
 	case "url":
-		return map[string]any{"type": "input_image", "image_url": stringValue(source["url"])}, nil
+		item := map[string]any{"type": "input_image", "image_url": rawStringValue(source["url"])}
+		copyCacheControl(item, part)
+		return item, nil
 	default:
 		return nil, fmt.Errorf("unsupported Claude image source type %q", stringValue(source["type"]))
 	}
@@ -342,17 +493,18 @@ func claudeDocumentToResponses(part map[string]any) (map[string]any, error) {
 	switch stringValue(source["type"]) {
 	case "base64":
 		mediaType := firstNonEmptyString(stringValue(source["media_type"]), "application/octet-stream")
-		item["file_data"] = "data:" + mediaType + ";base64," + stringValue(source["data"])
+		item["file_data"] = "data:" + mediaType + ";base64," + rawStringValue(source["data"])
 	case "url":
-		item["file_url"] = stringValue(source["url"])
+		item["file_url"] = rawStringValue(source["url"])
 	case "text":
-		item["file_data"] = stringValue(source["data"])
+		item["file_data"] = rawStringValue(source["data"])
 	default:
 		return nil, fmt.Errorf("unsupported Claude document source type %q", stringValue(source["type"]))
 	}
-	if title := stringValue(part["title"]); title != "" {
+	if title := rawStringValue(part["title"]); title != "" {
 		item["filename"] = title
 	}
+	copyCacheControl(item, part)
 	return item, nil
 }
 
@@ -360,23 +512,45 @@ func claudeToolResultOutput(value any) (any, error) {
 	if text, ok := value.(string); ok {
 		return text, nil
 	}
-	parts := make([]any, 0)
-	for _, part := range claudeContentParts(value) {
+	parts, err := claudeContentPartsStrict(value)
+	if err != nil {
+		return nil, err
+	}
+	converted := make([]any, 0)
+	for _, part := range parts {
 		switch stringValue(part["type"]) {
 		case "text":
-			parts = append(parts, map[string]any{"type": "input_text", "text": stringValue(part["text"])})
+			item := map[string]any{"type": "input_text", "text": rawStringValue(part["text"])}
+			copyCacheControl(item, part)
+			converted = append(converted, item)
 		case "image":
 			image, err := claudeImageToResponses(part)
 			if err != nil {
 				return nil, err
 			}
-			parts = append(parts, image)
+			converted = append(converted, image)
+		case "document":
+			document, err := claudeDocumentToResponses(part)
+			if err != nil {
+				return nil, err
+			}
+			converted = append(converted, document)
+		default:
+			if hasMeaningfulClaudePart(part) {
+				return nil, fmt.Errorf("unsupported nonempty Claude tool-result block type %q", stringValue(part["type"]))
+			}
 		}
 	}
-	if len(parts) == 0 {
+	if len(converted) == 0 {
 		return "", nil
 	}
-	return parts, nil
+	return converted, nil
+}
+
+func copyCacheControl(target, source map[string]any) {
+	if cacheControl, exists := source["cache_control"]; exists {
+		target["cache_control"] = cacheControl
+	}
 }
 
 func responsesReasoningText(item map[string]any) string {

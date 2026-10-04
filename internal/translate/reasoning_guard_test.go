@@ -8,7 +8,7 @@ import (
 
 func TestOpaqueReasoningRejectsLossyProtocolRoutes(t *testing.T) {
 	signedClaude := []byte(`{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"reason","signature":"opaque-signature"}]}]}`)
-	if _, err := RequestForEndpointFrom("claude", "gpt-test", signedClaude, false, EndpointChatCompletions); err == nil || !strings.Contains(err.Error(), "verification data") {
+	if _, err := RequestForEndpointFrom("claude", "gpt-test", signedClaude, false, EndpointChatCompletions); err == nil || !strings.Contains(err.Error(), "foreign encrypted Responses reasoning") {
 		t.Fatalf("signed Claude request error = %v", err)
 	}
 	if _, err := RequestForEndpointFrom("claude", "gpt-test", signedClaude, false, EndpointResponses); err != nil {
