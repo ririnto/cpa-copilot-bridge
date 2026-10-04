@@ -52,7 +52,10 @@ The plugin refreshes short-lived Copilot tokens in memory.
 Each request refreshes a Copilot token if it expires within the default five-minute buffer.
 Configure the buffer with `token_expiry_buffer_seconds`.
 On an upstream 401, the bridge invalidates its cached Copilot token.
-The bridge retries once for model discovery, JSON execution, and SSE execution.
+The bridge retries model discovery once with the renewed token.
+JSON and SSE execution retry once only when the API origin stays unchanged.
+An origin change returns HTTP 409 before the bridge sends the prepared request to the new origin.
+Start a new conversation after an API origin change.
 The bridge refreshes a GitHub OAuth credential near expiry only when it has a refresh token.
 The host persists rotated GitHub credentials returned through its normal auth callback.
 Non-expiring GitHub credentials need no OAuth refresh, but the plugin still mints short-lived Copilot tokens.

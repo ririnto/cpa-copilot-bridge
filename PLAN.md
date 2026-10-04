@@ -142,3 +142,6 @@ Repeat affected package, native host, and live Chat replay checks before the rev
 Passed the final Go 1.26.8 check and all native host protocol cases after both fixes.
 Passed all four live Chat JSON and SSE replay combinations with authenticated carriers.
 Passed installed Claude Code and Codex tool execution and resume on the affected Chat model.
+Reject an API-origin transition during a model retry before sending the prepared history to the new origin.
+Keep same-origin token renewal and retry behavior intact.
+Validate typed thinking signatures regardless of message role before forwarding.

@@ -15,7 +15,10 @@ These contracts describe behavior that clients and the CLIProxyAPI host can obse
 
 - Renew Copilot API tokens within the configurable expiry buffer.
 - On an upstream 401, invalidate the cached Copilot token.
-- Retry once for model discovery, JSON execution, and SSE execution.
+- Retry model discovery once with the renewed token.
+- Retry JSON and SSE execution once only when the API origin stays unchanged.
+- Return HTTP 409 before forwarding prepared requests to a changed origin.
+- Keep the refreshed token for new requests after the rejected exchange.
 - Refresh a GitHub OAuth credential near expiry only when it has a refresh token.
 - Return rotated GitHub credentials through the host auth callback for normal host persistence.
 - Keep configured OAuth permissions unchanged.
