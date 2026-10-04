@@ -63,6 +63,11 @@ func (s *Service) Execute(ctx context.Context, req ExecuteRequest) (pluginapi.Ex
 	if errEndpoint != nil {
 		return pluginapi.ExecutorResponse{}, errEndpoint
 	}
+	carrierScope := reasoningCarrierScopeFor(req.AuthID, storage, req.Model, endpoint, token)
+	translationPayload, errClaudeInput = unwrapRequestReasoningCarriers(sourceFormat, translationPayload, carrierScope)
+	if errClaudeInput != nil {
+		return pluginapi.ExecutorResponse{}, statusError("reasoning_carrier_error", errClaudeInput.Error(), http.StatusUnprocessableEntity)
+	}
 	if (v1Compact || v2Compact) && endpoint != translate.EndpointResponses {
 		return pluginapi.ExecutorResponse{}, statusError("unsupported_compaction_endpoint", "Responses compaction requires the Copilot Responses endpoint", http.StatusUnprocessableEntity)
 	}
@@ -131,6 +136,12 @@ func (s *Service) Execute(ctx context.Context, req ExecuteRequest) (pluginapi.Ex
 	if errResponse != nil {
 		return pluginapi.ExecutorResponse{}, statusError("translation_error", errResponse.Error(), http.StatusBadGateway)
 	}
+	if endpoint == translate.EndpointChatCompletions {
+		body, errResponse = sealResponseReasoningCarriers(sourceFormat, body, carrierScope)
+		if errResponse != nil {
+			return pluginapi.ExecutorResponse{}, statusError("reasoning_carrier_error", errResponse.Error(), http.StatusBadGateway)
+		}
+	}
 	if endpoint == translate.EndpointResponses {
 		s.recordReasoningReplay(scopeKey, resp.Body)
 	}
@@ -193,6 +204,11 @@ func (s *Service) ExecuteStream(ctx context.Context, req ExecuteRequest) (http.H
 	if errEndpoint != nil {
 		return nil, errEndpoint
 	}
+	carrierScope := reasoningCarrierScopeFor(req.AuthID, storage, req.Model, endpoint, token)
+	translationPayload, errClaudeInput = unwrapRequestReasoningCarriers(sourceFormat, translationPayload, carrierScope)
+	if errClaudeInput != nil {
+		return nil, statusError("reasoning_carrier_error", errClaudeInput.Error(), http.StatusUnprocessableEntity)
+	}
 	requestBody, errTranslate := translate.RequestForEndpointFrom(sourceFormat, req.Model, translationPayload, true, endpoint)
 	if errTranslate != nil {
 		return nil, statusError("translation_error", errTranslate.Error(), http.StatusUnprocessableEntity)
@@ -247,7 +263,7 @@ func (s *Service) ExecuteStream(ctx context.Context, req ExecuteRequest) (http.H
 		}
 		return nil, upstreamStatusError(upstream.StatusCode, redact.ErrorBody(body, token.Token, storage.GitHubAccessToken))
 	}
-	go s.pumpStream(ctx, req.StreamID, endpoint, sourceFormat, req.Model, req.OriginalRequest, requestBody, upstream, scopeKey, token.Token, storage.GitHubAccessToken)
+	go s.pumpStream(ctx, req.StreamID, endpoint, sourceFormat, req.Model, req.OriginalRequest, requestBody, upstream, scopeKey, carrierScope, token.Token, storage.GitHubAccessToken)
 	headers := filterResponseHeaders(upstream.Headers)
 	headers.Set("Content-Type", "text/event-stream")
 	headers.Set("Cache-Control", "no-cache")
@@ -358,7 +374,7 @@ func (s *Service) collectStreamError(ctx context.Context, stream transport.Strea
 	}
 }
 
-func (s *Service) pumpStream(ctx context.Context, outputID, endpoint, destination, model string, original, translated []byte, upstream transport.Stream, scopeKey, copilotToken, githubToken string) {
+func (s *Service) pumpStream(ctx context.Context, outputID, endpoint, destination, model string, original, translated []byte, upstream transport.Stream, scopeKey string, carrierScope reasoningCarrierScope, copilotToken, githubToken string) {
 	var terminalErr error
 	var terminal streamTerminal
 	defer func() {
@@ -380,6 +396,13 @@ func (s *Service) pumpStream(ctx context.Context, outputID, endpoint, destinatio
 		for _, output := range frames {
 			if len(output) == 0 {
 				continue
+			}
+			if endpoint == translate.EndpointChatCompletions {
+				sealed, errSeal := sealReasoningCarrierSSEFrame(destination, output, carrierScope)
+				if errSeal != nil {
+					return errSeal
+				}
+				output = sealed
 			}
 			if errEmit := s.host.Emit(ctx, outputID, output); errEmit != nil {
 				return errEmit

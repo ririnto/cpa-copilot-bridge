@@ -879,7 +879,7 @@ func assertMatrixClientOutput(t *testing.T, route matrixRoute, body []byte, stre
 			case "reasoning":
 				encrypted := stringValue(item["encrypted_content"])
 				switch {
-				case strings.HasPrefix(encrypted, "cpa-copilot-reasoning:v1:"):
+				case strings.HasPrefix(encrypted, "cpa-copilot-reasoning-auth:v1:"):
 					output.Signature = encrypted
 				case strings.HasPrefix(encrypted, "claude-redacted-thinking:"):
 					output.Redacted = strings.TrimPrefix(encrypted, "claude-redacted-thinking:")
@@ -1035,12 +1035,27 @@ func assertMatrixOutputSemantics(t *testing.T, route matrixRoute, output matrixO
 
 func assertChatReasoningCarrier(t *testing.T, carrier, model string) string {
 	t.Helper()
-	const prefix = "cpa-copilot-reasoning:v1:"
-	if !strings.HasPrefix(carrier, prefix) {
+	const authPrefix = "cpa-copilot-reasoning-auth:v1:"
+	if !strings.HasPrefix(carrier, authPrefix) {
 		t.Fatalf("Chat reasoning carrier missing or malformed: %q", carrier)
 	}
-	encoded := strings.TrimPrefix(carrier, prefix)
-	jsonEnvelope, err := base64.RawURLEncoding.DecodeString(encoded)
+	encodedInner, encodedMAC, ok := strings.Cut(strings.TrimPrefix(carrier, authPrefix), ".")
+	if !ok || encodedInner == "" || encodedMAC == "" || strings.Contains(encodedMAC, ".") {
+		t.Fatalf("Chat reasoning authentication wrapper is malformed: %q", carrier)
+	}
+	mac, err := base64.RawURLEncoding.DecodeString(encodedMAC)
+	if err != nil || len(mac) != 32 {
+		t.Fatalf("Chat reasoning authentication tag must be base64url HMAC-SHA256: %q", encodedMAC)
+	}
+	inner, err := base64.RawURLEncoding.DecodeString(encodedInner)
+	if err != nil {
+		t.Fatalf("decode authenticated Chat reasoning carrier: %v", err)
+	}
+	const innerPrefix = "cpa-copilot-reasoning:v1:"
+	if !strings.HasPrefix(string(inner), innerPrefix) {
+		t.Fatalf("Chat reasoning authentication wrapper has an unexpected inner carrier: %q", inner)
+	}
+	jsonEnvelope, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(string(inner), innerPrefix))
 	if err != nil {
 		t.Fatalf("decode Chat reasoning envelope: %v", err)
 	}

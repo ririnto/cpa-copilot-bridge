@@ -86,7 +86,7 @@ func TestPumpStreamCloseOutputWithholdsProviderPayload(t *testing.T) {
 	frame := []byte("event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"" + promptSentinel + " " + secretSentinel + "\"}}\n\n")
 	host := &errorStreamHost{chunk: transport.StreamChunk{Payload: frame}}
 	service := New(host)
-	service.pumpStream(context.Background(), "output", translate.EndpointResponses, "openai-response", "model", nil, nil, transport.Stream{ID: "upstream"}, "scope", "copilot-token", "github-token")
+	service.pumpStream(context.Background(), "output", translate.EndpointResponses, "openai-response", "model", nil, nil, transport.Stream{ID: "upstream"}, "scope", reasoningCarrierScope{}, "copilot-token", "github-token")
 	if host.closedOutputMessage == "" || !strings.Contains(host.closedOutputMessage, "upstream stream error details withheld") {
 		t.Fatalf("close output error = %q, want generic provider error", host.closedOutputMessage)
 	}
