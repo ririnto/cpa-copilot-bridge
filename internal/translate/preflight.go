@@ -12,6 +12,12 @@ func validateResponsesRequestForTarget(body []byte, target sdktranslator.Format)
 	if err != nil {
 		return fmt.Errorf("decode Responses request for translation")
 	}
+	if previousResponseID, exists := root["previous_response_id"]; exists && previousResponseID != nil {
+		value, isString := previousResponseID.(string)
+		if !isString || value != "" {
+			return fmt.Errorf("Responses previous_response_id cannot be translated to %s", target)
+		}
+	}
 	input := root["input"]
 	if input == nil || !hasMeaningfulValue(input) {
 		return nil

@@ -59,6 +59,47 @@ func TestResponsesRequestPreflightRejectsDroppedBlocks(t *testing.T) {
 	}
 }
 
+func TestResponsesPreviousResponseIDIsRejectedForCrossFormatRequests(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		endpoint string
+		stream   bool
+	}{
+		{name: "Chat JSON", endpoint: EndpointChatCompletions},
+		{name: "Chat SSE", endpoint: EndpointChatCompletions, stream: true},
+		{name: "Messages JSON", endpoint: EndpointMessages},
+		{name: "Messages SSE", endpoint: EndpointMessages, stream: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := RequestForEndpointFrom("openai-response", "gpt-test", []byte(`{"previous_response_id":"resp_previous"}`), test.stream, test.endpoint); err == nil {
+				t.Fatal("history-only previous_response_id was silently dropped")
+			}
+		})
+	}
+}
+
+func TestResponsesPreviousResponseIDEmptyAndNullRemainCompatible(t *testing.T) {
+	for _, endpoint := range []string{EndpointChatCompletions, EndpointMessages} {
+		for _, value := range []string{`""`, "null"} {
+			request := []byte(`{"previous_response_id":` + value + `,"input":"keep this prompt"}`)
+			if _, err := RequestForEndpointFrom("openai-response", "gpt-test", request, false, endpoint); err != nil {
+				t.Fatalf("empty/null previous_response_id rejected for %s: %v", endpoint, err)
+			}
+		}
+	}
+}
+
+func TestNativeResponsesPreservesPreviousResponseID(t *testing.T) {
+	request := []byte(`{"model":"old","previous_response_id":"resp_previous","input":[]}`)
+	translated, err := RequestForEndpointFrom("openai-response", "gpt-test", request, false, EndpointResponses)
+	if err != nil {
+		t.Fatalf("translate native Responses request: %v", err)
+	}
+	if got := gjson.GetBytes(translated, "previous_response_id").String(); got != "resp_previous" {
+		t.Fatalf("native previous_response_id = %q; request=%s", got, translated)
+	}
+}
+
 func TestResponsesRequestPreflightKeepsSupportedToolOutputImages(t *testing.T) {
 	chatBody := []byte(`{"input":[{"type":"custom_tool_call_output","call_id":"call_1","output":[{"type":"input_text","text":"result"},{"type":"input_image","image_url":"https://example.test/image.png"}]}]}`)
 	chat, err := RequestForEndpointFrom("openai-response", "gpt-test", chatBody, false, EndpointChatCompletions)
