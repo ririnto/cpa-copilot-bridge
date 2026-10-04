@@ -62,12 +62,12 @@ Report live-provider behavior as unverified unless a real provider call is expli
 - Passed formatting, race tests, vet, and native builds on Go 1.26.8.
 - Passed eight native host integration cases, including missing-ID restoration, cancellation, and both compaction routes.
 - Completed independent pull request review with no confirmed blockers.
-- Recorded downstream tool identifier limits as follow-up issue #5.
+- Recorded downstream tool identifier limits as a tracked follow-up.
 - Merged the initial delivery into `main` and tagged `v0.1.0`.
 
 ## PR Compatibility and Live Verification
 
-Review upstream PR #4702 and PR #6313 against the public plugin SDK.
+Review upstream prompt-cache and compaction changes against the public plugin SDK.
 Apply feasible behavior without changing upstream PR worktrees.
 Document SDK limits instead of claiming unsupported duplex or provider parity.
 Use the existing Copilot credential in an isolated host for synthetic live requests.
