@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/ririnto/cpa-copilot-bridge/internal/translate"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	cliproxysession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
 )
 
 const (
@@ -41,7 +43,10 @@ type reasoningReplayFunctionCall struct {
 }
 
 func protocolSessionIdentity(payload []byte, headers http.Header, metadata map[string]any) (string, string) {
-	sessionID := firstProtocolHeader(headers, "X-Claude-Code-Session-Id", "Session-Id", "Session_id", "session_id", "X-Codex-Session-Id")
+	sessionID := executionSessionIdentityFromMetadata(metadata)
+	if sessionID == "" {
+		sessionID = firstProtocolHeader(headers, "X-Claude-Code-Session-Id", "Session-Id", "Session_id", "session_id", "X-Codex-Session-Id")
+	}
 	if sessionID == "" {
 		sessionID = sessionIdentityFromPayload(payload)
 	}
@@ -60,6 +65,18 @@ func protocolSessionIdentity(payload []byte, headers http.Header, metadata map[s
 		agentID = "main"
 	}
 	return sessionID, boundedProtocolIdentity(agentID)
+}
+
+func executionSessionIdentityFromMetadata(metadata map[string]any) string {
+	if metadata == nil {
+		return ""
+	}
+	executionID, _ := metadata[cliproxyexecutor.ExecutionSessionMetadataKey].(string)
+	normalized := cliproxysession.NormalizeExplicitID(executionID)
+	if normalized == "" {
+		return ""
+	}
+	return cliproxysession.BoundSessionIdentity("execution:" + normalized)
 }
 
 func firstProtocolHeader(headers http.Header, names ...string) string {
