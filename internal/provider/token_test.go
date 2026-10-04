@@ -14,12 +14,13 @@ import (
 )
 
 type tokenExchangeHost struct {
-	entered  chan string
-	blocking string
-	release  chan struct{}
-	emptyAPI bool
-	mu       sync.Mutex
-	count    int
+	entered   chan string
+	blocking  string
+	release   chan struct{}
+	emptyAPI  bool
+	expiresAt int64
+	mu        sync.Mutex
+	count     int
 }
 
 func (h *tokenExchangeHost) Do(ctx context.Context, _ string, request transport.Request) (transport.Response, error) {
@@ -45,9 +46,13 @@ func (h *tokenExchangeHost) Do(ctx context.Context, _ string, request transport.
 	if !emptyAPI && credential == "github-b" {
 		apiURL = "https://api-b.example"
 	}
+	expiresAt := h.expiresAt
+	if expiresAt == 0 {
+		expiresAt = time.Now().Add(time.Hour).Unix()
+	}
 	response, err := json.Marshal(map[string]any{
 		"token":      "copilot-" + credential,
-		"expires_at": time.Now().Add(time.Hour).Unix(),
+		"expires_at": expiresAt,
 		"endpoints":  map[string]string{"api": apiURL},
 	})
 	if err != nil {
@@ -69,6 +74,43 @@ func (h *tokenExchangeHost) CloseStream(context.Context, string) error { return 
 func (h *tokenExchangeHost) Emit(context.Context, string, []byte) error { return nil }
 
 func (h *tokenExchangeHost) CloseOutput(context.Context, string, string) {}
+
+func TestCopilotTokenCacheRefreshesAtExpiryBufferBoundary(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	host := &tokenExchangeHost{expiresAt: now.Add(5 * time.Minute).Unix()}
+	service := New(host)
+	service.now = func() time.Time { return now }
+	storage := authStorage{GitHubAccessToken: "github-a"}
+	if _, err := service.copilotToken(context.Background(), "callback", "auth", storage); err != nil {
+		t.Fatalf("first token exchange: %v", err)
+	}
+	if _, err := service.copilotToken(context.Background(), "callback", "auth", storage); err != nil {
+		t.Fatalf("token exchange at expiry buffer boundary: %v", err)
+	}
+	if host.count != 2 {
+		t.Fatalf("token exchange count at exact five-minute buffer = %d, want 2", host.count)
+	}
+}
+
+func TestTokenExpiryPrecedence(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	for _, test := range []struct {
+		name  string
+		token copilotTokenResponse
+		want  time.Time
+	}{
+		{name: "explicit expiry first", token: copilotTokenResponse{ExpiresAt: now.Add(15 * time.Minute).Unix(), Token: "opaque;exp=1700000300", RefreshIn: 30}, want: now.Add(15 * time.Minute)},
+		{name: "embedded expiry second", token: copilotTokenResponse{Token: "opaque;exp=1700000600", RefreshIn: 30}, want: now.Add(10 * time.Minute)},
+		{name: "refresh interval third", token: copilotTokenResponse{Token: "opaque", RefreshIn: 90}, want: now.Add(90 * time.Second)},
+		{name: "twenty minute fallback", token: copilotTokenResponse{Token: "opaque"}, want: now.Add(20 * time.Minute)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := tokenExpiry(test.token, now); !got.Equal(test.want) {
+				t.Fatalf("tokenExpiry() = %s, want %s", got, test.want)
+			}
+		})
+	}
+}
 
 func TestCopilotTokenFlightsAreCredentialScoped(t *testing.T) {
 	host := &tokenExchangeHost{entered: make(chan string, 3), blocking: "github-a", release: make(chan struct{})}
