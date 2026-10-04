@@ -110,13 +110,21 @@ flowchart LR
 ```
 
 The bridge preserves native content blocks, block order, and opaque identifiers on same-format routes.
-Across formats, the bridge translates supported tool-call input and carries opaque reasoning through reversible carriers bound to the Copilot scope.
+Across formats, the bridge translates supported tool-call input and carries opaque reasoning through reversible carriers.
+For Chat opaque state, the inner carrier preserves the exact opaque JSON value.
+The authenticated outer wrapper binds Chat replay to the selected auth entry, GitHub credential, API origin, model, and endpoint.
+It remains valid across restarts and short-lived Copilot token renewal while the GitHub access credential stays unchanged.
+A GitHub access-credential change, including OAuth rotation, invalidates old wrappers.
+The bridge rejects caller-supplied v1 carrier data without its authenticated wrapper.
 Each cross-format route handles only its defined block types.
 The bridge rejects non-empty blocks without a target mapping instead of dropping them.
 Opaque replay requires the matching Copilot scope and a unique assistant or tool-call anchor.
 The bridge rejects opaque conversions that cannot retain verification data and tool identifiers it cannot represent safely.
 The bridge preflights request, response, and SSE shapes and returns errors when conversion would drop content.
-The bridge keeps Responses item IDs, tool `call_id` values, encrypted reasoning, and previous-response references distinct.
+Native Responses routes preserve `previous_response_id` references.
+Chat Completions and Messages routes cannot resolve server-side Responses context.
+Those routes reject a meaningful `previous_response_id` value.
+Send full input history for cross-format turns that use prior Responses context.
 The bridge keeps Claude signed thinking and redacted thinking intact on the native Messages path.
 Claude-to-Responses requests set `store: false` and request the `reasoning.encrypted_content` include for follow-up turns.
 The bridge carries Claude signatures and separate tool identifiers through reversible protocol carriers.
@@ -168,7 +176,7 @@ The bridge encrypts each capsule and binds it to the account credential, API ori
 The bridge replays its capsule after a host or plugin restart when the same credential and scope remain available.
 The plugin expands its own valid capsule into background history on a later request.
 The bridge rejects tampered capsules and capsules from a different scope.
-Credential replacement invalidates capsules issued with the previous credential.
+A GitHub access-credential change, including OAuth rotation, invalidates old capsules.
 The bridge binds capsule state to its Copilot auth entry because the public SDK offers no generic selected-auth keyring.
 The public plugin SDK does not expose Codex duplex steer or queue operations, so those compaction requests are unsupported.
 

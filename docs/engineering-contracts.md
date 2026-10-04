@@ -38,13 +38,21 @@ These contracts describe behavior that clients and the CLIProxyAPI host can obse
 ## Protocol Preservation
 
 - Preserve native content blocks, block order, and opaque identifiers on same-format routes.
-- Translate supported tool-call input across formats and carry opaque reasoning through reversible carriers bound to the Copilot scope.
+- Translate supported tool-call input across formats and carry opaque reasoning through reversible carriers.
+- Preserve the exact opaque JSON value in the inner Chat carrier.
+- Bind the authenticated outer wrapper to the selected auth entry, GitHub credential, API origin, model, and endpoint.
+- Retain the wrapper across restarts and short-lived Copilot token renewal while the GitHub access credential remains unchanged.
+- Invalidate the wrapper when the GitHub access credential changes, including OAuth rotation.
+- Reject caller-supplied v1 carrier data without the authenticated wrapper.
 - Handle only defined block types on each cross-format route.
 - Reject non-empty blocks without a target mapping instead of dropping them.
 - Restore opaque state only for a matching Copilot scope and a unique assistant or tool-call anchor.
 - Reject opaque conversions that cannot retain verification data and tool identifiers the destination cannot represent safely.
 - Preflight request, response, and SSE shapes and return errors when conversion would drop content.
 - Keep item identifiers, tool-call correlation, encrypted reasoning, signatures, ordering, and provider history intact.
+- Preserve `previous_response_id` on native Responses routes.
+- Reject non-empty `previous_response_id` when converting to Chat Completions or Messages because those endpoints cannot resolve Responses server-side context.
+- Require full input history for cross-format turns that use prior Responses context.
 - Translate only across formats and reject a conversion that cannot support a valid next turn.
 - Preserve protocol-visible status, usage, error, and stream completion semantics.
 - Decode server-sent events by frame boundaries and propagate cancellation through active streams.
@@ -56,6 +64,7 @@ These contracts describe behavior that clients and the CLIProxyAPI host can obse
 - Create replay capsules from completed responses and authenticate them before replay.
 - Bind compaction capsules to the account credential, API origin, model, and protocol endpoint.
 - Replay capsules across host or plugin reloads while the same credential and scope remain available.
+- Invalidate old capsules when the GitHub access credential changes, including OAuth rotation.
 - Keep capsule state tied to the bridge's Copilot auth entry because the SDK cannot access a generic selected-auth keyring.
 - The plugin cannot compact Codex duplex steer or queue requests because the public SDK exposes no operations for them.
 - Bind reasoning replay to the auth entry, model, endpoint, session, and agent.

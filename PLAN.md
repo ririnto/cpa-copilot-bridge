@@ -131,3 +131,14 @@ Passed buffered JSON and SSE compaction followed by authenticated capsule replay
 Confirmed the host exposes only eligible authenticated model IDs and configured aliases.
 Rendered the README Mermaid source to SVG and PNG and inspected the PNG.
 Raw runtime evidence and authentication remain outside repository publications.
+
+## Published Review Fixes
+
+Reject cross-format `previous_response_id` references because Chat and Messages cannot resolve Responses server-side context.
+Keep native Responses references unchanged and require full history for cross-format replay.
+Authenticate Chat opaque carriers at the selected provider credential boundary before accepting replay.
+Bind the wrapper to the auth entry, credential, API origin, model, and endpoint.
+Repeat affected package, native host, and live Chat replay checks before the reviewer reassesses these changes.
+Passed the final Go 1.26.8 check and all native host protocol cases after both fixes.
+Passed all four live Chat JSON and SSE replay combinations with authenticated carriers.
+Passed installed Claude Code and Codex tool execution and resume on the affected Chat model.
