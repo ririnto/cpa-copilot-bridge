@@ -25,12 +25,17 @@ type upstreamModel struct {
 	Name                string            `json:"name"`
 	Version             string            `json:"version"`
 	Object              string            `json:"object"`
-	ModelPickerEnabled  bool              `json:"model_picker_enabled"`
+	ModelPickerEnabled  *bool             `json:"model_picker_enabled"`
+	Policy              *modelPolicy      `json:"policy"`
 	Preview             bool              `json:"preview"`
 	SupportedEndpoints  []string          `json:"supported_endpoints"`
 	WarningMessages     []modelMessage    `json:"warning_messages"`
 	InformationMessages []modelMessage    `json:"info_messages"`
 	Capabilities        modelCapabilities `json:"capabilities"`
+}
+
+type modelPolicy struct {
+	State string `json:"state"`
 }
 
 type modelMessage struct {
@@ -69,7 +74,6 @@ type modelCacheEntry struct {
 	ConfigGeneration uint64
 	ExpiresAt        time.Time
 	Models           []upstreamModel
-	ByID             map[string]upstreamModel
 }
 
 func (s *Service) StaticModels() pluginapi.ModelResponse {
@@ -85,7 +89,9 @@ func (s *Service) ModelsForAuth(ctx context.Context, callbackID string, req plug
 	if errModels != nil {
 		return pluginapi.ModelResponse{}, errModels
 	}
-	return pluginapi.ModelResponse{Provider: providerID, Models: modelInfos(models)}, nil
+	cfg := s.Config()
+	available := filterModels(availableModels(models), cfg.ExcludedModelPrefixes)
+	return pluginapi.ModelResponse{Provider: providerID, Models: modelInfos(available)}, nil
 }
 
 func (s *Service) models(ctx context.Context, callbackID, authID string, storage authStorage, force bool) ([]upstreamModel, copilotTokenEntry, error) {
@@ -142,15 +148,8 @@ func (s *Service) models(ctx context.Context, callbackID, authID string, storage
 	if generation != token.ConfigGeneration {
 		return nil, copilotTokenEntry{}, fmt.Errorf("Copilot configuration changed during model discovery")
 	}
-	cleaned := filterModels(normalizeModels(list.Data), cfg.ExcludedModelPrefixes)
-	if len(cleaned) == 0 {
-		return nil, copilotTokenEntry{}, fmt.Errorf("Copilot models endpoint returned no usable models")
-	}
+	inventory := normalizeModels(list.Data)
 
-	byID := make(map[string]upstreamModel, len(cleaned))
-	for _, model := range cleaned {
-		byID[strings.ToLower(model.ID)] = model
-	}
 	s.configMu.RLock()
 	if s.configGeneration != token.ConfigGeneration {
 		s.configMu.RUnlock()
@@ -162,34 +161,70 @@ func (s *Service) models(ctx context.Context, callbackID, authID string, storage
 		APIBaseURL:       token.APIBaseURL,
 		ConfigGeneration: token.ConfigGeneration,
 		ExpiresAt:        now.Add(cfg.modelCacheTTL()),
-		Models:           cloneUpstreamModels(cleaned),
-		ByID:             byID,
+		Models:           cloneUpstreamModels(inventory),
 	}
 	s.modelMu.Unlock()
 	s.configMu.RUnlock()
-	return cleaned, token, nil
+	return inventory, token, nil
 }
 
-func (s *Service) endpointForModel(ctx context.Context, callbackID, authID string, storage authStorage, modelID, sourceFormat string) (string, copilotTokenEntry, error) {
+func (s *Service) endpointForModel(ctx context.Context, callbackID, authID string, storage authStorage, modelID, sourceFormat string) (string, upstreamModel, copilotTokenEntry, error) {
 	modelID = strings.TrimSpace(modelID)
 	if modelID == "" {
-		return "", copilotTokenEntry{}, statusError("invalid_request", "model is required", http.StatusBadRequest)
+		return "", upstreamModel{}, copilotTokenEntry{}, statusError("invalid_request", "model is required", http.StatusBadRequest)
 	}
 	if endpoint := s.endpointOverride(modelID); endpoint != "" {
-		token, errToken := s.copilotToken(ctx, callbackID, authID, storage)
-		return endpoint, token, errToken
+		models, token, errModels := s.models(ctx, callbackID, authID, storage, false)
+		if errModels != nil {
+			return "", upstreamModel{}, copilotTokenEntry{}, errModels
+		}
+		for _, model := range models {
+			if strings.EqualFold(model.ID, modelID) {
+				if !modelPolicyAllowsUse(model.Policy) {
+					return "", upstreamModel{}, token, statusError("model_not_found", "Copilot model is not present in the authenticated model catalog", http.StatusNotFound)
+				}
+				return endpoint, model, token, nil
+			}
+		}
+		return endpoint, upstreamModel{}, token, nil
 	}
 	models, token, errModels := s.models(ctx, callbackID, authID, storage, false)
 	if errModels != nil {
-		return "", copilotTokenEntry{}, errModels
+		return "", upstreamModel{}, copilotTokenEntry{}, errModels
 	}
-	for _, model := range models {
+	cfg := s.Config()
+	for _, model := range filterModels(availableModels(models), cfg.ExcludedModelPrefixes) {
 		if strings.EqualFold(model.ID, modelID) {
 			endpoint, errEndpoint := selectEndpoint(model, sourceFormat)
-			return endpoint, token, errEndpoint
+			return endpoint, model, token, errEndpoint
 		}
 	}
-	return "", token, statusError("model_not_found", "Copilot model is not present in the authenticated model catalog", http.StatusNotFound)
+	return "", upstreamModel{}, token, statusError("model_not_found", "Copilot model is not present in the authenticated model catalog", http.StatusNotFound)
+}
+
+func availableModels(models []upstreamModel) []upstreamModel {
+	out := make([]upstreamModel, 0, len(models))
+	for _, model := range models {
+		if !modelAvailable(model) {
+			continue
+		}
+		out = append(out, model)
+	}
+	return out
+}
+
+func modelAvailable(model upstreamModel) bool {
+	if !modelPolicyAllowsUse(model.Policy) || model.ModelPickerEnabled != nil && !*model.ModelPickerEnabled {
+		return false
+	}
+	if modelType := strings.TrimSpace(model.Capabilities.Type); modelType != "" && !strings.EqualFold(modelType, "chat") {
+		return false
+	}
+	return len(normalizeEndpoints(model.SupportedEndpoints)) > 0
+}
+
+func modelPolicyAllowsUse(policy *modelPolicy) bool {
+	return policy == nil || strings.EqualFold(strings.TrimSpace(policy.State), "enabled")
 }
 
 func (s *Service) endpointOverride(modelID string) string {
@@ -198,7 +233,7 @@ func (s *Service) endpointOverride(modelID string) string {
 
 func selectEndpoint(model upstreamModel, sourceFormat string) (string, error) {
 	endpoints := normalizeEndpoints(model.SupportedEndpoints)
-	for _, preferred := range endpointPreferences(sourceFormat) {
+	for _, preferred := range endpointPreferences(model, sourceFormat) {
 		for _, endpoint := range endpoints {
 			if endpoint == preferred {
 				return preferred, nil
@@ -208,15 +243,27 @@ func selectEndpoint(model upstreamModel, sourceFormat string) (string, error) {
 	return "", statusError("unsupported_model_endpoint", "Copilot model exposes no supported chat endpoint", http.StatusUnprocessableEntity)
 }
 
-func endpointPreferences(sourceFormat string) []string {
+func endpointPreferences(model upstreamModel, sourceFormat string) []string {
 	switch normalizeRequestFormat(sourceFormat) {
 	case "claude":
 		return []string{translate.EndpointMessages, translate.EndpointResponses, translate.EndpointChatCompletions}
 	case "openai":
 		return []string{translate.EndpointChatCompletions, translate.EndpointResponses, translate.EndpointMessages}
+	case "openai-response":
+		if isClaudeFamilyModel(model) {
+			return []string{translate.EndpointResponses, translate.EndpointMessages, translate.EndpointChatCompletions}
+		}
+		return []string{translate.EndpointResponses, translate.EndpointChatCompletions, translate.EndpointMessages}
 	default:
 		return []string{translate.EndpointResponses, translate.EndpointChatCompletions, translate.EndpointMessages}
 	}
+}
+
+func isClaudeFamilyModel(model upstreamModel) bool {
+	vendor := strings.ToLower(strings.TrimSpace(model.Vendor))
+	family := strings.ToLower(strings.TrimSpace(model.Capabilities.Family))
+	id := strings.ToLower(strings.TrimSpace(model.ID))
+	return vendor == "anthropic" || vendor == "claude" || strings.HasPrefix(family, "claude") || strings.HasPrefix(id, "claude-")
 }
 
 func normalizeModels(models []upstreamModel) []upstreamModel {
@@ -375,6 +422,14 @@ func cloneUpstreamModels(in []upstreamModel) []upstreamModel {
 		out[i].Capabilities.Supports.ReasoningEffort = append([]string(nil), in[i].Capabilities.Supports.ReasoningEffort...)
 		out[i].WarningMessages = append([]modelMessage(nil), in[i].WarningMessages...)
 		out[i].InformationMessages = append([]modelMessage(nil), in[i].InformationMessages...)
+		if in[i].ModelPickerEnabled != nil {
+			value := *in[i].ModelPickerEnabled
+			out[i].ModelPickerEnabled = &value
+		}
+		if in[i].Policy != nil {
+			policy := *in[i].Policy
+			out[i].Policy = &policy
+		}
 	}
 	return out
 }

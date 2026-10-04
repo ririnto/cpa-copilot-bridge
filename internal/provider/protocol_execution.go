@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -8,7 +9,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/ririnto/cpa-copilot-bridge/internal/redact"
 	"github.com/ririnto/cpa-copilot-bridge/internal/translate"
 )
 
@@ -21,15 +21,124 @@ func (s *Service) compactionEnabled(model string) bool {
 	return false
 }
 
-func compactionKeyMaterial(authID, credential, model, endpoint, apiBaseURL string, generation uint64) (string, []byte) {
+func compactionKeyMaterial(authID, credential, model, endpoint, apiBaseURL string) (string, []byte) {
 	credentialHash := tokenFingerprint(credential)
 	secret, err := hex.DecodeString(credentialHash)
 	if err != nil {
 		return "", nil
 	}
-	parts := []string{"cpa-copilot-bridge-compaction-v1", strings.TrimSpace(authID), credentialHash, strings.ToLower(strings.TrimSpace(model)), strings.TrimSpace(endpoint), strings.TrimRight(strings.TrimSpace(apiBaseURL), "/"), strconv.FormatUint(generation, 10)}
+	parts := []string{"cpa-copilot-bridge-compaction-v1", strings.TrimSpace(authID), credentialHash, strings.ToLower(strings.TrimSpace(model)), strings.TrimSpace(endpoint), strings.TrimRight(strings.TrimSpace(apiBaseURL), "/")}
 	scopeHash := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
 	return hex.EncodeToString(scopeHash[:]), secret
+}
+
+func buildResponsesCompactionFrames(payload []byte) ([][]byte, error) {
+	var response map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &response); err != nil || response == nil {
+		return nil, fmt.Errorf("compaction result is not a JSON object")
+	}
+	var status string
+	if err := json.Unmarshal(response["status"], &status); err != nil || status != "completed" {
+		return nil, fmt.Errorf("compaction result is not completed")
+	}
+	if rawError := bytes.TrimSpace(response["error"]); len(rawError) > 0 && !bytes.Equal(rawError, []byte("null")) {
+		return nil, fmt.Errorf("compaction result contains an error")
+	}
+	var output []json.RawMessage
+	if err := json.Unmarshal(response["output"], &output); err != nil || output == nil {
+		return nil, fmt.Errorf("compaction result has no output array")
+	}
+	compactionCount := 0
+	for _, item := range output {
+		var decoded struct {
+			Type             string `json:"type"`
+			EncryptedContent string `json:"encrypted_content"`
+		}
+		if err := json.Unmarshal(item, &decoded); err != nil {
+			return nil, fmt.Errorf("compaction result contains an invalid output item")
+		}
+		if decoded.Type == "compaction" || decoded.Type == "compaction_summary" {
+			if strings.TrimSpace(decoded.EncryptedContent) == "" {
+				return nil, fmt.Errorf("compaction result contains an empty compaction item")
+			}
+			compactionCount++
+		}
+	}
+	if compactionCount != 1 {
+		return nil, fmt.Errorf("compaction result must contain exactly one compaction item")
+	}
+	progress := make(map[string]json.RawMessage, len(response))
+	for key, value := range response {
+		progress[key] = append(json.RawMessage(nil), value...)
+	}
+	progress["status"] = json.RawMessage(`"in_progress"`)
+	progress["output"] = json.RawMessage(`[]`)
+	delete(progress, "usage")
+	delete(progress, "completed_at")
+	progressResponse, err := json.Marshal(progress)
+	if err != nil {
+		return nil, fmt.Errorf("encode compaction stream response")
+	}
+	frames := make([][]byte, 0, 3+len(output)*2)
+	sequence := 0
+	created, err := marshalCompactionEvent("response.created", sequence, map[string]json.RawMessage{"response": progressResponse})
+	if err != nil {
+		return nil, err
+	}
+	frames = append(frames, created)
+	sequence++
+	inProgress, err := marshalCompactionEvent("response.in_progress", sequence, map[string]json.RawMessage{"response": progressResponse})
+	if err != nil {
+		return nil, err
+	}
+	frames = append(frames, inProgress)
+	sequence++
+	for index, item := range output {
+		fields := map[string]json.RawMessage{
+			"output_index": json.RawMessage(strconv.Itoa(index)),
+			"item":         item,
+		}
+		added, errAdded := marshalCompactionEvent("response.output_item.added", sequence, fields)
+		if errAdded != nil {
+			return nil, errAdded
+		}
+		frames = append(frames, added)
+		sequence++
+		done, errDone := marshalCompactionEvent("response.output_item.done", sequence, fields)
+		if errDone != nil {
+			return nil, errDone
+		}
+		frames = append(frames, done)
+		sequence++
+	}
+	completed, err := marshalCompactionEvent("response.completed", sequence, map[string]json.RawMessage{"response": append(json.RawMessage(nil), payload...)})
+	if err != nil {
+		return nil, err
+	}
+	frames = append(frames, completed)
+	return frames, nil
+}
+
+func marshalCompactionEvent(event string, sequence int, fields map[string]json.RawMessage) ([]byte, error) {
+	typeJSON, err := json.Marshal(event)
+	if err != nil {
+		return nil, fmt.Errorf("encode compaction stream event")
+	}
+	data := map[string]json.RawMessage{"type": typeJSON, "sequence_number": json.RawMessage(strconv.Itoa(sequence))}
+	for key, value := range fields {
+		data[key] = value
+	}
+	payload, err := json.Marshal(data)
+	if err != nil {
+		return nil, fmt.Errorf("encode compaction stream event")
+	}
+	frame := make([]byte, 0, len(event)+len(payload)+16)
+	frame = append(frame, "event: "...)
+	frame = append(frame, event...)
+	frame = append(frame, "\ndata: "...)
+	frame = append(frame, payload...)
+	frame = append(frame, '\n', '\n')
+	return frame, nil
 }
 
 func hasCompactionTrigger(payload []byte) bool {
@@ -200,6 +309,6 @@ func parseSSEFrame(frame []byte) (string, string) {
 	return event, strings.Join(data, "\n")
 }
 
-func redactStreamError(value, copilotToken, githubToken string) string {
-	return redact.ErrorBody([]byte(value), copilotToken, githubToken)
+func redactStreamError(_, _, _ string) string {
+	return "upstream stream error details withheld"
 }

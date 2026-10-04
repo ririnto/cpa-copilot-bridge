@@ -1,11 +1,17 @@
 package provider
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
 
+	"github.com/ririnto/cpa-copilot-bridge/internal/compact"
 	"github.com/ririnto/cpa-copilot-bridge/internal/translate"
+	"github.com/ririnto/cpa-copilot-bridge/internal/transport"
+	"github.com/tidwall/gjson"
 )
 
 func TestStreamTerminalRequiresSourceSuccessEvent(t *testing.T) {
@@ -46,6 +52,49 @@ func TestStreamTerminalRequiresSourceSuccessEvent(t *testing.T) {
 	}
 }
 
+func TestStreamTerminalErrorsWithholdProviderPayload(t *testing.T) {
+	t.Parallel()
+	promptSentinel := "operator-prompt-sentinel-73d2"
+	secretSentinel := "unrecognized-secret-sentinel-81af"
+	tests := []struct {
+		name     string
+		endpoint string
+		frame    string
+	}{
+		{name: "Responses", endpoint: translate.EndpointResponses, frame: "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"operator-prompt-sentinel-73d2 unrecognized-secret-sentinel-81af\"}}\n\n"},
+		{name: "Chat Completions", endpoint: translate.EndpointChatCompletions, frame: "data: {\"error\":{\"message\":\"operator-prompt-sentinel-73d2 unrecognized-secret-sentinel-81af\"}}\n\n"},
+		{name: "Messages", endpoint: translate.EndpointMessages, frame: "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"operator-prompt-sentinel-73d2 unrecognized-secret-sentinel-81af\"}}\n\n"},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			var terminal streamTerminal
+			_, err := terminal.observe(test.endpoint, []byte(test.frame), "copilot-token", "github-token")
+			if err == nil || !strings.Contains(err.Error(), "upstream stream error details withheld") {
+				t.Fatalf("terminal error = %v, want generic provider error", err)
+			}
+			if strings.Contains(err.Error(), promptSentinel) || strings.Contains(err.Error(), secretSentinel) {
+				t.Fatalf("terminal error exposed provider payload: %v", err)
+			}
+		})
+	}
+}
+
+func TestPumpStreamCloseOutputWithholdsProviderPayload(t *testing.T) {
+	promptSentinel := "operator-prompt-sentinel-73d2"
+	secretSentinel := "unrecognized-secret-sentinel-81af"
+	frame := []byte("event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"" + promptSentinel + " " + secretSentinel + "\"}}\n\n")
+	host := &errorStreamHost{chunk: transport.StreamChunk{Payload: frame}}
+	service := New(host)
+	service.pumpStream(context.Background(), "output", translate.EndpointResponses, "openai-response", "model", nil, nil, transport.Stream{ID: "upstream"}, "scope", reasoningCarrierScope{}, "copilot-token", "github-token")
+	if host.closedOutputMessage == "" || !strings.Contains(host.closedOutputMessage, "upstream stream error details withheld") {
+		t.Fatalf("close output error = %q, want generic provider error", host.closedOutputMessage)
+	}
+	if strings.Contains(host.closedOutputMessage, promptSentinel) || strings.Contains(host.closedOutputMessage, secretSentinel) {
+		t.Fatalf("close output exposed provider payload: %q", host.closedOutputMessage)
+	}
+}
+
 func TestProtocolSessionIdentityAndPromptCacheScope(t *testing.T) {
 	t.Parallel()
 	headers := http.Header{"session_id": []string{"codex-session-7"}}
@@ -69,6 +118,56 @@ func TestProtocolSessionIdentityAndPromptCacheScope(t *testing.T) {
 	}
 	if got := derivedPromptCacheKey(protocolScopeKey("auth-a", "github-token-a", "model-a", "https://api.githubcopilot.com", translate.EndpointResponses, "", agent, 0)); got != "" {
 		t.Fatalf("cache key without session identity = %q", got)
+	}
+}
+
+func TestCompactionCapsuleSurvivesSameCredentialReconfigure(t *testing.T) {
+	t.Parallel()
+	service := New(nil)
+	if err := service.Configure([]byte("compaction_models:\n  - gpt-5.6-sol\n")); err != nil {
+		t.Fatalf("configure first generation: %v", err)
+	}
+	_, firstGeneration := service.configSnapshot()
+	firstScope, firstSecret := compactionKeyMaterial("auth-a", "github-credential-a", "gpt-5.6-sol", translate.EndpointResponses, "https://api.example")
+	completed, err := compact.Complete([]byte(`{"id":"resp_1","status":"completed","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Keep the active goal and decision."}]}]}`), firstScope, firstSecret)
+	if err != nil {
+		t.Fatalf("complete summary: %v", err)
+	}
+	capsule := gjson.GetBytes(completed, "output.1.encrypted_content").String()
+	if capsule == "" {
+		t.Fatalf("completed result has no capsule: %s", completed)
+	}
+	input, err := json.Marshal([]any{
+		map[string]any{"type": "message", "role": "user", "content": "Continue the task."},
+		map[string]string{"type": "compaction", "encrypted_content": capsule},
+		map[string]string{"type": "compaction_trigger"},
+	})
+	if err != nil {
+		t.Fatalf("encode replay input: %v", err)
+	}
+	replayRequest := append([]byte(`{"input":`), input...)
+	replayRequest = append(replayRequest, '}')
+	if err := service.Configure([]byte("compaction_models:\n  - gpt-5.6-sol\nreasoning_replay: false\n")); err != nil {
+		t.Fatalf("configure reloaded generation: %v", err)
+	}
+	_, secondGeneration := service.configSnapshot()
+	if secondGeneration <= firstGeneration {
+		t.Fatalf("config generation did not advance: %d to %d", firstGeneration, secondGeneration)
+	}
+	secondScope, secondSecret := compactionKeyMaterial("auth-a", "github-credential-a", "gpt-5.6-sol", translate.EndpointResponses, "https://api.example")
+	if firstScope != secondScope || string(firstSecret) != string(secondSecret) {
+		t.Fatal("stable compaction key material changed across configuration reload")
+	}
+	prepared, requested, err := compact.Prepare(replayRequest, secondScope, secondSecret)
+	if err != nil || !requested {
+		t.Fatalf("replay after reload: requested=%v error=%v", requested, err)
+	}
+	if bytes.Contains(prepared, []byte("compaction_trigger")) || bytes.Contains(prepared, []byte(capsule)) || !bytes.Contains(prepared, []byte("Keep the active goal and decision.")) {
+		t.Fatalf("replay did not expand and remove the opaque capsule: %s", prepared)
+	}
+	changedScope, changedSecret := compactionKeyMaterial("auth-a", "github-credential-b", "gpt-5.6-sol", translate.EndpointResponses, "https://api.example")
+	if _, _, err := compact.Prepare(replayRequest, changedScope, changedSecret); err == nil {
+		t.Fatal("capsule decrypted under a changed credential")
 	}
 }
 

@@ -416,6 +416,9 @@ func (s *Service) RefreshAuth(ctx context.Context, callbackID string, req plugin
 	if errUnmarshal := json.Unmarshal(resp.Body, &token); errUnmarshal != nil {
 		return pluginapi.AuthRefreshResponse{}, fmt.Errorf("decode GitHub OAuth refresh response: %w", errUnmarshal)
 	}
+	if strings.EqualFold(strings.TrimSpace(token.Error), "invalid_grant") && (resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnauthorized) {
+		return pluginapi.AuthRefreshResponse{}, &StatusError{Code: "invalid_grant", Message: "invalid_grant", HTTPStatus: resp.StatusCode}
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 || strings.TrimSpace(token.AccessToken) == "" {
 		return pluginapi.AuthRefreshResponse{}, upstreamStatusError(resp.StatusCode, redact.ErrorBody(resp.Body, storage.GitHubAccessToken, storage.GitHubRefreshToken))
 	}

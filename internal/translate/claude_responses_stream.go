@@ -3,16 +3,19 @@ package translate
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
 type responsesClaudeStreamState struct {
-	Started   bool
-	Stopped   bool
-	MessageID string
-	Model     string
-	NextBlock int
-	Blocks    map[string]*responsesClaudeBlock
+	Started           bool
+	Stopped           bool
+	MessageID         string
+	Model             string
+	NextBlock         int
+	BufferAfterTool   bool
+	ToolOutputIndexes map[int]struct{}
+	Blocks            map[string]*responsesClaudeBlock
 }
 
 type responsesClaudeBlock struct {
@@ -66,14 +69,13 @@ func responsesStreamToClaude(model string, frame []byte, state *any) ([][]byte, 
 
 	switch event {
 	case "error", "response.failed":
-		errorObject := objectValue(payload["error"])
-		if response, okResponse := payload["response"].(map[string]any); okResponse {
-			if nested := objectValue(response["error"]); len(nested) > 0 {
-				errorObject = nested
-			}
+		return nil, fmt.Errorf("Copilot Responses stream failed")
+	}
+	if streamState.BufferAfterTool && event != "response.completed" && event != "response.incomplete" {
+		if err := streamState.trackBufferedToolEvent(event, payload); err != nil {
+			return nil, err
 		}
-		message := firstNonEmptyString(stringValue(errorObject["message"]), stringValue(payload["message"]), "unknown upstream stream error")
-		return nil, fmt.Errorf("Copilot Responses stream failed: %s", message)
+		return nil, nil
 	}
 
 	var out [][]byte
@@ -95,10 +97,9 @@ func responsesStreamToClaude(model string, frame []byte, state *any) ([][]byte, 
 			block.Encrypted = rawStringValue(item["encrypted_content"])
 			out = append(out, streamState.openThinking(block)...)
 		case "function_call", "custom_tool_call":
-			block := streamState.block(key, "tool_use")
-			setResponsesFunction(block, item)
-			block.FunctionName = stringValue(item["name"])
-			out = append(out, streamState.openTool(block)...)
+			if err := streamState.markToolOutputIndex(payload); err != nil {
+				return nil, err
+			}
 		}
 	case "response.content_part.added":
 		part := objectValue(payload["part"])
@@ -123,72 +124,55 @@ func responsesStreamToClaude(model string, frame []byte, state *any) ([][]byte, 
 			out = append(out, streamState.delta(block, "thinking_delta", "thinking", delta)...)
 		}
 	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
-		block := streamState.block(itemKey(payload), "tool_use")
-		if block.FunctionID == "" {
-			block.FunctionID = firstNonEmptyString(rawStringValue(payload["call_id"]), rawStringValue(payload["item_id"]))
-		}
-		if block.FunctionName == "" {
-			block.FunctionName = stringValue(payload["name"])
-		}
-		out = append(out, streamState.openTool(block)...)
-		if delta := rawStringValue(payload["delta"]); delta != "" {
-			out = append(out, streamState.delta(block, "input_json_delta", "partial_json", delta)...)
+		if err := streamState.markToolOutputIndex(payload); err != nil {
+			return nil, err
 		}
 	case "response.content_part.done":
 		out = append(out, streamState.closeBlock(contentKey(payload))...)
 	case "response.output_item.done":
 		item := objectValue(payload["item"])
 		key := itemKey(payload)
-		block := streamState.Blocks[key]
-		if block == nil {
-			switch stringValue(item["type"]) {
-			case "reasoning":
+		if stringValue(item["type"]) == "function_call" || stringValue(item["type"]) == "custom_tool_call" {
+			if err := streamState.markToolOutputIndex(payload); err != nil {
+				return nil, err
+			}
+		} else {
+			block := streamState.Blocks[key]
+			if block == nil && stringValue(item["type"]) == "reasoning" {
 				block = streamState.block(key, "thinking")
 				block.Encrypted = rawStringValue(item["encrypted_content"])
 				out = append(out, streamState.openThinking(block)...)
-			case "function_call", "custom_tool_call":
-				block = streamState.block(key, "tool_use")
 			}
-		}
-		if block != nil {
-			if block.Kind == "thinking" {
-				out = append(out, streamState.openThinking(block)...)
-			}
-			if block.Kind == "tool_use" {
-				setResponsesFunction(block, item)
-				block.FunctionName = stringValue(item["name"])
-				out = append(out, streamState.openTool(block)...)
-			}
-			switch block.Kind {
-			case "thinking":
-				fullText := responsesReasoningText(item)
-				if !block.SawDelta && fullText != "" {
-					out = append(out, streamState.delta(block, "thinking_delta", "thinking", fullText)...)
-				}
-				if encrypted := rawStringValue(item["encrypted_content"]); encrypted != "" {
-					block.Encrypted = encrypted
-				}
-				if block.Encrypted != "" && !strings.HasPrefix(block.Encrypted, redactedThinkingPrefix) {
-					if !block.SignatureSent {
+			if block != nil {
+				if block.Kind == "thinking" {
+					out = append(out, streamState.openThinking(block)...)
+					fullText := responsesReasoningText(item)
+					if !block.SawDelta && fullText != "" {
+						out = append(out, streamState.delta(block, "thinking_delta", "thinking", fullText)...)
+					}
+					if encrypted := rawStringValue(item["encrypted_content"]); encrypted != "" {
+						block.Encrypted = encrypted
+					}
+					if block.Encrypted != "" && !strings.HasPrefix(block.Encrypted, redactedThinkingPrefix) && !block.SignatureSent {
 						out = append(out, streamState.delta(block, "signature_delta", "signature", block.Encrypted)...)
 					}
-				}
-			case "tool_use":
-				arguments := firstRawString(item, "arguments", "input")
-				if !block.SawDelta && arguments != "" {
-					out = append(out, streamState.delta(block, "input_json_delta", "partial_json", arguments)...)
+					out = append(out, streamState.closeBlock(key)...)
 				}
 			}
-			out = append(out, streamState.closeBlock(key)...)
 		}
-	case "response.completed", "response.incomplete":
-		if event == "response.completed" {
-			if errFailure := responsesFailure(responseObject); errFailure != nil {
-				return nil, errFailure
-			}
+
+	case "response.completed":
+		if errFailure := responsesFailure(responseObject); errFailure != nil {
+			return nil, errFailure
 		}
-		out = append(out, streamState.reconcileTerminalOutput(responseObject)...)
+		terminalFrames, errTerminal := streamState.reconcileTerminalOutput(responseObject)
+		if errTerminal != nil {
+			return nil, errTerminal
+		}
+		out = append(out, terminalFrames...)
 		out = append(out, streamState.finish(responseObject)...)
+	case "response.incomplete":
+		return nil, fmt.Errorf("Copilot Responses stream ended with an incomplete response")
 	}
 	return out, nil
 }
@@ -313,14 +297,19 @@ func (s *responsesClaudeStreamState) closeBlock(key string) [][]byte {
 	})}
 }
 
-func (s *responsesClaudeStreamState) reconcileTerminalOutput(response map[string]any) [][]byte {
+func (s *responsesClaudeStreamState) reconcileTerminalOutput(response map[string]any) ([][]byte, error) {
 	if s.Stopped {
-		return nil
+		return nil, nil
+	}
+	items, ok := response["output"].([]any)
+	if !ok {
+		return nil, fmt.Errorf("Copilot Responses completed without an output array")
 	}
 	var out [][]byte
-	for outputIndex, rawItem := range arrayValue(response["output"]) {
-		item, ok := rawItem.(map[string]any)
-		if !ok {
+	terminalToolIndexes := make(map[int]struct{})
+	for outputIndex, rawItem := range items {
+		item, okItem := rawItem.(map[string]any)
+		if !okItem {
 			continue
 		}
 		key := fmt.Sprintf("item:%d", outputIndex)
@@ -341,10 +330,47 @@ func (s *responsesClaudeStreamState) reconcileTerminalOutput(response map[string
 		case "reasoning":
 			out = append(out, s.reconcileReasoning(key, item)...)
 		case "function_call", "custom_tool_call":
-			out = append(out, s.reconcileFunction(key, item)...)
+			terminalToolIndexes[outputIndex] = struct{}{}
+			frames, errFunction := s.reconcileFunction(key, item)
+			if errFunction != nil {
+				return nil, errFunction
+			}
+			out = append(out, frames...)
 		}
 	}
-	return out
+	for outputIndex := range s.ToolOutputIndexes {
+		if _, ok := terminalToolIndexes[outputIndex]; !ok {
+			return nil, fmt.Errorf("Copilot Responses completed without a terminal tool item at output index %d", outputIndex)
+		}
+	}
+	return out, nil
+}
+
+func (s *responsesClaudeStreamState) markToolOutputIndex(payload map[string]any) error {
+	indexText := numberKey(payload["output_index"])
+	index, err := strconv.Atoi(indexText)
+	if err != nil || index < 0 {
+		return fmt.Errorf("Copilot Responses tool stream event has an invalid output index")
+	}
+	if s.ToolOutputIndexes == nil {
+		s.ToolOutputIndexes = make(map[int]struct{})
+	}
+	s.ToolOutputIndexes[index] = struct{}{}
+	s.BufferAfterTool = true
+	return nil
+}
+
+func (s *responsesClaudeStreamState) trackBufferedToolEvent(event string, payload map[string]any) error {
+	switch event {
+	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
+		return s.markToolOutputIndex(payload)
+	case "response.output_item.added", "response.output_item.done":
+		item := objectValue(payload["item"])
+		if stringValue(item["type"]) == "function_call" || stringValue(item["type"]) == "custom_tool_call" {
+			return s.markToolOutputIndex(payload)
+		}
+	}
+	return nil
 }
 
 func (s *responsesClaudeStreamState) reconcileText(key, text string) [][]byte {
@@ -401,27 +427,23 @@ func (s *responsesClaudeStreamState) reconcileReasoning(key string, item map[str
 	return out
 }
 
-func (s *responsesClaudeStreamState) reconcileFunction(key string, item map[string]any) [][]byte {
-	block := s.Blocks[key]
-	arguments := responsesFunctionArguments(item)
-	argumentRemainder := arguments
-	if block != nil && block.SawDelta {
-		if !strings.HasPrefix(arguments, block.Accumulated) {
-			argumentRemainder = ""
-		} else {
-			argumentRemainder = strings.TrimPrefix(arguments, block.Accumulated)
-		}
+func (s *responsesClaudeStreamState) reconcileFunction(key string, item map[string]any) ([][]byte, error) {
+	if rawStringValue(item["call_id"]) == "" || stringValue(item["name"]) == "" {
+		return nil, fmt.Errorf("Copilot Responses terminal tool item lacks its call ID or name")
 	}
-	if block != nil && argumentRemainder == "" {
-		return nil
+	arguments, err := responsesFunctionArguments(item)
+	if err != nil {
+		return nil, err
 	}
-	target, targetKey := terminalBlock(s, key, "tool_use", block)
-	setResponsesFunction(target, item)
-	target.FunctionName = stringValue(item["name"])
-	out := s.openTool(target)
-	out = append(out, s.delta(target, "input_json_delta", "partial_json", argumentRemainder)...)
-	out = append(out, s.closeBlock(targetKey)...)
-	return out
+	block := s.block(key, "tool_use")
+	setResponsesFunction(block, item)
+	block.FunctionName = stringValue(item["name"])
+	out := s.openTool(block)
+	if arguments != "" {
+		out = append(out, s.delta(block, "input_json_delta", "partial_json", arguments)...)
+	}
+	out = append(out, s.closeBlock(key)...)
+	return out, nil
 }
 
 func terminalBlock(s *responsesClaudeStreamState, key, kind string, current *responsesClaudeBlock) (*responsesClaudeBlock, string) {
@@ -443,17 +465,50 @@ func setResponsesFunction(block *responsesClaudeBlock, item map[string]any) {
 	block.FunctionID = encodeClaudeToolID(itemID, callID)
 }
 
-func responsesFunctionArguments(item map[string]any) string {
-	if arguments := rawStringValue(item["arguments"]); arguments != "" {
-		return arguments
-	}
-	if input, ok := item["input"]; ok {
-		encoded, err := json.Marshal(input)
-		if err == nil {
-			return string(encoded)
+func responsesFunctionArguments(item map[string]any) (string, error) {
+	arguments := "{}"
+	if stringValue(item["type"]) == "custom_tool_call" {
+		input, ok := item["input"]
+		if !ok {
+			return "", fmt.Errorf("Copilot Responses terminal custom tool input is missing")
 		}
+		var object map[string]any
+		switch value := input.(type) {
+		case map[string]any:
+			object = value
+		case string:
+			object = map[string]any{"input": value}
+		default:
+			return "", fmt.Errorf("Copilot Responses terminal custom tool input is not an object or string")
+		}
+		encoded, err := json.Marshal(object)
+		if err != nil {
+			return "", fmt.Errorf("encode Copilot Responses terminal custom tool input: %w", err)
+		}
+		arguments = string(encoded)
+	} else if rawArguments, ok := item["arguments"]; ok {
+		value, okValue := rawArguments.(string)
+		if !okValue {
+			return "", fmt.Errorf("Copilot Responses terminal tool arguments are not a string")
+		}
+		if strings.TrimSpace(value) != "" {
+			arguments = value
+		}
+	} else if input, ok := item["input"]; ok {
+		if _, okInput := input.(map[string]any); !okInput {
+			return "", fmt.Errorf("Copilot Responses terminal tool input is not an object")
+		}
+		encoded, err := json.Marshal(input)
+		if err != nil {
+			return "", fmt.Errorf("encode Copilot Responses terminal custom tool input: %w", err)
+		}
+		arguments = string(encoded)
 	}
-	return ""
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(arguments), &decoded); err != nil || decoded == nil {
+		return "", fmt.Errorf("Copilot Responses terminal tool arguments are not a JSON object")
+	}
+	return arguments, nil
 }
 
 func (s *responsesClaudeStreamState) finish(response map[string]any) [][]byte {

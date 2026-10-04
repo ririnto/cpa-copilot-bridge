@@ -4,12 +4,46 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/ririnto/cpa-copilot-bridge/internal/translate"
 )
+
+func TestExecutionSessionMetadataProvidesStableAgentScopedIdentity(t *testing.T) {
+	t.Parallel()
+	metadata := map[string]any{"execution_session_id": "run-1", "agent_id": "agent-a"}
+	sessionID, agentID := protocolSessionIdentity(nil, nil, metadata)
+	if sessionID != "execution:run-1" || agentID != "agent-a" {
+		t.Fatalf("execution session/agent = %q/%q", sessionID, agentID)
+	}
+	cacheKey := func(sessionID, agentID string) string {
+		scope := protocolScopeKey("auth-a", "github-token-a", "model-a", "https://api.githubcopilot.com", translate.EndpointResponses, sessionID, agentID, 0)
+		return derivedPromptCacheKey(scope)
+	}
+	firstKey := cacheKey(sessionID, agentID)
+	repeatedSession, repeatedAgent := protocolSessionIdentity(nil, nil, metadata)
+	if got := cacheKey(repeatedSession, repeatedAgent); got != firstKey {
+		t.Fatalf("execution-session cache key changed: %q != %q", got, firstKey)
+	}
+	otherAgent := map[string]any{"execution_session_id": "run-1", "agent_id": "agent-b"}
+	otherSessionID, otherAgentID := protocolSessionIdentity(nil, nil, otherAgent)
+	if got := cacheKey(otherSessionID, otherAgentID); got == firstKey {
+		t.Fatal("execution-session cache key crossed agent scope")
+	}
+	conflictingPayload := []byte(`{"session_id":"payload-session"}`)
+	conflictingHeaders := http.Header{"Session-Id": []string{"header-session"}}
+	preferredSession, preferredAgent := protocolSessionIdentity(conflictingPayload, conflictingHeaders, metadata)
+	if preferredSession != sessionID || preferredAgent != agentID {
+		t.Fatalf("execution metadata did not take precedence: got %q/%q, want %q/%q", preferredSession, preferredAgent, sessionID, agentID)
+	}
+	fallbackSession, _ := protocolSessionIdentity(nil, http.Header{"Session-Id": []string{"header-fallback"}}, map[string]any{"execution_session_id": "invalid\nidentity"})
+	if fallbackSession != "header-fallback" {
+		t.Fatalf("invalid execution session did not fall back to protocol header: %q", fallbackSession)
+	}
+}
 
 func TestReasoningReplayUsesExactTranslatedToolCallAnchor(t *testing.T) {
 	t.Parallel()
