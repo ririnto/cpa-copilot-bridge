@@ -14,6 +14,14 @@ func claudeRequestToResponses(model string, body []byte, stream bool) ([]byte, e
 	if err != nil {
 		return nil, fmt.Errorf("decode Claude request: %w", err)
 	}
+	messages, hasMessages := root["messages"].([]any)
+	if rawMessages, exists := root["messages"]; exists && rawMessages != nil && !hasMessages {
+		return nil, fmt.Errorf("Claude messages must be an array")
+	}
+	markerEffort, hasMarkerEffort, err := claudeMessageEffortMarker(messages)
+	if err != nil {
+		return nil, err
+	}
 	out := map[string]any{
 		"model":   model,
 		"stream":  stream,
@@ -72,7 +80,11 @@ func claudeRequestToResponses(model string, body []byte, stream bool) ([]byte, e
 			}
 		}
 	}
-	if effort := claudeReasoningEffort(root); effort != "" {
+	effort := claudeReasoningEffort(root)
+	if _, rootEffortExists := objectValue(root["output_config"])["effort"]; !rootEffortExists && hasMarkerEffort {
+		effort = markerEffort
+	}
+	if effort != "" {
 		out["reasoning"] = map[string]any{"effort": effort, "summary": "auto"}
 	}
 	if outputConfig, ok := root["output_config"].(map[string]any); ok {
@@ -92,7 +104,6 @@ func claudeRequestToResponses(model string, body []byte, stream bool) ([]byte, e
 	if systemMessage != nil {
 		input = append(input, systemMessage)
 	}
-	messages, _ := root["messages"].([]any)
 	for _, rawMessage := range messages {
 		message, okMessage := rawMessage.(map[string]any)
 		if !okMessage {
@@ -102,6 +113,14 @@ func claudeRequestToResponses(model string, body []byte, stream bool) ([]byte, e
 			continue
 		}
 		role := stringValue(message["role"])
+		if role == "system" {
+			if _, okMarker, errMarker := claudeOutputConfigMarker(message); errMarker != nil {
+				return nil, errMarker
+			} else if okMarker {
+				continue
+			}
+			return nil, fmt.Errorf("unsupported Claude system message")
+		}
 		if role != "user" && role != "assistant" {
 			if role != "" || hasMeaningfulValue(message["content"]) {
 				return nil, fmt.Errorf("unsupported Claude message role %q", role)
@@ -239,6 +258,9 @@ func responsesResponseToClaude(model string, body []byte) ([]byte, error) {
 	if errResponse := responsesFailure(root); errResponse != nil {
 		return nil, errResponse
 	}
+	if err := validateResponsesOutputForClaude(root); err != nil {
+		return nil, err
+	}
 	content := make([]any, 0)
 	hasToolUse := false
 	for _, rawItem := range arrayValue(root["output"]) {
@@ -273,13 +295,30 @@ func responsesResponseToClaude(model string, body []byte) ([]byte, error) {
 				}
 				content = append(content, block)
 			}
-		case "function_call", "custom_tool_call":
-			arguments := firstString(item, "arguments", "input")
+		case "function_call":
+			arguments := rawStringValue(item["arguments"])
 			var input map[string]any
 			if strings.TrimSpace(arguments) == "" {
 				input = map[string]any{}
 			} else if errArguments := json.Unmarshal([]byte(arguments), &input); errArguments != nil {
-				return nil, fmt.Errorf("decode Responses tool arguments: %w", errArguments)
+				return nil, fmt.Errorf("decode Responses tool arguments")
+			}
+			content = append(content, map[string]any{
+				"type":  "tool_use",
+				"id":    claudeToolIDFromResponses(item),
+				"name":  stringValue(item["name"]),
+				"input": input,
+			})
+			hasToolUse = true
+		case "custom_tool_call":
+			var input map[string]any
+			switch rawInput := item["input"].(type) {
+			case string:
+				input = map[string]any{"input": rawInput}
+			case map[string]any:
+				input = rawInput
+			default:
+				input = map[string]any{}
 			}
 			content = append(content, map[string]any{
 				"type":  "tool_use",
@@ -365,19 +404,17 @@ func claudeSystemToResponses(value any) (string, any, error) {
 		}
 		content = append(content, item)
 	}
-	if !hasCacheControl {
-		return strings.Join(texts, "\n"), nil, nil
+	if hasCacheControl {
+		return "", map[string]any{"type": "message", "role": "system", "content": content}, nil
 	}
-	return "", map[string]any{"type": "message", "role": "system", "content": content}, nil
+	return strings.Join(texts, "\n"), nil, nil
 }
 
 func claudeReasoningEffort(root map[string]any) string {
 	if outputConfig, ok := root["output_config"].(map[string]any); ok {
 		switch effort := strings.ToLower(stringValue(outputConfig["effort"])); effort {
-		case "low", "medium", "high":
+		case "low", "medium", "high", "xhigh", "max":
 			return effort
-		case "max":
-			return "high"
 		}
 	}
 	thinking, _ := root["thinking"].(map[string]any)
@@ -394,6 +431,53 @@ func claudeReasoningEffort(root map[string]any) string {
 		return "medium"
 	default:
 		return "high"
+	}
+}
+
+func claudeMessageEffortMarker(messages []any) (string, bool, error) {
+	var effort string
+	var found bool
+	for _, rawMessage := range messages {
+		message, ok := rawMessage.(map[string]any)
+		if !ok || stringValue(message["role"]) != "system" {
+			continue
+		}
+		markerEffort, okMarker, err := claudeOutputConfigMarker(message)
+		if err != nil {
+			return "", false, err
+		}
+		if okMarker {
+			effort, found = markerEffort, true
+		}
+	}
+	return effort, found, nil
+}
+
+func claudeOutputConfigMarker(message map[string]any) (string, bool, error) {
+	if stringValue(message["role"]) != "system" {
+		return "", false, nil
+	}
+	content, okContent := message["content"].([]any)
+	config, okConfig := message["output_config"].(map[string]any)
+	if !okContent || len(content) != 0 || !okConfig || len(config) != 1 {
+		return "", false, fmt.Errorf("unsupported Claude system message")
+	}
+	if len(message) != 3 {
+		return "", false, fmt.Errorf("unsupported Claude system message fields")
+	}
+	value, exists := config["effort"]
+	if !exists {
+		return "", false, fmt.Errorf("unsupported Claude system output configuration")
+	}
+	switch strings.ToLower(rawStringValue(value)) {
+	case "none":
+		return "", true, nil
+	case "low", "medium", "high", "xhigh":
+		return strings.ToLower(rawStringValue(value)), true, nil
+	case "max":
+		return "max", true, nil
+	default:
+		return "", false, fmt.Errorf("unsupported Claude system reasoning effort")
 	}
 }
 
@@ -553,6 +637,62 @@ func copyCacheControl(target, source map[string]any) {
 	}
 }
 
+func containsCacheControl(body []byte) bool {
+	root, err := decodeObject(body)
+	if err != nil {
+		return false
+	}
+	for _, rawTool := range arrayValue(root["tools"]) {
+		if _, exists := objectValue(rawTool)["cache_control"]; exists {
+			return true
+		}
+	}
+	for _, rawItem := range arrayValue(root["input"]) {
+		item := objectValue(rawItem)
+		if _, exists := item["cache_control"]; exists || containsCacheControlBlock(item["content"]) || containsCacheControlBlock(item["output"]) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsCacheControlBlock(value any) bool {
+	for _, rawBlock := range arrayValue(value) {
+		if _, exists := objectValue(rawBlock)["cache_control"]; exists {
+			return true
+		}
+	}
+	return false
+}
+
+func stripCacheControlFields(body []byte) ([]byte, error) {
+	root, err := decodeObject(body)
+	if err != nil {
+		return nil, fmt.Errorf("decode translated Responses request")
+	}
+	stripResponsesRequestCacheControl(root)
+	encoded, err := json.Marshal(root)
+	if err != nil {
+		return nil, fmt.Errorf("encode normalized Responses request")
+	}
+	return encoded, nil
+}
+
+func stripResponsesRequestCacheControl(root map[string]any) {
+	for _, rawTool := range arrayValue(root["tools"]) {
+		delete(objectValue(rawTool), "cache_control")
+	}
+	for _, rawItem := range arrayValue(root["input"]) {
+		item := objectValue(rawItem)
+		delete(item, "cache_control")
+		for _, field := range []string{"content", "output"} {
+			for _, rawBlock := range arrayValue(item[field]) {
+				delete(objectValue(rawBlock), "cache_control")
+			}
+		}
+	}
+}
+
 func responsesReasoningText(item map[string]any) string {
 	for _, field := range []string{"summary", "content"} {
 		var builder strings.Builder
@@ -576,9 +716,7 @@ func responsesFailure(root map[string]any) error {
 	if status != "failed" && status != "cancelled" {
 		return nil
 	}
-	errorObject := objectValue(root["error"])
-	message := firstNonEmptyString(stringValue(errorObject["message"]), stringValue(root["error"]), "unknown upstream error")
-	return fmt.Errorf("Copilot Responses request %s: %s", status, message)
+	return fmt.Errorf("Copilot Responses request failed")
 }
 
 func responsesStopReason(root map[string]any, hasToolUse bool) string {

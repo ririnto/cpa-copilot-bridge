@@ -34,7 +34,7 @@ func rejectOpaqueReasoningResponse(from, to sdktranslator.Format, body []byte) e
 	if from == sdktranslator.FormatOpenAIResponse && to != sdktranslator.FormatClaude && containsResponsesOpaqueReasoning(body) {
 		return fmt.Errorf("cannot translate encrypted Responses reasoning from %s to %s because this route cannot preserve verification data", from, to)
 	}
-	if from == sdktranslator.FormatClaude && containsClaudeOpaqueReasoning(body) {
+	if from == sdktranslator.FormatClaude && to != sdktranslator.FormatOpenAIResponse && containsClaudeOpaqueReasoning(body) {
 		return fmt.Errorf("cannot translate signed or redacted Claude reasoning from %s to %s because this route cannot preserve verification data", from, to)
 	}
 	return nil
@@ -55,7 +55,7 @@ func rejectOpaqueReasoningStream(from, to sdktranslator.Format, frame []byte) er
 	if from == sdktranslator.FormatOpenAIResponse && to != sdktranslator.FormatClaude && containsResponsesOpaqueReasoning(data) {
 		return fmt.Errorf("cannot translate encrypted Responses reasoning stream from %s to %s because this route cannot preserve verification data", from, to)
 	}
-	if from == sdktranslator.FormatClaude && (containsClaudeOpaqueReasoning(data) || stringValue(objectValue(payload["delta"])["type"]) == "signature_delta") {
+	if from == sdktranslator.FormatClaude && to != sdktranslator.FormatOpenAIResponse && (containsClaudeOpaqueReasoning(data) || stringValue(objectValue(payload["delta"])["type"]) == "signature_delta") {
 		return fmt.Errorf("cannot translate signed or redacted Claude reasoning stream from %s to %s because this route cannot preserve verification data", from, to)
 	}
 	return nil

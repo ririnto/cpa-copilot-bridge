@@ -53,15 +53,25 @@ func TestResponsesClaudeToolIDReplayPreservesItemAndCallIDs(t *testing.T) {
 
 func TestClaudeResponsesRequestIncludesStatelessEncryptedReasoning(t *testing.T) {
 	requestBody, err := json.Marshal(map[string]any{
-		"max_tokens": 8192,
-		"thinking":   map[string]any{"type": "enabled", "budget_tokens": 4096},
+		"max_tokens":       8192,
+		"prompt_cache_key": "cache-prefix-1",
+		"system": []any{map[string]any{
+			"type": "text", "text": "Use this cached prefix.", "cache_control": map[string]any{"type": "ephemeral"},
+		}},
+		"thinking": map[string]any{"type": "enabled", "budget_tokens": 4096},
 		"tools": []any{map[string]any{
-			"name":         "lookup",
-			"description":  "Look up a value",
-			"input_schema": map[string]any{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}}},
+			"name":        "lookup",
+			"description": "Look up a value",
+			"input_schema": map[string]any{"type": "object", "properties": map[string]any{
+				"query":         map[string]any{"type": "string"},
+				"cache_control": map[string]any{"type": "string"},
+			}},
+			"cache_control": map[string]any{"type": "ephemeral"},
 		}},
 		"tool_choice": map[string]any{"type": "tool", "name": "lookup"},
-		"messages":    []any{map[string]any{"role": "user", "content": "Find a value"}},
+		"messages": []any{map[string]any{"role": "user", "content": []any{map[string]any{
+			"type": "text", "text": "Find a value", "cache_control": map[string]any{"type": "ephemeral"},
+		}}}},
 	})
 	if err != nil {
 		t.Fatalf("encode Claude request: %v", err)
@@ -72,6 +82,20 @@ func TestClaudeResponsesRequestIncludesStatelessEncryptedReasoning(t *testing.T)
 	}
 	if !gjson.GetBytes(responsesRequest, "store").Exists() || gjson.GetBytes(responsesRequest, "store").Bool() {
 		t.Fatalf("Responses store = %s, want false; request=%s", gjson.GetBytes(responsesRequest, "store"), responsesRequest)
+	}
+	if got := gjson.GetBytes(responsesRequest, "prompt_cache_key").String(); got != "cache-prefix-1" {
+		t.Fatalf("prompt_cache_key = %q; request=%s", got, responsesRequest)
+	}
+	for _, path := range []string{"tools.0.cache_control", "input.0.cache_control", "input.0.content.0.cache_control", "input.1.content.0.cache_control"} {
+		if gjson.GetBytes(responsesRequest, path).Exists() {
+			t.Fatalf("Claude cache_control leaked at %s: %s", path, responsesRequest)
+		}
+	}
+	if got := gjson.GetBytes(responsesRequest, "input.0.content.0.text").String(); got != "Use this cached prefix." {
+		t.Fatalf("system prefix text = %q; request=%s", got, responsesRequest)
+	}
+	if got := gjson.GetBytes(responsesRequest, "input.1.content.0.text").String(); got != "Find a value" {
+		t.Fatalf("user text = %q; request=%s", got, responsesRequest)
 	}
 	include := gjson.GetBytes(responsesRequest, "include").Array()
 	if len(include) != 1 || include[0].String() != "reasoning.encrypted_content" {
@@ -85,6 +109,9 @@ func TestClaudeResponsesRequestIncludesStatelessEncryptedReasoning(t *testing.T)
 	}
 	if gjson.GetBytes(responsesRequest, "tools.0.type").String() != "function" || gjson.GetBytes(responsesRequest, "tools.0.name").String() != "lookup" || gjson.GetBytes(responsesRequest, "tools.0.parameters.type").String() != "object" {
 		t.Fatalf("Claude tool definition changed: %s", responsesRequest)
+	}
+	if got := gjson.GetBytes(responsesRequest, "tools.0.parameters.properties.cache_control.type").String(); got != "string" {
+		t.Fatalf("tool schema cache_control property = %q; request=%s", got, responsesRequest)
 	}
 	if gjson.GetBytes(responsesRequest, "tool_choice.type").String() != "function" || gjson.GetBytes(responsesRequest, "tool_choice.name").String() != "lookup" {
 		t.Fatalf("Claude tool choice changed: %s", responsesRequest)
@@ -135,6 +162,65 @@ func TestClaudeReasoningPayloadsPreserveOpaqueWhitespace(t *testing.T) {
 	}
 	if got := gjson.GetBytes(claudeResponse, "content.1.data").String(); got != redacted {
 		t.Fatalf("Claude redacted data = %q, want %q; response=%s", got, redacted, claudeResponse)
+	}
+}
+
+func TestClaudeOutputConfigEffortMarkerIsNormalizedWithoutDroppingMessages(t *testing.T) {
+	const model = "gpt-test"
+	requestBody := []byte(`{"model":"claude","prompt_cache_key":"marker-cache-key","messages":[{"role":"system","content":[],"output_config":{"effort":"low"}},{"role":"user","content":"keep this prompt"},{"role":"system","content":[],"output_config":{"effort":"high"}}]}`)
+	responsesRequest, err := RequestForEndpointFrom("claude", model, requestBody, false, EndpointResponses)
+	if err != nil {
+		t.Fatalf("translate Claude effort-marker request to Responses: %v", err)
+	}
+	if got := gjson.GetBytes(responsesRequest, "reasoning.effort").String(); got != "high" {
+		t.Fatalf("Responses reasoning effort = %q; request=%s", got, responsesRequest)
+	}
+	if got := gjson.GetBytes(responsesRequest, "input.0.content.0.text").String(); got != "keep this prompt" {
+		t.Fatalf("Responses user prompt = %q; request=%s", got, responsesRequest)
+	}
+	if got := gjson.GetBytes(responsesRequest, "prompt_cache_key").String(); got != "marker-cache-key" {
+		t.Fatalf("Responses prompt_cache_key = %q; request=%s", got, responsesRequest)
+	}
+	if strings.Contains(string(responsesRequest), `"role":"system"`) {
+		t.Fatalf("synthetic effort markers reached Responses: %s", responsesRequest)
+	}
+	chatRequest, err := RequestForEndpointFrom("claude", model, requestBody, false, EndpointChatCompletions)
+	if err != nil {
+		t.Fatalf("translate Claude effort-marker request to Chat: %v", err)
+	}
+	if got := gjson.GetBytes(chatRequest, "reasoning_effort").String(); got != "high" {
+		t.Fatalf("Chat reasoning effort = %q; request=%s", got, chatRequest)
+	}
+	if got := gjson.GetBytes(chatRequest, "messages.0.content.0.text").String(); got != "keep this prompt" {
+		t.Fatalf("Chat prompt was lost: %s", chatRequest)
+	}
+
+	rootEffortWins := []byte(`{"output_config":{"effort":"low"},"messages":[{"role":"system","content":[],"output_config":{"effort":"high"}},{"role":"user","content":"keep"}]}`)
+	responsesRequest, err = RequestForEndpointFrom("claude", model, rootEffortWins, false, EndpointResponses)
+	if err != nil {
+		t.Fatalf("translate root effort request: %v", err)
+	}
+	if got := gjson.GetBytes(responsesRequest, "reasoning.effort").String(); got != "low" {
+		t.Fatalf("root reasoning effort = %q; request=%s", got, responsesRequest)
+	}
+	for _, effort := range []string{"xhigh", "max"} {
+		request := []byte(`{"output_config":{"effort":"` + effort + `"},"messages":[{"role":"user","content":"keep"}]}`)
+		translated, err := RequestForEndpointFrom("claude", model, request, false, EndpointResponses)
+		if err != nil {
+			t.Fatalf("translate %s effort request: %v", effort, err)
+		}
+		if got := gjson.GetBytes(translated, "reasoning.effort").String(); got != effort {
+			t.Fatalf("Responses reasoning effort = %q, want %q; request=%s", got, effort, translated)
+		}
+	}
+
+	unknownMarker := []byte(`{"messages":[{"role":"system","content":[],"output_config":{"effort":"high","extra":true}},{"role":"user","content":"keep"}]}`)
+	if _, err := RequestForEndpointFrom("claude", model, unknownMarker, false, EndpointResponses); err == nil {
+		t.Fatal("unknown synthetic system marker field was silently dropped")
+	}
+	meaningfulMarker := []byte(`{"messages":[{"role":"system","content":[{"type":"text","text":"must not drop"}],"output_config":{"effort":"high"}},{"role":"user","content":"keep"}]}`)
+	if _, err := RequestForEndpointFrom("claude", model, meaningfulMarker, false, EndpointResponses); err == nil {
+		t.Fatal("meaningful synthetic system content was silently dropped")
 	}
 }
 
@@ -223,6 +309,27 @@ func TestResponsesStreamPreservesTerminalReasoningAndLateUsage(t *testing.T) {
 	}
 	if finalUsage.Get("input_tokens").Int() != 11 || finalUsage.Get("output_tokens").Int() != 7 || finalUsage.Get("cache_read_input_tokens").Int() != 4 {
 		t.Fatalf("late final usage was not preserved: %s", finalUsage.Raw)
+	}
+}
+
+func TestResponsesStreamErrorsDoNotExposeProviderMessages(t *testing.T) {
+	const secret = "private-prompt-fragment-73e4"
+	for _, frame := range [][]byte{
+		[]byte("event: error\ndata: {\"type\":\"error\",\"message\":\"" + secret + "\"}\n\n"),
+		[]byte("event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"" + secret + "\"}}}\n\n"),
+	} {
+		var state any
+		if _, err := StreamFromEndpoint(context.Background(), EndpointResponses, "claude", "gpt-test", nil, nil, frame, &state); err == nil {
+			t.Fatal("provider stream error was not returned")
+		} else if strings.Contains(err.Error(), secret) {
+			t.Fatalf("provider stream error exposed secret content: %v", err)
+		}
+	}
+	const body = `{"id":"resp_1","status":"failed","error":{"message":"private-prompt-fragment-73e4"}}`
+	if _, err := ResponseFromEndpoint(context.Background(), EndpointResponses, "claude", "gpt-test", nil, nil, []byte(body)); err == nil {
+		t.Fatal("provider Responses failure was not returned")
+	} else if strings.Contains(err.Error(), secret) {
+		t.Fatalf("provider Responses failure exposed secret content: %v", err)
 	}
 }
 

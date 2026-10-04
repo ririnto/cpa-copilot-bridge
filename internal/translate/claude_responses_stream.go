@@ -69,14 +69,7 @@ func responsesStreamToClaude(model string, frame []byte, state *any) ([][]byte, 
 
 	switch event {
 	case "error", "response.failed":
-		errorObject := objectValue(payload["error"])
-		if response, okResponse := payload["response"].(map[string]any); okResponse {
-			if nested := objectValue(response["error"]); len(nested) > 0 {
-				errorObject = nested
-			}
-		}
-		message := firstNonEmptyString(stringValue(errorObject["message"]), stringValue(payload["message"]), "unknown upstream stream error")
-		return nil, fmt.Errorf("Copilot Responses stream failed: %s", message)
+		return nil, fmt.Errorf("Copilot Responses stream failed")
 	}
 	if streamState.BufferAfterTool && event != "response.completed" && event != "response.incomplete" {
 		if err := streamState.trackBufferedToolEvent(event, payload); err != nil {

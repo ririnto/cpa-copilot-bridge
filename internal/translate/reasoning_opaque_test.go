@@ -81,7 +81,10 @@ func TestCopilotOpaqueClaudeSignatureReplaysToChat(t *testing.T) {
 		t.Fatalf("Claude system content was lost: %s", chatRequest)
 	}
 	if got := gjson.GetBytes(chatRequest, "messages.0.content.0.cache_control").Raw; got != `{"type":"ephemeral"}` {
-		t.Fatalf("Claude system cache_control was lost: %s", chatRequest)
+		t.Fatalf("Claude cache_control was not preserved for Chat: %s", chatRequest)
+	}
+	if got := gjson.GetBytes(chatRequest, "messages.0.content.0.text").String(); got != "Use the tool." {
+		t.Fatalf("Claude system prefix text was lost: %s", chatRequest)
 	}
 	rawOpaque := []byte(`"copilot-turn-state"`)
 	chatResponse := []byte(`{"id":"chatcmpl_2","choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_run_2","type":"function","function":{"name":"run","arguments":"{\"x\":2}"}}]},"finish_reason":"tool_calls"}]}`)
