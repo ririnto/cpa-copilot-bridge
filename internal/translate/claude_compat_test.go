@@ -51,6 +51,46 @@ func TestResponsesClaudeToolIDReplayPreservesItemAndCallIDs(t *testing.T) {
 	}
 }
 
+func TestClaudeResponsesRequestIncludesStatelessEncryptedReasoning(t *testing.T) {
+	requestBody, err := json.Marshal(map[string]any{
+		"max_tokens": 8192,
+		"thinking":   map[string]any{"type": "enabled", "budget_tokens": 4096},
+		"tools": []any{map[string]any{
+			"name":         "lookup",
+			"description":  "Look up a value",
+			"input_schema": map[string]any{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}}},
+		}},
+		"tool_choice": map[string]any{"type": "tool", "name": "lookup"},
+		"messages":    []any{map[string]any{"role": "user", "content": "Find a value"}},
+	})
+	if err != nil {
+		t.Fatalf("encode Claude request: %v", err)
+	}
+	responsesRequest, err := RequestForEndpointFrom("claude", "gpt-test", requestBody, true, EndpointResponses)
+	if err != nil {
+		t.Fatalf("translate Claude request: %v", err)
+	}
+	if !gjson.GetBytes(responsesRequest, "store").Exists() || gjson.GetBytes(responsesRequest, "store").Bool() {
+		t.Fatalf("Responses store = %s, want false; request=%s", gjson.GetBytes(responsesRequest, "store"), responsesRequest)
+	}
+	include := gjson.GetBytes(responsesRequest, "include").Array()
+	if len(include) != 1 || include[0].String() != "reasoning.encrypted_content" {
+		t.Fatalf("Responses include = %s, want [reasoning.encrypted_content]; request=%s", gjson.GetBytes(responsesRequest, "include"), responsesRequest)
+	}
+	if !gjson.GetBytes(responsesRequest, "stream").Bool() || gjson.GetBytes(responsesRequest, "max_output_tokens").Int() != 8192 {
+		t.Fatalf("Claude stream or token limit was not preserved: %s", responsesRequest)
+	}
+	if gjson.GetBytes(responsesRequest, "reasoning.effort").String() != "medium" || gjson.GetBytes(responsesRequest, "reasoning.summary").String() != "auto" {
+		t.Fatalf("Claude reasoning settings changed: %s", responsesRequest)
+	}
+	if gjson.GetBytes(responsesRequest, "tools.0.type").String() != "function" || gjson.GetBytes(responsesRequest, "tools.0.name").String() != "lookup" || gjson.GetBytes(responsesRequest, "tools.0.parameters.type").String() != "object" {
+		t.Fatalf("Claude tool definition changed: %s", responsesRequest)
+	}
+	if gjson.GetBytes(responsesRequest, "tool_choice.type").String() != "function" || gjson.GetBytes(responsesRequest, "tool_choice.name").String() != "lookup" {
+		t.Fatalf("Claude tool choice changed: %s", responsesRequest)
+	}
+}
+
 func TestClaudeReasoningPayloadsPreserveOpaqueWhitespace(t *testing.T) {
 	const thinking = " inspect carefully \n"
 	const signature = " sig "

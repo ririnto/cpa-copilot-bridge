@@ -15,9 +15,11 @@ func claudeRequestToResponses(model string, body []byte, stream bool) ([]byte, e
 		return nil, fmt.Errorf("decode Claude request: %w", err)
 	}
 	out := map[string]any{
-		"model":  model,
-		"stream": stream,
-		"input":  []any{},
+		"model":   model,
+		"stream":  stream,
+		"input":   []any{},
+		"store":   false,
+		"include": []string{"reasoning.encrypted_content"},
 	}
 	copyField(out, root, "max_tokens", "max_output_tokens")
 	copyField(out, root, "temperature", "temperature")
