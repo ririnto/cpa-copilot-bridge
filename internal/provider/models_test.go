@@ -41,6 +41,117 @@ func TestSelectEndpoint(t *testing.T) {
 			want:         translate.EndpointResponses,
 		},
 		{
+			name: "Claude client routes to Gemini Chat",
+			model: upstreamModel{
+				ID: "gemini-3.8-flash", Vendor: "Google",
+				SupportedEndpoints: []string{"/chat/completions"},
+			},
+			sourceFormat: "claude",
+			want:         translate.EndpointChatCompletions,
+		},
+		{
+			name: "Claude client routes to native GPT Responses",
+			model: upstreamModel{
+				ID: "gpt-6-luna", Vendor: "OpenAI",
+				SupportedEndpoints: []string{"/responses"},
+			},
+			sourceFormat: "claude",
+			want:         translate.EndpointResponses,
+		},
+		{
+			name: "Claude client routes to native Claude Messages",
+			model: upstreamModel{
+				ID: "claude-sonnet-5.5", Vendor: "Anthropic",
+				SupportedEndpoints: []string{"/v1/messages"},
+			},
+			sourceFormat: "claude",
+			want:         translate.EndpointMessages,
+		},
+		{
+			name: "Chat client keeps native Chat endpoint for Claude model",
+			model: upstreamModel{
+				ID: "claude-sonnet-5.5", Vendor: "Anthropic",
+				SupportedEndpoints: []string{"/v1/messages", "/chat/completions"},
+			},
+			sourceFormat: "openai",
+			want:         translate.EndpointChatCompletions,
+		},
+		{
+			name: "Responses client routes Gemini fallback to Chat",
+			model: upstreamModel{
+				ID: "gemini-3.8-flash", Vendor: "Google",
+				Capabilities:       modelCapabilities{Family: "gemini"},
+				SupportedEndpoints: []string{"/v1/messages", "/chat/completions"},
+			},
+			sourceFormat: "openai-response",
+			want:         translate.EndpointChatCompletions,
+		},
+		{
+			name: "Responses client uses native GPT endpoint",
+			model: upstreamModel{
+				ID: "gpt-6-luna", Vendor: "OpenAI",
+				SupportedEndpoints: []string{"/chat/completions", "/responses"},
+			},
+			sourceFormat: "openai-response",
+			want:         translate.EndpointResponses,
+		},
+		{
+			name: "Responses client prefers Claude Messages over Chat fallback",
+			model: upstreamModel{
+				ID: "claude-sonnet-5.5", Vendor: "Anthropic",
+				Capabilities:       modelCapabilities{Family: "Claude"},
+				SupportedEndpoints: []string{"/chat/completions", "/v1/messages"},
+			},
+			sourceFormat: "openai-response",
+			want:         translate.EndpointMessages,
+		},
+		{
+			name: "Claude family metadata selects Messages fallback",
+			model: upstreamModel{
+				ID: "model-family-only", Vendor: "Other",
+				Capabilities:       modelCapabilities{Family: "claude-sonnet"},
+				SupportedEndpoints: []string{"/chat/completions", "/v1/messages"},
+			},
+			sourceFormat: "openai-response",
+			want:         translate.EndpointMessages,
+		},
+		{
+			name: "Claude model ID selects Messages fallback",
+			model: upstreamModel{
+				ID: "claude-sonnet-5.5", Vendor: "Other",
+				SupportedEndpoints: []string{"/chat/completions", "/v1/messages"},
+			},
+			sourceFormat: "openai-response",
+			want:         translate.EndpointMessages,
+		},
+		{
+			name: "Responses source preserves native endpoint before Claude fallback",
+			model: upstreamModel{
+				ID: "claude-sonnet-5.5", Vendor: "Anthropic",
+				SupportedEndpoints: []string{"/chat/completions", "/v1/messages", "/responses"},
+			},
+			sourceFormat: "openai-response",
+			want:         translate.EndpointResponses,
+		},
+		{
+			name: "unknown vendor keeps existing Responses fallback order",
+			model: upstreamModel{
+				ID: "model-unknown", Vendor: "Other",
+				SupportedEndpoints: []string{"/chat/completions", "/v1/messages"},
+			},
+			sourceFormat: "openai-response",
+			want:         translate.EndpointChatCompletions,
+		},
+		{
+			name: "unrecognized source keeps existing endpoint order",
+			model: upstreamModel{
+				ID: "claude-sonnet-5.5", Vendor: "Anthropic",
+				SupportedEndpoints: []string{"/chat/completions", "/v1/messages"},
+			},
+			sourceFormat: "unknown",
+			want:         translate.EndpointChatCompletions,
+		},
+		{
 			name:         "unsupported",
 			model:        upstreamModel{ID: "embedding-model", SupportedEndpoints: []string{"/embeddings"}},
 			sourceFormat: "openai-response",

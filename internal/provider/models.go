@@ -198,7 +198,7 @@ func (s *Service) endpointOverride(modelID string) string {
 
 func selectEndpoint(model upstreamModel, sourceFormat string) (string, error) {
 	endpoints := normalizeEndpoints(model.SupportedEndpoints)
-	for _, preferred := range endpointPreferences(sourceFormat) {
+	for _, preferred := range endpointPreferences(model, sourceFormat) {
 		for _, endpoint := range endpoints {
 			if endpoint == preferred {
 				return preferred, nil
@@ -208,15 +208,27 @@ func selectEndpoint(model upstreamModel, sourceFormat string) (string, error) {
 	return "", statusError("unsupported_model_endpoint", "Copilot model exposes no supported chat endpoint", http.StatusUnprocessableEntity)
 }
 
-func endpointPreferences(sourceFormat string) []string {
+func endpointPreferences(model upstreamModel, sourceFormat string) []string {
 	switch normalizeRequestFormat(sourceFormat) {
 	case "claude":
 		return []string{translate.EndpointMessages, translate.EndpointResponses, translate.EndpointChatCompletions}
 	case "openai":
 		return []string{translate.EndpointChatCompletions, translate.EndpointResponses, translate.EndpointMessages}
+	case "openai-response":
+		if isClaudeFamilyModel(model) {
+			return []string{translate.EndpointResponses, translate.EndpointMessages, translate.EndpointChatCompletions}
+		}
+		return []string{translate.EndpointResponses, translate.EndpointChatCompletions, translate.EndpointMessages}
 	default:
 		return []string{translate.EndpointResponses, translate.EndpointChatCompletions, translate.EndpointMessages}
 	}
+}
+
+func isClaudeFamilyModel(model upstreamModel) bool {
+	vendor := strings.ToLower(strings.TrimSpace(model.Vendor))
+	family := strings.ToLower(strings.TrimSpace(model.Capabilities.Family))
+	id := strings.ToLower(strings.TrimSpace(model.ID))
+	return vendor == "anthropic" || vendor == "claude" || strings.HasPrefix(family, "claude") || strings.HasPrefix(id, "claude-")
 }
 
 func normalizeModels(models []upstreamModel) []upstreamModel {
