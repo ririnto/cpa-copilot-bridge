@@ -246,6 +246,21 @@ func TestRequestCarrierLeavesNativeSignaturesAndOrdinaryTextUntouched(t *testing
 	}
 }
 
+func TestRequestCarrierRejectsWrongScopeInNonAssistantThinkingSlot(t *testing.T) {
+	t.Parallel()
+	issued := testReasoningCarrierScope()
+	sealed, err := sealReasoningCarrier(testInnerReasoningCarrier(), issued)
+	if err != nil {
+		t.Fatalf("seal fixture: %v", err)
+	}
+	receiver := issued
+	receiver.AuthID = "auth-b"
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"thinking","thinking":"synthetic","signature":"` + sealed + `"}]}]}`)
+	if _, err := unwrapRequestReasoningCarriers("claude", payload, receiver); err == nil {
+		t.Fatal("wrong-scope carrier in a non-assistant thinking slot was accepted")
+	}
+}
+
 func testReasoningCarrierScope() reasoningCarrierScope {
 	return reasoningCarrierScope{AuthID: "auth-a", Credential: "credential-a", Model: "test-chat", Endpoint: translate.EndpointChatCompletions, APIBaseURL: "https://api.example"}
 }

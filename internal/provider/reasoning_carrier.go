@@ -134,9 +134,6 @@ func requestReasoningCarrierPaths(sourceFormat string, payload []byte) []string 
 	switch normalizeRequestFormat(sourceFormat) {
 	case "claude":
 		for messageIndex, message := range root.Get("messages").Array() {
-			if message.Get("role").String() != "assistant" {
-				continue
-			}
 			for blockIndex, block := range message.Get("content").Array() {
 				if block.Get("type").String() == "thinking" && block.Get("signature").Type == gjson.String {
 					paths = append(paths, fmt.Sprintf("messages.%d.content.%d.signature", messageIndex, blockIndex))
