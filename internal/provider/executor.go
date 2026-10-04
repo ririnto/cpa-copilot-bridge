@@ -39,6 +39,10 @@ func (s *Service) Execute(ctx context.Context, req ExecuteRequest) (pluginapi.Ex
 	if sourceFormat == "" {
 		return pluginapi.ExecutorResponse{}, statusError("unsupported_format", fmt.Sprintf("unsupported request format %q", firstNonEmpty(req.SourceFormat, req.Format)), http.StatusUnprocessableEntity)
 	}
+	translationPayload, errClaudeInput := normalizeClaudeSourceRequest(sourceFormat, req.Payload)
+	if errClaudeInput != nil {
+		return pluginapi.ExecutorResponse{}, statusError("translation_error", errClaudeInput.Error(), http.StatusUnprocessableEntity)
+	}
 	storage, errParse := parseStorage(req.StorageJSON)
 	if errParse != nil {
 		return pluginapi.ExecutorResponse{}, errParse
@@ -55,16 +59,22 @@ func (s *Service) Execute(ctx context.Context, req ExecuteRequest) (pluginapi.Ex
 	if v1Compact {
 		endpointFormat = "openai-response"
 	}
-	endpoint, token, errEndpoint := s.endpointForModel(ctx, req.HostCallbackID, req.AuthID, storage, req.Model, endpointFormat)
+	endpoint, model, token, errEndpoint := s.endpointForModel(ctx, req.HostCallbackID, req.AuthID, storage, req.Model, endpointFormat)
 	if errEndpoint != nil {
 		return pluginapi.ExecutorResponse{}, errEndpoint
 	}
 	if (v1Compact || v2Compact) && endpoint != translate.EndpointResponses {
 		return pluginapi.ExecutorResponse{}, statusError("unsupported_compaction_endpoint", "Responses compaction requires the Copilot Responses endpoint", http.StatusUnprocessableEntity)
 	}
-	requestBody, errTranslate := translate.RequestForEndpointFrom(sourceFormat, req.Model, req.Payload, false, endpoint)
+	requestBody, errTranslate := translate.RequestForEndpointFrom(sourceFormat, req.Model, translationPayload, false, endpoint)
 	if errTranslate != nil {
 		return pluginapi.ExecutorResponse{}, statusError("translation_error", errTranslate.Error(), http.StatusUnprocessableEntity)
+	}
+	if endpoint == translate.EndpointMessages {
+		requestBody, errTranslate = normalizeClaudeMessagesRequest(model, sourceFormat, req.Payload, requestBody)
+		if errTranslate != nil {
+			return pluginapi.ExecutorResponse{}, statusError("translation_error", errTranslate.Error(), http.StatusUnprocessableEntity)
+		}
 	}
 	sessionPayload := req.OriginalRequest
 	if len(sessionPayload) == 0 {
@@ -145,6 +155,10 @@ func (s *Service) ExecuteStream(ctx context.Context, req ExecuteRequest) (http.H
 	if sourceFormat == "" {
 		return nil, statusError("unsupported_format", fmt.Sprintf("unsupported request format %q", firstNonEmpty(req.SourceFormat, req.Format)), http.StatusUnprocessableEntity)
 	}
+	translationPayload, errClaudeInput := normalizeClaudeSourceRequest(sourceFormat, req.Payload)
+	if errClaudeInput != nil {
+		return nil, statusError("translation_error", errClaudeInput.Error(), http.StatusUnprocessableEntity)
+	}
 	storage, errParse := parseStorage(req.StorageJSON)
 	if errParse != nil {
 		return nil, errParse
@@ -175,13 +189,19 @@ func (s *Service) ExecuteStream(ctx context.Context, req ExecuteRequest) (http.H
 		headers.Set("Cache-Control", "no-cache")
 		return headers, nil
 	}
-	endpoint, token, errEndpoint := s.endpointForModel(ctx, req.HostCallbackID, req.AuthID, storage, req.Model, sourceFormat)
+	endpoint, model, token, errEndpoint := s.endpointForModel(ctx, req.HostCallbackID, req.AuthID, storage, req.Model, sourceFormat)
 	if errEndpoint != nil {
 		return nil, errEndpoint
 	}
-	requestBody, errTranslate := translate.RequestForEndpointFrom(sourceFormat, req.Model, req.Payload, true, endpoint)
+	requestBody, errTranslate := translate.RequestForEndpointFrom(sourceFormat, req.Model, translationPayload, true, endpoint)
 	if errTranslate != nil {
 		return nil, statusError("translation_error", errTranslate.Error(), http.StatusUnprocessableEntity)
+	}
+	if endpoint == translate.EndpointMessages {
+		requestBody, errTranslate = normalizeClaudeMessagesRequest(model, sourceFormat, req.Payload, requestBody)
+		if errTranslate != nil {
+			return nil, statusError("translation_error", errTranslate.Error(), http.StatusUnprocessableEntity)
+		}
 	}
 	sessionPayload := req.OriginalRequest
 	if len(sessionPayload) == 0 {
@@ -194,6 +214,13 @@ func (s *Service) ExecuteStream(ctx context.Context, req ExecuteRequest) (http.H
 			requestBody = s.restoreReasoningReplay(scopeKey, req.OriginalRequest, requestBody)
 		} else if sourceFormat == "openai-response" {
 			requestBody = s.restoreNativeResponsesReplay(scopeKey, requestBody)
+		}
+	}
+	if s.compactionEnabled(req.Model) && endpoint == translate.EndpointResponses {
+		compactionScope, compactionSecret := compactionKeyMaterial(req.AuthID, storage.GitHubAccessToken, req.Model, endpoint, token.APIBaseURL)
+		requestBody, _, errTranslate = compact.Prepare(requestBody, compactionScope, compactionSecret)
+		if errTranslate != nil {
+			return nil, statusError("invalid_compaction_request", errTranslate.Error(), http.StatusBadRequest)
 		}
 	}
 	cacheKey := explicitPromptCacheKey(req.OriginalRequest, req.Metadata)

@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ririnto/cpa-copilot-bridge/internal/compact"
+	"github.com/ririnto/cpa-copilot-bridge/internal/translate"
 	"github.com/ririnto/cpa-copilot-bridge/internal/transport"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	"github.com/tidwall/gjson"
@@ -48,16 +50,18 @@ func (h *errorStreamHost) CloseOutput(_ context.Context, _ string, message strin
 }
 
 type compactionStreamHost struct {
-	responseBody []byte
-	emitErrAt    int
-	cancelAt     int
-	cancel       context.CancelFunc
-	mu           sync.Mutex
-	requests     []transport.Request
-	emitCount    int
-	openCount    int
-	emitted      chan []byte
-	closed       chan string
+	responseBody  []byte
+	emitErrAt     int
+	cancelAt      int
+	cancel        context.CancelFunc
+	mu            sync.Mutex
+	requests      []transport.Request
+	emitCount     int
+	openCount     int
+	allowStream   bool
+	streamRequest transport.Request
+	emitted       chan []byte
+	closed        chan string
 }
 
 func newCompactionStreamHost(responseBody []byte) *compactionStreamHost {
@@ -69,18 +73,37 @@ func (h *compactionStreamHost) Do(_ context.Context, _ string, request transport
 	request.Body = append([]byte(nil), request.Body...)
 	h.requests = append(h.requests, request)
 	h.mu.Unlock()
+	if request.Method == http.MethodGet && strings.HasSuffix(request.URL, "/models") {
+		return transport.Response{StatusCode: http.StatusOK, Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: []byte(`{"data":[{"id":"gpt-5.6-sol","model_picker_enabled":true,"policy":{"state":"enabled"},"capabilities":{"type":"chat"},"supported_endpoints":["/responses"]}]}`)}, nil
+	}
 	return transport.Response{StatusCode: http.StatusOK, Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: append([]byte(nil), h.responseBody...)}, nil
 }
 
-func (h *compactionStreamHost) OpenStream(context.Context, string, transport.Request) (transport.Stream, error) {
+func (h *compactionStreamHost) OpenStream(_ context.Context, _ string, request transport.Request) (transport.Stream, error) {
 	h.mu.Lock()
 	h.openCount++
+	request.Body = append([]byte(nil), request.Body...)
+	request.Headers = request.Headers.Clone()
+	h.streamRequest = request
+	allowStream := h.allowStream
 	h.mu.Unlock()
-	return transport.Stream{}, errors.New("unexpected upstream stream")
+	if !allowStream {
+		return transport.Stream{}, errors.New("unexpected upstream stream")
+	}
+	return transport.Stream{ID: "upstream-stream", StatusCode: http.StatusOK}, nil
 }
 
 func (h *compactionStreamHost) ReadStream(context.Context, string) (transport.StreamChunk, error) {
-	return transport.StreamChunk{}, errors.New("unexpected upstream stream read")
+	h.mu.Lock()
+	allowStream := h.allowStream
+	h.mu.Unlock()
+	if !allowStream {
+		return transport.StreamChunk{}, errors.New("unexpected upstream stream read")
+	}
+	return transport.StreamChunk{
+		Payload: []byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_stream\",\"status\":\"completed\",\"output\":[]}}\n\n"),
+		Done:    true,
+	}, nil
 }
 
 func (h *compactionStreamHost) CloseStream(context.Context, string) error { return nil }
@@ -107,14 +130,22 @@ func (h *compactionStreamHost) CloseOutput(_ context.Context, _ string, message 
 	h.closed <- message
 }
 
-func (h *compactionStreamHost) requestBodies() [][]byte {
+func (h *compactionStreamHost) requestSnapshot() []transport.Request {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	bodies := make([][]byte, len(h.requests))
+	requests := make([]transport.Request, len(h.requests))
 	for index, request := range h.requests {
-		bodies[index] = append([]byte(nil), request.Body...)
+		requests[index] = request
+		requests[index].Body = append([]byte(nil), request.Body...)
+		requests[index].Headers = request.Headers.Clone()
 	}
-	return bodies
+	return requests
+}
+
+func (h *compactionStreamHost) streamRequestBody() []byte {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]byte(nil), h.streamRequest.Body...)
 }
 
 func newCompactionStreamService(t *testing.T, host *compactionStreamHost) *Service {
@@ -257,12 +288,28 @@ func TestExecuteStreamBuffersCompactionAndEmitsResponsesSSE(t *testing.T) {
 			if gjson.Get(terminal, "usage.total_tokens").Int() != 22 || gjson.Get(terminal, "metadata.origin").String() != "test" {
 				t.Fatalf("terminal usage or metadata changed: %s", terminal)
 			}
-			requestBodies := host.requestBodies()
-			if len(requestBodies) != 1 || bytes.Contains(requestBodies[0], []byte("compaction_trigger")) {
-				t.Fatalf("upstream request included trigger or wrong count: %q", requestBodies)
+			requests := host.requestSnapshot()
+			discoveryRequests := make([]transport.Request, 0, 1)
+			generationRequests := make([]transport.Request, 0, 1)
+			for _, request := range requests {
+				switch {
+				case request.Method == http.MethodGet && strings.HasSuffix(request.URL, "/models"):
+					discoveryRequests = append(discoveryRequests, request)
+				case request.Method == http.MethodPost && strings.HasSuffix(request.URL, "/responses"):
+					generationRequests = append(generationRequests, request)
+				default:
+					t.Fatalf("unexpected upstream request method or path: %s %s", request.Method, request.URL)
+				}
 			}
-			if gjson.GetBytes(requestBodies[0], "tool_choice").String() != "none" {
-				t.Fatalf("summary request did not disable tools: %s", requestBodies[0])
+			if len(discoveryRequests) != 1 || len(generationRequests) != 1 {
+				t.Fatalf("upstream discovery/generation requests = %d/%d, want one each", len(discoveryRequests), len(generationRequests))
+			}
+			generationBody := generationRequests[0].Body
+			if bytes.Contains(generationBody, []byte("compaction_trigger")) {
+				t.Fatalf("upstream generation request included trigger: %s", generationBody)
+			}
+			if gjson.GetBytes(generationBody, "tool_choice").String() != "none" {
+				t.Fatalf("summary request did not disable tools: %s", generationBody)
 			}
 			host.mu.Lock()
 			openCount := host.openCount
@@ -284,6 +331,86 @@ func TestExecuteStreamCompactionFailsBeforeEmittingSuccess(t *testing.T) {
 	}
 	if len(host.emitted) != 0 || len(host.closed) != 0 {
 		t.Fatal("failed compaction emitted or closed a successful stream")
+	}
+}
+
+func TestExecuteStreamExpandsCompactionCapsuleBeforeUpstreamRequest(t *testing.T) {
+	t.Parallel()
+	host := newCompactionStreamHost(compactionStreamResponse("completed"))
+	host.allowStream = true
+	service := newCompactionStreamService(t, host)
+	const githubToken = "github-token-for-compaction-test"
+	model := "gpt-5.6-sol"
+	scope, secret := compactionKeyMaterial("auth-id", githubToken, model, translate.EndpointResponses, "https://api.example")
+	completed, err := compact.Complete(compactionStreamResponse("completed"), scope, secret)
+	if err != nil {
+		t.Fatalf("create compaction fixture: %v", err)
+	}
+	capsule := gjson.GetBytes(completed, "output.1.encrypted_content").String()
+	if capsule == "" {
+		t.Fatal("compaction fixture has no capsule")
+	}
+	payload := []byte(`{"model":"gpt-5.6-sol","stream":true,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Continue."}]},{"type":"compaction","encrypted_content":"` + capsule + `"}]}`)
+	request := compactionStreamRequest(payload, "")
+	if _, err := service.ExecuteStream(context.Background(), request); err != nil {
+		t.Fatalf("execute stream with compaction replay: %v", err)
+	}
+	if _, closeMessage := collectCompactionStreamFrames(t, host); closeMessage != "" {
+		t.Fatalf("upstream stream closed with error: %s", closeMessage)
+	}
+	upstreamBody := host.streamRequestBody()
+	if bytes.Contains(upstreamBody, []byte("cpa-copilot-bridge:compaction:")) || bytes.Contains(upstreamBody, []byte(capsule)) {
+		t.Fatalf("upstream request retained the bridge capsule: %s", upstreamBody)
+	}
+	if got := gjson.GetBytes(upstreamBody, "input.1.content.0.text").String(); !strings.Contains(got, "Preserve the active task.") {
+		t.Fatalf("upstream request did not contain the expanded summary: %s", upstreamBody)
+	}
+}
+
+func TestClaudeSafeguardsFailBeforeUpstreamOnTranslatedRoutes(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		endpoint string
+		stream   bool
+	}{
+		{name: "Chat JSON", endpoint: "/chat/completions"},
+		{name: "Responses JSON", endpoint: "/responses"},
+		{name: "Chat SSE", endpoint: "/chat/completions", stream: true},
+		{name: "Responses SSE", endpoint: "/responses", stream: true},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			host := &errorStreamHost{}
+			service := New(host)
+			config := []byte("model_endpoint_overrides:\n  claude-sonnet-5.5: " + test.endpoint + "\n")
+			if err := service.Configure(config); err != nil {
+				t.Fatalf("configure service: %v", err)
+			}
+			payload := []byte(`{"safeguards":{"dangerous_tool_use":{"action":"block"}},"messages":[]}`)
+			request := ExecuteRequest{ExecutorRequest: pluginapi.ExecutorRequest{
+				SourceFormat:    "claude",
+				Model:           "claude-sonnet-5.5",
+				OriginalRequest: append([]byte(nil), payload...),
+				Payload:         append([]byte(nil), payload...),
+			}}
+			var err error
+			if test.stream {
+				request.StreamID = "stream-id"
+				_, err = service.ExecuteStream(context.Background(), request)
+			} else {
+				_, err = service.Execute(context.Background(), request)
+			}
+			var statusErr *StatusError
+			if !errors.As(err, &statusErr) || statusErr.Code != "translation_error" || statusErr.HTTPStatus != http.StatusUnprocessableEntity {
+				t.Fatalf("request error = %#v, want pre-upstream 422 translation error", err)
+			}
+			if strings.Contains(err.Error(), "dangerous_tool_use") || !bytes.Equal(request.OriginalRequest, payload) {
+				t.Fatalf("request error leaked request data or original history changed: %v", err)
+			}
+		})
 	}
 }
 
