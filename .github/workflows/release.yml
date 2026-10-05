@@ -42,6 +42,9 @@ jobs:
       - name: Build marketplace package
         run: make package VERSION=${{ steps.version.outputs.value }}
 
+      - name: Run synthetic native host tests
+        run: make test-native
+
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}

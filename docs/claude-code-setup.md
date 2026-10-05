@@ -205,14 +205,11 @@ These OAuth exclusions affect Copilot only.
 Matching IDs from other provider catalogs remain available.
 The exact Claude exclusions do not filter `claude-opus-5.5` or `claude-sonnet-5.5`.
 
-The template adds input aliases for selected GPT, Claude, and Gemini model IDs.
+The template adds input aliases for selected Claude model IDs.
 
 ```yaml
 model-alias:
   copilot:
-    - name: "gpt-6.1-sol"
-      alias: "gpt-6-1-sol"
-      fork: true
     - name: "claude-opus-5.5"
       alias: "claude-opus-5-5"
       fork: true
@@ -222,12 +219,6 @@ model-alias:
     - name: "claude-fable-5.1"
       alias: "claude-fable-5-1"
       fork: true
-    - name: "gemini-3.8-flash"
-      alias: "gemini-flash-3.8"
-      fork: true
-    - name: "gemini-3.8-flash"
-      alias: "gemini-flash-3-8"
-      fork: true
 ```
 
 When Copilot exposes an upstream model, the aliases keep its dotted ID and add these client names.
@@ -235,7 +226,6 @@ CLIProxyAPI sends the original dotted model IDs to Copilot for aliased requests.
 The configuration does not force response model IDs to change.
 
 The template sets the advertised context length to 272000 tokens for both GPT models.
-The `gpt-6-1-sol` alias uses the `gpt-6.1-sol` context setting when Copilot exposes that model.
 
 ```yaml
 settings:
@@ -283,12 +273,14 @@ The plugin derives `prompt_cache_key` for Copilot Responses requests when a stab
 Set `support-prompt-cache-key: false` in the plugin configuration to omit generated keys.
 The plugin preserves explicit caller keys.
 Copilot's implicit cache lifetime can differ from Codex's.
-Enable response compaction only on a compatible CLIProxyAPI host.
-Add this under `plugins.configs.cliproxyapi-copilot` when `gpt-6-luna` appears in `/v1/models`.
+The plugin enables compaction for listed models on compatible CLIProxyAPI hosts.
+This option does not add unavailable models to `/v1/models`.
 
 ```yaml
 compaction_models:
   - "gpt-6-luna"
+  - "gpt-6.1-sol"
+  - "mai-code-1.1-flash"
 ```
 
 ## 8. Configure Claude Code globally
@@ -315,7 +307,7 @@ Merge the following values into `~/.claude/settings.json`. Replace the
     "ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-fable-5-1",
     "ANTHROPIC_DEFAULT_OPUS_MODEL": "gpt-6-luna",
     "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-5-5",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gemini-flash-3-8",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gemini-3.8-flash",
     "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"
   },
   "apiKeyHelper": "sed -n 's/^CLIPROXYAPI_API_KEY=//p' /home/YOUR_USER/cliproxyapi-copilot-plugin/.runtime/secrets.env"
@@ -343,7 +335,7 @@ The configured aliases are:
 | Fable | `claude-fable-5-1` | Claude or GitHub Copilot |
 | Opus | `gpt-6-luna` | GitHub Copilot |
 | Sonnet | `claude-sonnet-5-5` | Claude or GitHub Copilot |
-| Haiku | `gemini-flash-3-8` | GitHub Copilot |
+| Haiku | `gemini-3.8-flash` | GitHub Copilot |
 
 Claude and Copilot can expose the same Fable and Sonnet IDs.
 Plain aliases keep the requested names and can route through either provider's registered credentials.

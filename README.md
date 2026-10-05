@@ -96,7 +96,13 @@ the Debian Bookworm runtime used by the official image.
 ```sh
 make test
 make build
+make test-native
 ```
+
+`make test-native` loads the built plugin in a temporary CLIProxyAPI host from the SDK version selected in `go.mod`.
+Its provider responses and credentials are synthetic fixtures served on loopback addresses.
+It does not require a Copilot login.
+Run `scripts/test-native-host.sh` directly to test a prebuilt plugin for the local platform with the installed Go toolchain.
 
 The loader artifact is:
 
@@ -120,6 +126,9 @@ including the complete configuration block, are in
 
 Every push and pull request runs the Go tests and builds a production-compatible
 Linux `amd64` marketplace package. Pushes do not publish releases.
+
+CI and release builds run the native host fixtures against the packaged plugin before publishing artifacts.
+The fixture suite covers all nine client-to-endpoint routes over JSON and SSE, original tool IDs, reasoning replay, native model settings, and compaction.
 
 To publish a marketplace-compatible release, create and push a dotted numeric
 version tag:

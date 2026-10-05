@@ -133,6 +133,7 @@ func startNativeCodexWebsocketHost(t *testing.T, binary, upstream string) (strin
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	command := exec.CommandContext(ctx, binary, "--config", configPath, "--local-model")
+	command.Env = filteredChildEnvironment(os.Environ())
 	command.Dir = root
 	command.Stdout = logFile
 	command.Stderr = logFile

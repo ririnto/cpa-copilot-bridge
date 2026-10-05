@@ -32,6 +32,9 @@ jobs:
       - name: Build and package production plugin
         run: make package VERSION=0.0.0
 
+      - name: Run synthetic native host tests
+        run: make test-native
+
       - name: Upload package
         uses: actions/upload-artifact@v4
         with:

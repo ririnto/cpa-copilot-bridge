@@ -131,9 +131,6 @@ Add this native v8 `model-alias` block to the existing top-level `oauth` section
 ```yaml
 model-alias:
   copilot:
-    - name: "gpt-6.1-sol"
-      alias: "gpt-6-1-sol"
-      fork: true
     - name: "claude-opus-5.5"
       alias: "claude-opus-5-5"
       fork: true
@@ -142,12 +139,6 @@ model-alias:
       fork: true
     - name: "claude-fable-5.1"
       alias: "claude-fable-5-1"
-      fork: true
-    - name: "gemini-3.8-flash"
-      alias: "gemini-flash-3.8"
-      fork: true
-    - name: "gemini-3.8-flash"
-      alias: "gemini-flash-3-8"
       fork: true
 ```
 
@@ -166,7 +157,6 @@ settings:
       max-context-length: 272000
 ```
 
-The `gpt-6-1-sol` alias uses the `gpt-6.1-sol` context setting when Copilot exposes that model.
 This global setting changes only the advertised context metadata for Copilot OAuth accounts.
 It does not enforce a billing or usage-cost cap.
 Thinking support and other capabilities remain based on Copilot model metadata.
@@ -185,12 +175,14 @@ The plugin derives `prompt_cache_key` for Copilot Responses requests when a stab
 Set `support-prompt-cache-key: false` to omit generated keys.
 The plugin preserves explicit caller keys.
 Copilot's implicit cache lifetime can differ from Codex's.
-Enable response compaction only on a compatible CLIProxyAPI host.
-Add this under `plugins.configs.cliproxyapi-copilot` when `gpt-6-luna` appears in `/v1/models`.
+The plugin enables compaction for listed models on compatible CLIProxyAPI hosts.
+This option does not add unavailable models to `/v1/models`.
 
 ```yaml
 compaction_models:
   - "gpt-6-luna"
+  - "gpt-6.1-sol"
+  - "mai-code-1.1-flash"
 ```
 
 Codex also needs remote compaction enabled for its configured model provider.

@@ -32,9 +32,6 @@ oauth:
         max-context-length: 272000
   model-alias:
     copilot:
-      - name: "gpt-6.1-sol"
-        alias: "gpt-6-1-sol"
-        fork: true
       - name: "claude-opus-5.5"
         alias: "claude-opus-5-5"
         fork: true
@@ -43,12 +40,6 @@ oauth:
         fork: true
       - name: "claude-fable-5.1"
         alias: "claude-fable-5-1"
-        fork: true
-      - name: "gemini-3.8-flash"
-        alias: "gemini-flash-3.8"
-        fork: true
-      - name: "gemini-3.8-flash"
-        alias: "gemini-flash-3-8"
         fork: true
   excluded-models:
     copilot:
@@ -95,5 +86,7 @@ plugins:
       oauth_timeout_seconds: 900
       model_cache_ttl_seconds: 600
       token_expiry_buffer_seconds: 300
-      # Enable only on a CLIProxyAPI host that supports Responses compaction.
-      # compaction_models: ["gpt-6-luna"]
+      compaction_models:
+        - "gpt-6-luna"
+        - "gpt-6.1-sol"
+        - "mai-code-1.1-flash"

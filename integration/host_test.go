@@ -386,7 +386,7 @@ func TestNativeHostOAuthExcludedModelsFilterPluginModels(t *testing.T) {
 	state := &fixture{canceled: make(chan struct{})}
 	upstream := httptest.NewServer(state)
 	defer upstream.Close()
-	oauthConfig := "  excluded-models:\n    copilot:\n      - \"gpt-5*\"\n      - \"gpt-6-sol\"\n      - \"claude-fable-5\"\n      - \"claude-sonnet-4*\"\n      - \"claude-sonnet-5\"\n      - \"claude-opus-4*\"\n      - \"claude-opus-5\"\n      - \"gemini-3.7-flash\"\n      - \"grok-4.5\"\n      - \"grok-4.6\"\n  model-alias:\n    copilot:\n      - name: \"claude-sonnet-5.5\"\n        alias: \"claude-sonnet-5-5\"\n        fork: true\n      - name: \"claude-opus-5.5\"\n        alias: \"claude-opus-5-5\"\n        fork: true\n      - name: \"claude-fable-5.1\"\n        alias: \"claude-fable-5-1\"\n        fork: true\n      - name: \"gemini-3.8-flash\"\n        alias: \"gemini-flash-3.8\"\n        fork: true\n      - name: \"gemini-3.8-flash\"\n        alias: \"gemini-flash-3-8\"\n        fork: true\n      - name: \"gpt-6.1-sol\"\n        alias: \"gpt-6-1-sol\"\n        fork: true\n"
+	oauthConfig := "  excluded-models:\n    copilot:\n      - \"gpt-5*\"\n      - \"gpt-6-sol\"\n      - \"claude-fable-5\"\n      - \"claude-sonnet-4*\"\n      - \"claude-sonnet-5\"\n      - \"claude-opus-4*\"\n      - \"claude-opus-5\"\n      - \"gemini-3.7-flash\"\n      - \"grok-4.5\"\n      - \"grok-4.6\"\n  model-alias:\n    copilot:\n      - name: \"claude-sonnet-5.5\"\n        alias: \"claude-sonnet-5-5\"\n        fork: true\n      - name: \"claude-opus-5.5\"\n        alias: \"claude-opus-5-5\"\n        fork: true\n      - name: \"claude-fable-5.1\"\n        alias: \"claude-fable-5-1\"\n        fork: true\n"
 	base, _ := startProxyInRoot(t, binary, upstream.URL, t.TempDir(), nil, "", oauthConfig)
 	request, err := http.NewRequest(http.MethodGet, base+"/v1/models", nil)
 	if err != nil {
@@ -419,7 +419,12 @@ func TestNativeHostOAuthExcludedModelsFilterPluginModels(t *testing.T) {
 			t.Fatalf("native OAuth exclusions retained %q in the model catalog", excluded)
 		}
 	}
-	for _, retained := range []string{"gpt-6.1-sol", "gpt-6-1-sol", "gpt-6-luna", "claude-fable-5.1", "claude-fable-5-1", "claude-sonnet-5.5", "claude-sonnet-5-5", "claude-opus-5.5", "claude-opus-5-5", "gemini-3.8-flash", "gemini-flash-3.8", "gemini-flash-3-8", "grok-4.7"} {
+	for _, removedAlias := range []string{"gpt-6-1-sol", "gemini-3-8-flash", "gemini-flash-3.8", "gemini-flash-3-8", "mai-code-1-1-flash"} {
+		if _, exists := models[removedAlias]; exists {
+			t.Fatalf("removed model alias %q remains in the model catalog", removedAlias)
+		}
+	}
+	for _, retained := range []string{"gpt-6.1-sol", "gpt-6-luna", "claude-fable-5.1", "claude-fable-5-1", "claude-sonnet-5.5", "claude-sonnet-5-5", "claude-opus-5.5", "claude-opus-5-5", "gemini-3.8-flash", "mai-code-1.1-flash", "grok-4.7"} {
 		if _, exists := models[retained]; !exists {
 			t.Fatalf("native OAuth exclusions removed unrelated eligible model %q", retained)
 		}
@@ -433,19 +438,20 @@ func TestNativeHostOAuthExcludedModelsFilterPluginModels(t *testing.T) {
 	}{
 		{path: "/v1/messages", model: "claude-sonnet-5-5", upstreamID: "claude-sonnet-5.5", upstreamPath: "/v1/messages", request: map[string]any{"max_tokens": 128, "messages": []any{map[string]any{"role": "user", "content": "alias"}}}},
 		{path: "/v1/responses", model: "claude-opus-5-5", upstreamID: "claude-opus-5.5", upstreamPath: "/v1/messages", request: map[string]any{"input": "alias"}},
-		{path: "/v1/chat/completions", model: "gemini-flash-3.8", upstreamID: "gemini-3.8-flash", upstreamPath: "/chat/completions", request: map[string]any{"messages": []any{map[string]any{"role": "user", "content": "alias"}}}},
-		{path: "/v1/responses", model: "gemini-flash-3-8", upstreamID: "gemini-3.8-flash", upstreamPath: "/chat/completions", request: map[string]any{"input": "alias"}},
-		{path: "/v1/responses", model: "gpt-6-1-sol", upstreamID: "gpt-6.1-sol", upstreamPath: "/responses", request: map[string]any{"input": "alias"}},
+		{path: "/v1/chat/completions", model: "gemini-3.8-flash", upstreamID: "gemini-3.8-flash", upstreamPath: "/chat/completions", request: map[string]any{"messages": []any{map[string]any{"role": "user", "content": "canonical model"}}}},
+		{path: "/v1/responses", model: "gemini-3.8-flash", upstreamID: "gemini-3.8-flash", upstreamPath: "/chat/completions", request: map[string]any{"input": "canonical model"}},
+		{path: "/v1/responses", model: "mai-code-1.1-flash", upstreamID: "mai-code-1.1-flash", upstreamPath: "/responses", request: map[string]any{"input": "canonical model"}},
+		{path: "/v1/responses", model: "gpt-6.1-sol", upstreamID: "gpt-6.1-sol", upstreamPath: "/responses", request: map[string]any{"input": "canonical model"}},
 	} {
 		request := route.request
 		request["model"] = route.model
 		callProxy(t, base+route.path, request)
 		captured, path := lastUpstreamRequest(t, state)
 		if path != route.upstreamPath {
-			t.Fatalf("request for alias %q used native path %q, want %s", route.model, path, route.upstreamPath)
+			t.Fatalf("request for model %q used native path %q, want %s", route.model, path, route.upstreamPath)
 		}
 		if captured["model"] != route.upstreamID {
-			t.Fatalf("request for alias %q reached Copilot as %v, want %q", route.model, captured["model"], route.upstreamID)
+			t.Fatalf("request for model %q reached Copilot as %v, want %q", route.model, captured["model"], route.upstreamID)
 		}
 	}
 }
@@ -458,13 +464,12 @@ func TestNativeHostOAuthSettingsOverrideCopilotModelContext(t *testing.T) {
 	state := &fixture{canceled: make(chan struct{})}
 	upstream := httptest.NewServer(state)
 	defer upstream.Close()
-	modelAlias := "  model-alias:\n    copilot:\n      - name: gpt-6.1-sol\n        alias: gpt-6-1-sol\n        fork: true\n"
-	baselineBase, _ := startProxyInRoot(t, binary, upstream.URL, t.TempDir(), nil, "", modelAlias)
+	baselineBase, _ := startProxyInRoot(t, binary, upstream.URL, t.TempDir(), nil, "", "")
 	baseline := requestNativeCodexModels(t, baselineBase)
-	oauthSettings := modelAlias + "  settings:\n    copilot:\n      - name: gpt-6.1-sol\n        max-context-length: 272000\n      - name: gpt-6-1-sol\n        max-context-length: 272000\n      - name: gpt-6-luna\n        max-context-length: 272000\n"
+	oauthSettings := "  settings:\n    copilot:\n      - name: gpt-6.1-sol\n        max-context-length: 272000\n      - name: gpt-6-luna\n        max-context-length: 272000\n"
 	base, _ := startProxyInRoot(t, binary, upstream.URL, t.TempDir(), nil, "", oauthSettings)
 	configured := requestNativeCodexModels(t, base)
-	for _, modelID := range []string{"gpt-6.1-sol", "gpt-6-1-sol", "gpt-6-luna"} {
+	for _, modelID := range []string{"gpt-6.1-sol", "gpt-6-luna"} {
 		before, beforeExists := baseline[modelID]
 		after, afterExists := configured[modelID]
 		if !beforeExists || !afterExists {
@@ -567,6 +572,7 @@ func (f *fixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			map[string]any{"id": "gpt-6.1-sol", "vendor": "OpenAI", "supported_endpoints": []string{"/responses"}, "capabilities": map[string]any{"type": "chat", "family": "gpt", "supports": map[string]any{"adaptive_thinking": true, "reasoning_effort": []string{"low", "medium", "high", "xhigh"}}, "limits": map[string]int{"max_context_window_tokens": 128000}}},
 			map[string]any{"id": "gpt-6-luna", "vendor": "OpenAI", "supported_endpoints": []string{"/responses"}, "capabilities": map[string]any{"type": "chat", "family": "gpt", "supports": map[string]any{"adaptive_thinking": true, "reasoning_effort": []string{"low", "medium", "high"}}, "limits": map[string]int{"max_context_window_tokens": 96000}}},
 			map[string]any{"id": "gemini-3.8-flash", "vendor": "Google", "supported_endpoints": []string{"/chat/completions"}, "capabilities": map[string]any{"type": "chat", "family": "gemini"}},
+			map[string]any{"id": "mai-code-1.1-flash", "model_picker_enabled": true, "policy": map[string]string{"state": "enabled"}, "supported_endpoints": []string{"/responses"}, "capabilities": map[string]any{"type": "chat", "family": "mai", "supports": map[string]any{"adaptive_thinking": true, "reasoning_effort": []string{"low", "medium", "high"}}}},
 			map[string]any{"id": "bridge-gemini-3.8", "vendor": "Google", "supported_endpoints": []string{"/chat/completions"}, "capabilities": map[string]any{"type": "chat", "family": "gemini", "supports": map[string]bool{"streaming": true, "tool_calls": true}}},
 			map[string]any{"id": "bridge-gpt-6-luna", "vendor": "OpenAI", "supported_endpoints": []string{"/responses"}, "capabilities": map[string]any{"type": "chat", "family": "gpt", "supports": map[string]bool{"streaming": true, "tool_calls": true}}},
 			map[string]any{"id": "bridge-chat-sonnet-5.5", "vendor": "Anthropic", "supported_endpoints": []string{"/v1/messages"}, "capabilities": map[string]any{"type": "chat", "family": "claude", "supports": map[string]any{"streaming": true, "tool_calls": true, "adaptive_thinking": true, "reasoning_effort": []string{"low", "medium", "high", "max"}}, "limits": map[string]int{"max_context_window_tokens": 81920}}},
@@ -861,7 +867,7 @@ func startProxyInRoot(t *testing.T, binary, upstream, root string, authJSON []by
 	for _, fragment := range oauthConfigYAML {
 		oauthConfig.WriteString(fragment)
 	}
-	config := fmt.Sprintf("config-version: 8\nserver:\n  host: 127.0.0.1\n  port: %d\nmanagement:\n  disable-control-panel: true\n  secret-key: %q\naccess:\n  api-keys: [fixture-client-key]\noauth:\n  auth-dir: %q\n%splugins:\n  enabled: true\n  dir: %q\n  configs:\n    cliproxyapi-copilot:\n      enabled: true\n      allow_insecure_base_urls: true\n      compaction_models: [bridge-responses]\n      reasoning_replay: true\n      github_base_url: %q\n      github_api_url: %q\n      copilot_api_url: %q\n", port, managementSecret, authDir, oauthConfig.String(), filepath.Join(root, "plugins"), upstream, upstream, upstream)
+	config := fmt.Sprintf("config-version: 8\nserver:\n  host: 127.0.0.1\n  port: %d\nmanagement:\n  disable-control-panel: true\n  secret-key: %q\naccess:\n  api-keys: [fixture-client-key]\noauth:\n  auth-dir: %q\n%splugins:\n  enabled: true\n  dir: %q\n  configs:\n    cliproxyapi-copilot:\n      enabled: true\n      allow_insecure_base_urls: true\n      compaction_models: [\"bridge-responses\", \"gpt-6-luna\", \"gpt-6.1-sol\", \"mai-code-1.1-flash\"]\n      reasoning_replay: true\n      github_base_url: %q\n      github_api_url: %q\n      copilot_api_url: %q\n", port, managementSecret, authDir, oauthConfig.String(), filepath.Join(root, "plugins"), upstream, upstream, upstream)
 	configPath := filepath.Join(root, "config.yaml")
 	if err := os.WriteFile(configPath, []byte(config), 0600); err != nil {
 		t.Fatal(err)
@@ -873,6 +879,7 @@ func startProxyInRoot(t *testing.T, binary, upstream, root string, authJSON []by
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	command := exec.CommandContext(ctx, binary, "--config", configPath, "--local-model")
+	command.Env = filteredChildEnvironment(os.Environ())
 	command.Dir = root
 	command.Stdout = logFile
 	command.Stderr = logFile

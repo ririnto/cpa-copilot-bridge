@@ -5,7 +5,7 @@ PLUGIN_SO := $(PLUGIN_DIR)/cliproxyapi-copilot.so
 CACHE_DIR := .cache
 VERSION_LDFLAG := -X main.pluginVersion=$(VERSION)
 
-.PHONY: test build build-local package clean
+.PHONY: test build build-local package test-native clean
 
 test:
 	go test ./...
@@ -28,6 +28,25 @@ build-local:
 
 package: build
 	scripts/package-release.sh "$(VERSION)"
+
+test-native:
+	mkdir -p $(CACHE_DIR)/go-build $(CACHE_DIR)/go-mod
+	set -eu; snapshot=$$(mktemp -d); trap 'rm -rf "$$snapshot"' EXIT; trap 'exit 1' HUP INT TERM; \
+		( cd "$(CURDIR)"; git ls-files -z -- '*.go' go.mod go.sum scripts/test-native-host.sh | tar --null -T - -cf - ) | tar -xf - -C "$$snapshot"; \
+		mkdir -p "$$snapshot/$(PLUGIN_DIR)"; cp "$(CURDIR)/$(PLUGIN_SO)" "$$snapshot/$(PLUGIN_SO)"; \
+		docker run --rm --platform=linux/amd64 --read-only --tmpfs /tmp:rw,exec,nosuid,size=1g,mode=1777 \
+		--user "$$(id -u):$$(id -g)" \
+		-e GOENV=off \
+		-e GOWORK=off \
+		-e TMPDIR=/tmp \
+		-e GOCACHE=/cache/go-build \
+		-e GOMODCACHE=/cache/go-mod \
+		-v "$$snapshot:/src:ro" \
+		-v "$(CURDIR)/$(CACHE_DIR)/go-build:/cache/go-build" \
+		-v "$(CURDIR)/$(CACHE_DIR)/go-mod:/cache/go-mod" \
+		-w /src \
+		$(GO_IMAGE) \
+		sh -ec 'scripts/test-native-host.sh'
 
 clean:
 	rm -rf build dist $(CACHE_DIR)
