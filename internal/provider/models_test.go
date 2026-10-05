@@ -236,19 +236,6 @@ func TestModelInfosPreservesAdaptiveThinkingMetadata(t *testing.T) {
 	}
 }
 
-func TestFilterModelsExcludesConfiguredPrefixes(t *testing.T) {
-	t.Parallel()
-
-	models := filterModels([]upstreamModel{
-		{ID: "gpt-5.6-sol"},
-		{ID: "claude-sonnet-5"},
-		{ID: "Claude-Haiku-4.5"},
-	}, []string{"claude-"})
-	if len(models) != 1 || models[0].ID != "gpt-5.6-sol" {
-		t.Fatalf("filtered models = %#v", models)
-	}
-}
-
 func TestAvailableModelsUsesExplicitAvailabilityMetadata(t *testing.T) {
 	t.Parallel()
 	var list modelListResponse
@@ -281,6 +268,7 @@ func TestModelsForAuthReturnsOnlyAvailableInventoryEntries(t *testing.T) {
 	t.Parallel()
 	models := []upstreamModel{
 		{ID: "visible", ModelPickerEnabled: boolPointer(true), Policy: &modelPolicy{State: "enabled"}, Capabilities: modelCapabilities{Type: "chat"}, SupportedEndpoints: []string{"/responses"}},
+		{ID: "claude-sonnet-5.5", Vendor: "Anthropic", ModelPickerEnabled: boolPointer(true), Policy: &modelPolicy{State: "enabled"}, Capabilities: modelCapabilities{Type: "chat"}, SupportedEndpoints: []string{"/v1/messages"}},
 		{ID: "disabled", ModelPickerEnabled: boolPointer(true), Policy: &modelPolicy{State: "disabled"}, Capabilities: modelCapabilities{Type: "chat"}, SupportedEndpoints: []string{"/responses"}},
 		{ID: "internal", ModelPickerEnabled: boolPointer(false), Capabilities: modelCapabilities{Type: "chat"}, SupportedEndpoints: []string{"/responses"}},
 		{ID: "embedding", Capabilities: modelCapabilities{Type: "embeddings"}, SupportedEndpoints: []string{"/responses"}},
@@ -291,8 +279,8 @@ func TestModelsForAuthReturnsOnlyAvailableInventoryEntries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("discover available models: %v", err)
 	}
-	if len(response.Models) != 1 || response.Models[0].ID != "visible" {
-		t.Fatalf("exposed models = %#v, want only visible", response.Models)
+	if len(response.Models) != 2 || response.Models[0].ID != "visible" || response.Models[1].ID != "claude-sonnet-5.5" {
+		t.Fatalf("exposed models = %#v, want all eligible models", response.Models)
 	}
 	if storage.GitHubAccessToken == "" {
 		t.Fatal("test storage lost its synthetic credential")
@@ -375,13 +363,4 @@ func serviceWithCachedModels(t *testing.T, models []upstreamModel) (*Service, au
 
 func boolPointer(value bool) *bool {
 	return &value
-}
-
-func TestNormalizeModelPrefixes(t *testing.T) {
-	t.Parallel()
-
-	got := normalizeModelPrefixes([]string{" Claude- ", "claude-", "", "GPT-"})
-	if len(got) != 2 || got[0] != "claude-" || got[1] != "gpt-" {
-		t.Fatalf("normalized prefixes = %#v", got)
-	}
 }

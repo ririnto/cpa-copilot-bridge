@@ -27,10 +27,9 @@ type Config struct {
 	OAuthTimeoutSeconds      int               `yaml:"oauth_timeout_seconds"`
 	ModelCacheTTLSeconds     int               `yaml:"model_cache_ttl_seconds"`
 	TokenExpiryBufferSeconds int               `yaml:"token_expiry_buffer_seconds"`
-	ExcludedModelPrefixes    []string          `yaml:"excluded_model_prefixes"`
 	ModelEndpointOverrides   map[string]string `yaml:"model_endpoint_overrides"`
 	CompactionModels         []string          `yaml:"compaction_models"`
-	PromptCacheKey           bool              `yaml:"prompt_cache_key"`
+	PromptCacheKey           bool              `yaml:"support-prompt-cache-key"`
 	ReasoningReplay          bool              `yaml:"reasoning_replay"`
 }
 
@@ -63,7 +62,6 @@ func ParseConfig(raw []byte) (Config, error) {
 	cfg.GitHubBaseURL = strings.TrimRight(strings.TrimSpace(cfg.GitHubBaseURL), "/")
 	cfg.GitHubAPIURL = strings.TrimRight(strings.TrimSpace(cfg.GitHubAPIURL), "/")
 	cfg.CopilotAPIURL = strings.TrimRight(strings.TrimSpace(cfg.CopilotAPIURL), "/")
-	cfg.ExcludedModelPrefixes = normalizeModelPrefixes(cfg.ExcludedModelPrefixes)
 	cfg.CompactionModels = normalizeModelIDs(cfg.CompactionModels)
 	var errOverrides error
 	cfg.ModelEndpointOverrides, errOverrides = normalizeEndpointOverrides(cfg.ModelEndpointOverrides)
@@ -92,23 +90,6 @@ func ParseConfig(raw []byte) (Config, error) {
 		return Config{}, fmt.Errorf("token_expiry_buffer_seconds must be between 30 and 900")
 	}
 	return cfg, nil
-}
-
-func normalizeModelPrefixes(prefixes []string) []string {
-	seen := make(map[string]struct{}, len(prefixes))
-	out := make([]string, 0, len(prefixes))
-	for _, prefix := range prefixes {
-		prefix = strings.ToLower(strings.TrimSpace(prefix))
-		if prefix == "" {
-			continue
-		}
-		if _, exists := seen[prefix]; exists {
-			continue
-		}
-		seen[prefix] = struct{}{}
-		out = append(out, prefix)
-	}
-	return out
 }
 
 func normalizeModelIDs(modelIDs []string) []string {

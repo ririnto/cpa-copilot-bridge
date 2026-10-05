@@ -35,20 +35,29 @@ type fixture struct {
 }
 
 const (
-	matrixChatModel        = "bridge-gemini-3.8"
-	matrixResponsesModel   = "bridge-gpt-6-luna"
-	matrixMessagesModel    = "bridge-sonnet-5.5"
-	matrixSignature        = "provider-signature/+ exact\n\t "
-	matrixRedacted         = "provider-redacted/+ exact\n\t "
-	matrixReasoning        = "provider reasoning exact"
-	matrixOutputText       = "provider text exact"
-	matrixToolName         = "inspect"
-	matrixToolArguments    = `{"query":"provider-value"}`
-	matrixInitialSignature = "initial-signature/+ exact\n\t "
-	matrixInitialRedacted  = "initial-redacted/+ exact\n\t "
-	matrixInputMarker      = "matrix user history exact"
-	matrixContinuation     = "matrix continuation exact"
-	matrixToolResult       = "matrix tool result exact"
+	matrixChatModel                  = "bridge-gemini-3.8"
+	matrixResponsesModel             = "bridge-gpt-6-luna"
+	matrixMessagesModel              = "bridge-sonnet-5.5"
+	matrixChatMessagesModel          = "bridge-chat-sonnet-5.5"
+	matrixSignature                  = "provider-signature/+ exact\n\t "
+	matrixRedacted                   = "provider-redacted/+ exact\n\t "
+	matrixReasoning                  = "provider reasoning exact"
+	matrixOutputText                 = "provider text exact"
+	matrixToolName                   = "inspect"
+	matrixToolArguments              = `{"query":"provider-value"}`
+	matrixInitialSignature           = "initial-signature/+ exact\n\t "
+	matrixInitialRedacted            = "initial-redacted/+ exact\n\t "
+	matrixInputMarker                = "matrix user history exact"
+	matrixContinuation               = "matrix continuation exact"
+	matrixThirdContinuation          = "matrix third continuation exact"
+	matrixToolResult                 = "matrix tool result exact"
+	matrixCompactReasoningID         = "reasoning_compaction_original/+"
+	matrixCompactFunctionID          = "function_compaction_original/+"
+	matrixCompactCallID              = "call_compaction_original/+"
+	matrixCompactOpaque              = "copilot-opaque/+ encrypted content exact"
+	matrixCompactCacheKey            = "compact-history-cache-key"
+	matrixChatInitialThinkingEffort  = "low"
+	matrixChatFollowupThinkingEffort = "high"
 )
 
 var (
@@ -71,8 +80,11 @@ type matrixRoute struct {
 }
 
 type matrixOutput struct {
+	Model         string
+	Turn          int
 	Signature     string
 	Redacted      string
+	ChatOpaque    any
 	Text          string
 	ClaudeToolID  string
 	ItemID        string
@@ -80,6 +92,17 @@ type matrixOutput struct {
 	ToolName      string
 	ToolArguments string
 	ResponseItems []map[string]any
+}
+
+type nativeCodexModel struct {
+	Slug                     string                     `json:"slug"`
+	ContextWindow            int                        `json:"context_window"`
+	MaxContextWindow         int                        `json:"max_context_window"`
+	SupportedReasoningLevels []nativeCodexThinkingLevel `json:"supported_reasoning_levels"`
+}
+
+type nativeCodexThinkingLevel struct {
+	Effort string `json:"effort"`
 }
 
 func TestNativeHostProtocolRoundTrips(t *testing.T) {
@@ -193,18 +216,16 @@ func TestNativeHostProtocolRoundTrips(t *testing.T) {
 		}
 	})
 	t.Run("ResponsesCompactionTriggerRoundTrip", func(t *testing.T) {
-		history := []any{map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "Remember the active goal: finish the native host bridge."}}}}
-		input := append(append([]any(nil), history...), map[string]any{"type": "compaction_trigger"})
-		response := callProxy(t, base+"/v1/responses", map[string]any{"model": "bridge-responses", "input": input})
+		input := append(matrixCompactionHistory(), map[string]any{"type": "compaction_trigger"})
+		response := callProxy(t, base+"/v1/responses", map[string]any{"model": "bridge-responses", "input": input, "prompt_cache_key": matrixCompactCacheKey})
 		captured, path := lastUpstreamRequest(t, state)
 		assertCompactionRequest(t, captured, path)
 		capsule := assertSingleCompaction(t, response)
 		assertCompactionReplay(t, base, state, capsule, "Continue the bridge task.", false)
 	})
 	t.Run("ResponsesCompactionTriggerStreamingRoundTrip", func(t *testing.T) {
-		history := []any{map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "Remember the active goal: finish the native host bridge."}}}}
-		input := append(append([]any(nil), history...), map[string]any{"type": "compaction_trigger"})
-		stream := callProxy(t, base+"/v1/responses", map[string]any{"model": "bridge-responses", "stream": true, "input": input})
+		input := append(matrixCompactionHistory(), map[string]any{"type": "compaction_trigger"})
+		stream := callProxy(t, base+"/v1/responses", map[string]any{"model": "bridge-responses", "stream": true, "input": input, "prompt_cache_key": matrixCompactCacheKey})
 		captured, path := lastUpstreamRequest(t, state)
 		assertCompactionRequest(t, captured, path)
 		events := parseSSEDataEvents(t, stream)
@@ -277,8 +298,9 @@ func TestNativeHostProtocolRoundTrips(t *testing.T) {
 	})
 	t.Run("ResponsesCompactRouteRoundTrip", func(t *testing.T) {
 		request := map[string]any{
-			"model": "bridge-responses",
-			"input": []any{map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "Summarize the native host bridge task."}}}},
+			"model":            "bridge-responses",
+			"input":            matrixCompactionHistory(),
+			"prompt_cache_key": matrixCompactCacheKey,
 		}
 		response := callProxy(t, base+"/v1/responses/compact", request)
 		captured, path := lastUpstreamRequest(t, state)
@@ -311,14 +333,17 @@ func TestNativeHostProtocolRoundTrips(t *testing.T) {
 			})
 		}
 	})
-	t.Run("SixClientProviderProtocolRoutes", func(t *testing.T) {
+	t.Run("NineClientProviderProtocolRoutes", func(t *testing.T) {
 		routes := []matrixRoute{
 			{name: "ClaudeToGeminiChat", clientFormat: "claude", model: matrixChatModel, upstreamPath: "/chat/completions"},
 			{name: "ResponsesToGeminiChat", clientFormat: "openai-response", model: matrixChatModel, upstreamPath: "/chat/completions"},
+			{name: "ChatToGeminiChat", clientFormat: "openai", model: matrixChatModel, upstreamPath: "/chat/completions"},
 			{name: "ClaudeToGPT6Luna", clientFormat: "claude", model: matrixResponsesModel, upstreamPath: "/responses"},
 			{name: "ResponsesToGPT6Luna", clientFormat: "openai-response", model: matrixResponsesModel, upstreamPath: "/responses"},
+			{name: "ChatToGPT6Luna", clientFormat: "openai", model: matrixResponsesModel, upstreamPath: "/responses"},
 			{name: "ClaudeToSonnet55", clientFormat: "claude", model: matrixMessagesModel, upstreamPath: "/v1/messages"},
 			{name: "ResponsesToSonnet55", clientFormat: "openai-response", model: matrixMessagesModel, upstreamPath: "/v1/messages"},
+			{name: "ChatToSonnet55", clientFormat: "openai", model: matrixChatMessagesModel, upstreamPath: "/v1/messages"},
 		}
 		for _, route := range routes {
 			for _, stream := range []bool{false, true} {
@@ -332,14 +357,164 @@ func TestNativeHostProtocolRoundTrips(t *testing.T) {
 					assertMatrixInitialRequest(t, route, firstCaptured)
 					output := assertMatrixClientOutput(t, route, firstResponse, stream)
 					followup := matrixFollowupRequest(route, output)
-					callProxyWithSession(t, base+matrixClientPath(route.clientFormat), followup, session)
+					assertChatClientToolResultEcho(t, route, followup, output)
+					followupResponse := callProxyWithSession(t, base+matrixClientPath(route.clientFormat), followup, session)
 					followupCaptured, followupPath := lastUpstreamRequest(t, state)
 					assertMatrixRoute(t, route, followupCaptured, followupPath, false)
 					assertMatrixFollowupRequest(t, route, followupCaptured, output)
+					if route.name == "ChatToSonnet55" {
+						secondOutput := assertMatrixClientOutputTurn(t, route, followupResponse, false, 2)
+						thirdRequest := matrixThirdTurnRequest(t, route, output, secondOutput)
+						assertChatClientToolResultEcho(t, route, thirdRequest, secondOutput)
+						thirdResponse := callProxyWithSession(t, base+matrixClientPath(route.clientFormat), thirdRequest, session)
+						thirdCaptured, thirdPath := lastUpstreamRequest(t, state)
+						assertMatrixRoute(t, route, thirdCaptured, thirdPath, false)
+						assertChatClientThirdTurnRequest(t, thirdCaptured, output, secondOutput)
+						assertMatrixClientOutputTurn(t, route, thirdResponse, false, 3)
+					}
 				})
 			}
 		}
 	})
+}
+
+func TestNativeHostOAuthExcludedModelsFilterPluginModels(t *testing.T) {
+	binary := os.Getenv("CPA_BINARY")
+	if binary == "" {
+		t.Skip("set CPA_BINARY to a built CLIProxyAPI v8 server for native host integration")
+	}
+	state := &fixture{canceled: make(chan struct{})}
+	upstream := httptest.NewServer(state)
+	defer upstream.Close()
+	oauthConfig := "  excluded-models:\n    copilot:\n      - \"gpt-5*\"\n      - \"gpt-6-sol\"\n      - \"claude-fable-5\"\n      - \"claude-sonnet-4*\"\n      - \"claude-sonnet-5\"\n      - \"claude-opus-4*\"\n      - \"claude-opus-5\"\n      - \"gemini-3.7-flash\"\n      - \"grok-4.5\"\n      - \"grok-4.6\"\n  model-alias:\n    copilot:\n      - name: \"claude-sonnet-5.5\"\n        alias: \"claude-sonnet-5-5\"\n        fork: true\n      - name: \"claude-opus-5.5\"\n        alias: \"claude-opus-5-5\"\n        fork: true\n      - name: \"claude-fable-5.1\"\n        alias: \"claude-fable-5-1\"\n        fork: true\n      - name: \"gemini-3.8-flash\"\n        alias: \"gemini-flash-3.8\"\n        fork: true\n      - name: \"gemini-3.8-flash\"\n        alias: \"gemini-flash-3-8\"\n        fork: true\n      - name: \"gpt-6.1-sol\"\n        alias: \"gpt-6-1-sol\"\n        fork: true\n"
+	base, _ := startProxyInRoot(t, binary, upstream.URL, t.TempDir(), nil, "", oauthConfig)
+	request, err := http.NewRequest(http.MethodGet, base+"/v1/models", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer fixture-client-key")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("list native models: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("list native models: status=%d body=%s", response.StatusCode, body)
+	}
+	var catalog struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&catalog); err != nil {
+		t.Fatalf("decode native model catalog: %v", err)
+	}
+	models := make(map[string]struct{}, len(catalog.Data))
+	for _, model := range catalog.Data {
+		models[model.ID] = struct{}{}
+	}
+	for _, excluded := range []string{"gpt-5.5", "gpt-5-copilot-only", "gpt-6-sol", "claude-fable-5", "claude-sonnet-4.8-fast", "claude-sonnet-4-8-fast", "claude-sonnet-5", "claude-opus-4.8-fast", "claude-opus-4-8-fast", "claude-opus-5", "gemini-3.7-flash", "grok-4.5", "grok-4.6"} {
+		if _, exists := models[excluded]; exists {
+			t.Fatalf("native OAuth exclusions retained %q in the model catalog", excluded)
+		}
+	}
+	for _, retained := range []string{"gpt-6.1-sol", "gpt-6-1-sol", "gpt-6-luna", "claude-fable-5.1", "claude-fable-5-1", "claude-sonnet-5.5", "claude-sonnet-5-5", "claude-opus-5.5", "claude-opus-5-5", "gemini-3.8-flash", "gemini-flash-3.8", "gemini-flash-3-8", "grok-4.7"} {
+		if _, exists := models[retained]; !exists {
+			t.Fatalf("native OAuth exclusions removed unrelated eligible model %q", retained)
+		}
+	}
+	for _, route := range []struct {
+		path         string
+		model        string
+		upstreamID   string
+		upstreamPath string
+		request      map[string]any
+	}{
+		{path: "/v1/messages", model: "claude-sonnet-5-5", upstreamID: "claude-sonnet-5.5", upstreamPath: "/v1/messages", request: map[string]any{"max_tokens": 128, "messages": []any{map[string]any{"role": "user", "content": "alias"}}}},
+		{path: "/v1/responses", model: "claude-opus-5-5", upstreamID: "claude-opus-5.5", upstreamPath: "/v1/messages", request: map[string]any{"input": "alias"}},
+		{path: "/v1/chat/completions", model: "gemini-flash-3.8", upstreamID: "gemini-3.8-flash", upstreamPath: "/chat/completions", request: map[string]any{"messages": []any{map[string]any{"role": "user", "content": "alias"}}}},
+		{path: "/v1/responses", model: "gemini-flash-3-8", upstreamID: "gemini-3.8-flash", upstreamPath: "/chat/completions", request: map[string]any{"input": "alias"}},
+		{path: "/v1/responses", model: "gpt-6-1-sol", upstreamID: "gpt-6.1-sol", upstreamPath: "/responses", request: map[string]any{"input": "alias"}},
+	} {
+		request := route.request
+		request["model"] = route.model
+		callProxy(t, base+route.path, request)
+		captured, path := lastUpstreamRequest(t, state)
+		if path != route.upstreamPath {
+			t.Fatalf("request for alias %q used native path %q, want %s", route.model, path, route.upstreamPath)
+		}
+		if captured["model"] != route.upstreamID {
+			t.Fatalf("request for alias %q reached Copilot as %v, want %q", route.model, captured["model"], route.upstreamID)
+		}
+	}
+}
+
+func TestNativeHostOAuthSettingsOverrideCopilotModelContext(t *testing.T) {
+	binary := os.Getenv("CPA_BINARY")
+	if binary == "" {
+		t.Skip("set CPA_BINARY to a built CLIProxyAPI v8 server for native host integration")
+	}
+	state := &fixture{canceled: make(chan struct{})}
+	upstream := httptest.NewServer(state)
+	defer upstream.Close()
+	modelAlias := "  model-alias:\n    copilot:\n      - name: gpt-6.1-sol\n        alias: gpt-6-1-sol\n        fork: true\n"
+	baselineBase, _ := startProxyInRoot(t, binary, upstream.URL, t.TempDir(), nil, "", modelAlias)
+	baseline := requestNativeCodexModels(t, baselineBase)
+	oauthSettings := modelAlias + "  settings:\n    copilot:\n      - name: gpt-6.1-sol\n        max-context-length: 272000\n      - name: gpt-6-1-sol\n        max-context-length: 272000\n      - name: gpt-6-luna\n        max-context-length: 272000\n"
+	base, _ := startProxyInRoot(t, binary, upstream.URL, t.TempDir(), nil, "", oauthSettings)
+	configured := requestNativeCodexModels(t, base)
+	for _, modelID := range []string{"gpt-6.1-sol", "gpt-6-1-sol", "gpt-6-luna"} {
+		before, beforeExists := baseline[modelID]
+		after, afterExists := configured[modelID]
+		if !beforeExists || !afterExists {
+			t.Fatalf("native Codex catalog must retain %q before and after its context override", modelID)
+		}
+		if before.ContextWindow != 272000 || after.ContextWindow != 272000 || before.MaxContextWindow == 272000 || after.MaxContextWindow != 272000 {
+			t.Errorf("%s context windows = %d/%d before, %d/%d after, want context and max context windows 272000", modelID, before.ContextWindow, before.MaxContextWindow, after.ContextWindow, after.MaxContextWindow)
+		}
+		assertEqualJSON(t, after.SupportedReasoningLevels, before.SupportedReasoningLevels)
+	}
+	for _, modelID := range []string{"bridge-sonnet-5.5", "claude-sonnet-5.5"} {
+		before, beforeExists := baseline[modelID]
+		after, afterExists := configured[modelID]
+		if !beforeExists || !afterExists {
+			t.Fatalf("native Codex catalog must retain unconfigured model %q", modelID)
+		}
+		if before.ContextWindow != after.ContextWindow || before.MaxContextWindow != after.MaxContextWindow {
+			t.Errorf("unconfigured %s context windows changed from %d/%d to %d/%d", modelID, before.ContextWindow, before.MaxContextWindow, after.ContextWindow, after.MaxContextWindow)
+		}
+		assertEqualJSON(t, after.SupportedReasoningLevels, before.SupportedReasoningLevels)
+	}
+}
+
+func requestNativeCodexModels(t *testing.T, base string) map[string]nativeCodexModel {
+	t.Helper()
+	request, err := http.NewRequest(http.MethodGet, base+"/v1/models?client_version=cpa", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer fixture-client-key")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("list native Codex models: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("list native Codex models: status=%d body=%s", response.StatusCode, body)
+	}
+	var catalog struct {
+		Models []nativeCodexModel `json:"models"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&catalog); err != nil {
+		t.Fatalf("decode native Codex model catalog: %v", err)
+	}
+	models := make(map[string]nativeCodexModel, len(catalog.Models))
+	for _, model := range catalog.Models {
+		models[model.Slug] = model
+	}
+	return models
 }
 
 func (f *fixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -372,9 +547,30 @@ func (f *fixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			map[string]any{"id": "bridge-responses", "supported_endpoints": []string{"/responses"}, "capabilities": map[string]any{"type": "chat", "supports": map[string]bool{"streaming": true, "tool_calls": true}}},
 			map[string]any{"id": "bridge-messages", "supported_endpoints": []string{"/v1/messages", "/chat/completions"}, "capabilities": map[string]any{"type": "chat"}},
 			map[string]any{"id": "bridge-chat", "supported_endpoints": []string{"/chat/completions"}, "capabilities": map[string]any{"type": "chat"}},
+			map[string]any{"id": "grok-4.5", "vendor": "xAI", "supported_endpoints": []string{"/responses"}, "capabilities": map[string]any{"type": "chat", "family": "grok"}},
+			map[string]any{"id": "grok-4.6", "vendor": "xAI", "supported_endpoints": []string{"/responses"}, "capabilities": map[string]any{"type": "chat", "family": "grok"}},
+			map[string]any{"id": "grok-4.7", "vendor": "xAI", "supported_endpoints": []string{"/responses"}, "capabilities": map[string]any{"type": "chat", "family": "grok"}},
+			map[string]any{"id": "gpt-5.5", "vendor": "OpenAI", "supported_endpoints": []string{"/responses"}, "capabilities": map[string]any{"type": "chat", "family": "gpt"}},
+			map[string]any{"id": "gpt-5-copilot-only", "vendor": "OpenAI", "supported_endpoints": []string{"/responses"}, "capabilities": map[string]any{"type": "chat", "family": "gpt"}},
+			map[string]any{"id": "gpt-6-sol", "vendor": "OpenAI", "supported_endpoints": []string{"/responses"}, "capabilities": map[string]any{"type": "chat", "family": "gpt"}},
+			map[string]any{"id": "claude-fable-5", "vendor": "Anthropic", "supported_endpoints": []string{"/v1/messages"}, "capabilities": map[string]any{"type": "chat", "family": "claude"}},
+			map[string]any{"id": "claude-fable-5.1", "vendor": "Anthropic", "supported_endpoints": []string{"/v1/messages"}, "capabilities": map[string]any{"type": "chat", "family": "claude"}},
+			map[string]any{"id": "claude-sonnet-4.8-fast", "vendor": "Anthropic", "supported_endpoints": []string{"/v1/messages"}, "capabilities": map[string]any{"type": "chat", "family": "claude"}},
+			map[string]any{"id": "claude-sonnet-4-8-fast", "vendor": "Anthropic", "supported_endpoints": []string{"/v1/messages"}, "capabilities": map[string]any{"type": "chat", "family": "claude"}},
+			map[string]any{"id": "claude-sonnet-5", "vendor": "Anthropic", "supported_endpoints": []string{"/v1/messages"}, "capabilities": map[string]any{"type": "chat", "family": "claude"}},
+			map[string]any{"id": "claude-sonnet-5.5", "vendor": "Anthropic", "supported_endpoints": []string{"/v1/messages"}, "capabilities": map[string]any{"type": "chat", "family": "claude", "supports": map[string]any{"adaptive_thinking": true, "reasoning_effort": []string{"low", "high"}}, "limits": map[string]int{"max_context_window_tokens": 32768}}},
+			map[string]any{"id": "claude-opus-4.8-fast", "vendor": "Anthropic", "supported_endpoints": []string{"/v1/messages"}, "capabilities": map[string]any{"type": "chat", "family": "claude"}},
+			map[string]any{"id": "claude-opus-4-8-fast", "vendor": "Anthropic", "supported_endpoints": []string{"/v1/messages"}, "capabilities": map[string]any{"type": "chat", "family": "claude"}},
+			map[string]any{"id": "claude-opus-5", "vendor": "Anthropic", "supported_endpoints": []string{"/v1/messages"}, "capabilities": map[string]any{"type": "chat", "family": "claude"}},
+			map[string]any{"id": "claude-opus-5.5", "vendor": "Anthropic", "supported_endpoints": []string{"/v1/messages"}, "capabilities": map[string]any{"type": "chat", "family": "claude"}},
+			map[string]any{"id": "gemini-3.7-flash", "vendor": "Google", "supported_endpoints": []string{"/responses"}, "capabilities": map[string]any{"type": "chat", "family": "gemini"}},
+			map[string]any{"id": "gpt-6.1-sol", "vendor": "OpenAI", "supported_endpoints": []string{"/responses"}, "capabilities": map[string]any{"type": "chat", "family": "gpt", "supports": map[string]any{"adaptive_thinking": true, "reasoning_effort": []string{"low", "medium", "high", "xhigh"}}, "limits": map[string]int{"max_context_window_tokens": 128000}}},
+			map[string]any{"id": "gpt-6-luna", "vendor": "OpenAI", "supported_endpoints": []string{"/responses"}, "capabilities": map[string]any{"type": "chat", "family": "gpt", "supports": map[string]any{"adaptive_thinking": true, "reasoning_effort": []string{"low", "medium", "high"}}, "limits": map[string]int{"max_context_window_tokens": 96000}}},
+			map[string]any{"id": "gemini-3.8-flash", "vendor": "Google", "supported_endpoints": []string{"/chat/completions"}, "capabilities": map[string]any{"type": "chat", "family": "gemini"}},
 			map[string]any{"id": "bridge-gemini-3.8", "vendor": "Google", "supported_endpoints": []string{"/chat/completions"}, "capabilities": map[string]any{"type": "chat", "family": "gemini", "supports": map[string]bool{"streaming": true, "tool_calls": true}}},
 			map[string]any{"id": "bridge-gpt-6-luna", "vendor": "OpenAI", "supported_endpoints": []string{"/responses"}, "capabilities": map[string]any{"type": "chat", "family": "gpt", "supports": map[string]bool{"streaming": true, "tool_calls": true}}},
-			map[string]any{"id": "bridge-sonnet-5.5", "vendor": "Anthropic", "supported_endpoints": []string{"/chat/completions", "/v1/messages"}, "capabilities": map[string]any{"type": "chat", "family": "claude", "supports": map[string]any{"streaming": true, "tool_calls": true, "adaptive_thinking": true, "reasoning_effort": []string{"low", "medium", "high", "max"}}}},
+			map[string]any{"id": "bridge-chat-sonnet-5.5", "vendor": "Anthropic", "supported_endpoints": []string{"/v1/messages"}, "capabilities": map[string]any{"type": "chat", "family": "claude", "supports": map[string]any{"streaming": true, "tool_calls": true, "adaptive_thinking": true, "reasoning_effort": []string{"low", "medium", "high", "max"}}, "limits": map[string]int{"max_context_window_tokens": 81920}}},
+			map[string]any{"id": "bridge-sonnet-5.5", "vendor": "Anthropic", "supported_endpoints": []string{"/chat/completions", "/v1/messages"}, "capabilities": map[string]any{"type": "chat", "family": "claude", "supports": map[string]any{"streaming": true, "tool_calls": true, "adaptive_thinking": true, "reasoning_effort": []string{"low", "medium", "high", "max"}}, "limits": map[string]int{"max_context_window_tokens": 81920}}},
 		}})
 	case "/responses", "/v1/messages", "/chat/completions":
 		if r.Header.Get("Authorization") != "Bearer fixture-copilot-token" {
@@ -433,11 +629,15 @@ func (f *fixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func isMatrixModel(model string) bool {
-	return model == matrixChatModel || model == matrixResponsesModel || model == matrixMessagesModel
+	return model == matrixChatModel || model == matrixResponsesModel || model == matrixMessagesModel || model == matrixChatMessagesModel
 }
 
 func writeMatrixResponse(w http.ResponseWriter, path string, request map[string]any) {
 	model := stringValue(request["model"])
+	turn := 1
+	if model == matrixChatMessagesModel {
+		turn = matrixPriorToolCallCount(path, request)
+	}
 	if request["stream"] != true {
 		w.Header().Set("Content-Type", "application/json")
 		var response any
@@ -447,7 +647,7 @@ func writeMatrixResponse(w http.ResponseWriter, path string, request map[string]
 		case "/responses":
 			response = matrixResponsesResponse(model)
 		case "/v1/messages":
-			response = matrixMessagesResponse(model)
+			response = matrixMessagesResponse(model, turn)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 			return
@@ -463,10 +663,68 @@ func writeMatrixResponse(w http.ResponseWriter, path string, request map[string]
 	case "/responses":
 		writeMatrixResponsesStream(w, model)
 	case "/v1/messages":
-		writeMatrixMessagesStream(w, model)
+		writeMatrixMessagesStream(w, model, turn)
 	default:
 		w.WriteHeader(http.StatusNotFound)
 	}
+}
+
+func matrixPriorToolCallCount(path string, request map[string]any) int {
+	count := 0
+	switch path {
+	case "/chat/completions":
+		for _, message := range jsonObjects(request["messages"]) {
+			count += len(jsonObjects(message["tool_calls"]))
+		}
+	case "/responses":
+		for _, item := range jsonObjects(request["input"]) {
+			if item["type"] == "function_call" || item["type"] == "custom_tool_call" {
+				count++
+			}
+		}
+	case "/v1/messages":
+		for _, message := range jsonObjects(request["messages"]) {
+			for _, block := range jsonObjects(message["content"]) {
+				if block["type"] == "tool_use" {
+					count++
+				}
+			}
+		}
+	}
+	return count
+}
+
+func matrixSignatureForTurn(turn int) string {
+	if turn <= 1 {
+		return matrixSignature
+	}
+	return fmt.Sprintf("provider-signature-turn-%d/+ exact\n\t ", turn)
+}
+
+func matrixRedactedForTurn(turn int) string {
+	if turn <= 1 {
+		return matrixRedacted
+	}
+	return fmt.Sprintf("provider-redacted-turn-%d/+ exact\n\t ", turn)
+}
+
+func matrixReasoningForTurn(turn int) string {
+	if turn <= 1 {
+		return matrixReasoning
+	}
+	return fmt.Sprintf("provider reasoning turn %d exact", turn)
+}
+
+func matrixMessagesToolIDForTurn(turn int) string {
+	if turn <= 1 {
+		return matrixMessagesToolID
+	}
+	prefix := fmt.Sprintf("toolu_provider_turn_%d_", turn)
+	return prefix + strings.Repeat("p", 64-len(prefix))
+}
+
+func matrixMessagesItemIDForTurn(turn int) string {
+	return "fc_" + matrixMessagesToolIDForTurn(turn)
 }
 
 func matrixChatResponse(model string) map[string]any {
@@ -482,12 +740,12 @@ func matrixResponsesResponse(model string) map[string]any {
 	}, "usage": map[string]any{"input_tokens": 4, "output_tokens": 3, "total_tokens": 7}}
 }
 
-func matrixMessagesResponse(model string) map[string]any {
+func matrixMessagesResponse(model string, turn int) map[string]any {
 	return map[string]any{"id": "msg_matrix", "type": "message", "role": "assistant", "model": model, "content": []any{
 		map[string]any{"type": "text", "text": matrixOutputText},
-		map[string]any{"type": "thinking", "thinking": matrixReasoning, "signature": matrixSignature},
-		map[string]any{"type": "redacted_thinking", "data": matrixRedacted},
-		map[string]any{"type": "tool_use", "id": matrixMessagesToolID, "name": matrixToolName, "input": map[string]any{"query": "provider-value"}},
+		map[string]any{"type": "thinking", "thinking": matrixReasoningForTurn(turn), "signature": matrixSignatureForTurn(turn)},
+		map[string]any{"type": "redacted_thinking", "data": matrixRedactedForTurn(turn)},
+		map[string]any{"type": "tool_use", "id": matrixMessagesToolIDForTurn(turn), "name": matrixToolName, "input": map[string]any{"query": "provider-value"}},
 	}, "stop_reason": "tool_use", "stop_sequence": nil, "usage": map[string]int{"input_tokens": 4, "output_tokens": 3}}
 }
 
@@ -511,18 +769,18 @@ func writeMatrixResponsesStream(w http.ResponseWriter, model string) {
 	writeEvent(w, map[string]any{"type": "response.completed", "response": response})
 }
 
-func writeMatrixMessagesStream(w http.ResponseWriter, model string) {
+func writeMatrixMessagesStream(w http.ResponseWriter, model string, turn int) {
 	writeSSEEvent(w, "message_start", map[string]any{"type": "message_start", "message": map[string]any{"id": "msg_matrix", "type": "message", "role": "assistant", "model": model, "content": []any{}, "stop_reason": nil, "usage": map[string]int{"input_tokens": 4, "output_tokens": 0}}})
 	writeSSEEvent(w, "content_block_start", map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}})
 	writeSSEEvent(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": matrixOutputText}})
 	writeSSEEvent(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
 	writeSSEEvent(w, "content_block_start", map[string]any{"type": "content_block_start", "index": 1, "content_block": map[string]any{"type": "thinking", "thinking": ""}})
-	writeSSEEvent(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 1, "delta": map[string]any{"type": "thinking_delta", "thinking": matrixReasoning}})
-	writeSSEEvent(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 1, "delta": map[string]any{"type": "signature_delta", "signature": matrixSignature}})
+	writeSSEEvent(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 1, "delta": map[string]any{"type": "thinking_delta", "thinking": matrixReasoningForTurn(turn)}})
+	writeSSEEvent(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 1, "delta": map[string]any{"type": "signature_delta", "signature": matrixSignatureForTurn(turn)}})
 	writeSSEEvent(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 1})
-	writeSSEEvent(w, "content_block_start", map[string]any{"type": "content_block_start", "index": 2, "content_block": map[string]any{"type": "redacted_thinking", "data": matrixRedacted}})
+	writeSSEEvent(w, "content_block_start", map[string]any{"type": "content_block_start", "index": 2, "content_block": map[string]any{"type": "redacted_thinking", "data": matrixRedactedForTurn(turn)}})
 	writeSSEEvent(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 2})
-	writeSSEEvent(w, "content_block_start", map[string]any{"type": "content_block_start", "index": 3, "content_block": map[string]any{"type": "tool_use", "id": matrixMessagesToolID, "name": matrixToolName, "input": map[string]any{}}})
+	writeSSEEvent(w, "content_block_start", map[string]any{"type": "content_block_start", "index": 3, "content_block": map[string]any{"type": "tool_use", "id": matrixMessagesToolIDForTurn(turn), "name": matrixToolName, "input": map[string]any{}}})
 	writeSSEEvent(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 3, "delta": map[string]any{"type": "input_json_delta", "partial_json": matrixToolArguments}})
 	writeSSEEvent(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 3})
 	writeSSEEvent(w, "message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "tool_use", "stop_sequence": nil}, "usage": map[string]int{"output_tokens": 3}})
@@ -555,7 +813,7 @@ func startProxy(t *testing.T, binary, upstream string) string {
 	return base
 }
 
-func startProxyInRoot(t *testing.T, binary, upstream, root string, authJSON []byte, managementSecret string) (string, func()) {
+func startProxyInRoot(t *testing.T, binary, upstream, root string, authJSON []byte, managementSecret string, oauthConfigYAML ...string) (string, func()) {
 	t.Helper()
 	if err := os.MkdirAll(root, 0700); err != nil {
 		t.Fatal(err)
@@ -599,7 +857,11 @@ func startProxyInRoot(t *testing.T, binary, upstream, root string, authJSON []by
 	} else if err != nil {
 		t.Fatal(err)
 	}
-	config := fmt.Sprintf("config-version: 8\nserver:\n  host: 127.0.0.1\n  port: %d\nmanagement:\n  disable-control-panel: true\n  secret-key: %q\naccess:\n  api-keys: [fixture-client-key]\noauth:\n  auth-dir: %q\nplugins:\n  enabled: true\n  dir: %q\n  configs:\n    cliproxyapi-copilot:\n      enabled: true\n      allow_insecure_base_urls: true\n      compaction_models: [bridge-responses]\n      reasoning_replay: true\n      github_base_url: %q\n      github_api_url: %q\n      copilot_api_url: %q\n", port, managementSecret, authDir, filepath.Join(root, "plugins"), upstream, upstream, upstream)
+	var oauthConfig strings.Builder
+	for _, fragment := range oauthConfigYAML {
+		oauthConfig.WriteString(fragment)
+	}
+	config := fmt.Sprintf("config-version: 8\nserver:\n  host: 127.0.0.1\n  port: %d\nmanagement:\n  disable-control-panel: true\n  secret-key: %q\naccess:\n  api-keys: [fixture-client-key]\noauth:\n  auth-dir: %q\n%splugins:\n  enabled: true\n  dir: %q\n  configs:\n    cliproxyapi-copilot:\n      enabled: true\n      allow_insecure_base_urls: true\n      compaction_models: [bridge-responses]\n      reasoning_replay: true\n      github_base_url: %q\n      github_api_url: %q\n      copilot_api_url: %q\n", port, managementSecret, authDir, oauthConfig.String(), filepath.Join(root, "plugins"), upstream, upstream, upstream)
 	configPath := filepath.Join(root, "config.yaml")
 	if err := os.WriteFile(configPath, []byte(config), 0600); err != nil {
 		t.Fatal(err)
@@ -758,6 +1020,15 @@ func lastUpstreamRequest(t *testing.T, state *fixture) (map[string]any, string) 
 	return state.requests[last], state.paths[last]
 }
 
+func matrixCompactionHistory() []any {
+	return []any{
+		map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "Remember the active goal: finish the native host bridge."}}},
+		map[string]any{"type": "reasoning", "id": matrixCompactReasoningID, "summary": []any{}, "encrypted_content": matrixCompactOpaque},
+		map[string]any{"type": "function_call", "id": matrixCompactFunctionID, "call_id": matrixCompactCallID, "name": "inspect", "arguments": `{"query":"original"}`},
+		map[string]any{"type": "function_call_output", "call_id": matrixCompactCallID, "output": "original result"},
+	}
+}
+
 func assertCompactionRequest(t *testing.T, request map[string]any, path string) {
 	t.Helper()
 	if path != "/responses" {
@@ -765,6 +1036,9 @@ func assertCompactionRequest(t *testing.T, request map[string]any, path string) 
 	}
 	if request["tool_choice"] != "none" {
 		t.Fatalf("compaction request tool_choice = %v, want none", request["tool_choice"])
+	}
+	if request["prompt_cache_key"] != matrixCompactCacheKey {
+		t.Fatalf("compaction request changed the explicit prompt cache key: %+v", request)
 	}
 	if _, exists := request["tools"]; exists {
 		t.Fatalf("compaction request retained tools: %+v", request)
@@ -776,19 +1050,51 @@ func assertCompactionRequest(t *testing.T, request map[string]any, path string) 
 	if bytes.Contains(input, []byte("compaction_trigger")) {
 		t.Fatalf("raw compaction trigger reached Copilot: %s", input)
 	}
+	items := jsonObjects(request["input"])
+	var reasoningFound, functionFound, outputFound bool
+	for _, item := range items {
+		switch item["type"] {
+		case "reasoning":
+			reasoningFound = item["id"] == matrixCompactReasoningID && item["encrypted_content"] == matrixCompactOpaque
+		case "function_call":
+			functionFound = item["id"] == matrixCompactFunctionID && item["call_id"] == matrixCompactCallID && item["name"] == "inspect" && item["arguments"] == `{"query":"original"}`
+		case "function_call_output":
+			outputFound = item["call_id"] == matrixCompactCallID && item["output"] == "original result"
+		}
+	}
+	if !reasoningFound || !functionFound || !outputFound {
+		t.Fatalf("compaction request changed encrypted thinking or original tool history: %+v", request["input"])
+	}
 	if !bytes.Contains(input, []byte("transcript data")) {
 		t.Fatalf("summary instruction missing from Copilot request: %s", input)
 	}
 }
 
 func matrixClientPath(format string) string {
-	if format == "claude" {
+	switch format {
+	case "claude":
 		return "/v1/messages"
+	case "openai":
+		return "/v1/chat/completions"
+	default:
+		return "/v1/responses"
 	}
-	return "/v1/responses"
 }
 
 func matrixInitialRequest(route matrixRoute, stream bool) map[string]any {
+	if route.clientFormat == "openai" {
+		messages := []any{
+			map[string]any{"role": "user", "content": matrixInputMarker},
+			map[string]any{"role": "assistant", "content": "prior tool call", "tool_calls": []any{map[string]any{"id": "chat-input-call", "type": "function", "function": map[string]any{"name": matrixToolName, "arguments": `{"query":"initial-value"}`}}}},
+			map[string]any{"role": "tool", "tool_call_id": "chat-input-call", "content": matrixToolResult},
+			map[string]any{"role": "user", "content": "Continue the protocol matrix."},
+		}
+		request := map[string]any{"model": route.model, "stream": stream, "messages": messages, "tools": []any{map[string]any{"type": "function", "function": map[string]any{"name": matrixToolName, "description": "Inspect a matrix value.", "parameters": map[string]any{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}}}}}}}
+		if route.upstreamPath == "/v1/messages" {
+			request["reasoning_effort"] = matrixChatInitialThinkingEffort
+		}
+		return request
+	}
 	if route.clientFormat == "claude" {
 		assistant := []any{}
 		if route.upstreamPath != "/chat/completions" {
@@ -841,7 +1147,7 @@ func assertMatrixInitialRequest(t *testing.T, route matrixRoute, request map[str
 		t.Fatalf("initial text or tool result was dropped on %s: %+v", route.name, request)
 	}
 	if route.upstreamPath == "/chat/completions" {
-		if containsJSONScalar(request, matrixInitialSignature) || containsJSONScalar(request, matrixInitialRedacted) {
+		if route.clientFormat != "openai" && (containsJSONScalar(request, matrixInitialSignature) || containsJSONScalar(request, matrixInitialRedacted)) {
 			t.Fatalf("Chat request lost tool identity or accepted unsupported opaque history: %+v", request)
 		}
 		messages := jsonObjects(request["messages"])
@@ -852,6 +1158,15 @@ func assertMatrixInitialRequest(t *testing.T, route matrixRoute, request map[str
 					candidate := stringValue(call["id"])
 					itemID, decodedCallID, ok := translate.DecodeClaudeToolIDs(candidate)
 					if ok && itemID == matrixInitialItemID && decodedCallID == matrixInitialCallID {
+						callID = candidate
+					}
+				}
+			}
+		} else if route.clientFormat == "openai" {
+			for _, message := range messages {
+				for _, call := range jsonObjects(message["tool_calls"]) {
+					candidate := stringValue(call["id"])
+					if candidate == "chat-input-call" {
 						callID = candidate
 					}
 				}
@@ -899,7 +1214,7 @@ func assertMatrixInitialRequest(t *testing.T, route matrixRoute, request map[str
 				redactedFound = redactedFound || encrypted == "claude-redacted-thinking:"+matrixInitialRedacted
 			case "function_call":
 				toolCallID = stringValue(item["call_id"])
-				callFound = callFound || toolCallID == "toolu_initial_1" || toolCallID == matrixInitialCallID
+				callFound = callFound || toolCallID == "toolu_initial_1" || toolCallID == matrixInitialCallID || route.clientFormat == "openai" && toolCallID == "chat-input-call"
 				itemIDFound = itemIDFound || item["id"] == matrixInitialItemID
 			case "function_call_output":
 				outputFound = outputFound || item["call_id"] == toolCallID && toolCallID != ""
@@ -909,6 +1224,10 @@ func assertMatrixInitialRequest(t *testing.T, route matrixRoute, request map[str
 			if !itemIDFound || !containsJSONScalar(request["input"], matrixInitialCallID) {
 				t.Fatalf("native Responses request changed separate function item/call IDs: %+v", request["input"])
 			}
+		}
+		if route.clientFormat == "openai" {
+			signatureFound = true
+			redactedFound = true
 		}
 		if !signatureFound || !redactedFound || !callFound || !outputFound {
 			t.Fatalf("Responses request dropped signed/redacted history or tool correlation: %+v", request["input"])
@@ -936,10 +1255,21 @@ func assertMatrixInitialRequest(t *testing.T, route matrixRoute, request map[str
 			}
 		}
 	}
+	if route.clientFormat == "openai" {
+		signatureFound = true
+		redactedFound = true
+	}
 	if !signatureFound || !redactedFound || !callFound || !outputFound {
 		t.Fatalf("Messages request dropped signed/redacted history or tool correlation: %+v", request["messages"])
 	}
-	assertAdaptiveThinkingRequest(t, request)
+	if route.clientFormat == "openai" && toolID != "chat-input-call" {
+		t.Fatalf("Chat tool-call ID changed in native Messages history: got %q", toolID)
+	}
+	effort := "high"
+	if route.clientFormat == "openai" {
+		effort = matrixChatInitialThinkingEffort
+	}
+	assertAdaptiveThinkingRequest(t, request, effort)
 	if route.clientFormat == "openai-response" {
 		itemID, callID, ok := translate.DecodeClaudeToolIDs(toolID)
 		if !ok || itemID != matrixInitialItemID || callID != matrixInitialCallID {
@@ -980,8 +1310,12 @@ func jsonObjects(value any) []map[string]any {
 }
 
 func assertMatrixClientOutput(t *testing.T, route matrixRoute, body []byte, stream bool) matrixOutput {
+	return assertMatrixClientOutputTurn(t, route, body, stream, 1)
+}
+
+func assertMatrixClientOutputTurn(t *testing.T, route matrixRoute, body []byte, stream bool, turn int) matrixOutput {
 	t.Helper()
-	output := matrixOutput{}
+	output := matrixOutput{Turn: turn}
 	if route.clientFormat == "claude" {
 		var blocks []map[string]any
 		if stream {
@@ -1017,6 +1351,91 @@ func assertMatrixClientOutput(t *testing.T, route matrixRoute, body []byte, stre
 				}
 			}
 		}
+	} else if route.clientFormat == "openai" {
+		var message map[string]any
+		if stream {
+			events, done := parseSSEDataEventsWithDone(t, body)
+			if !done {
+				t.Fatalf("Chat matrix stream has no [DONE] event: %s", body)
+			}
+			var content strings.Builder
+			var toolCall map[string]any
+			var finishReason string
+			for _, event := range events {
+				if model := stringValue(event["model"]); model != "" {
+					output.Model = model
+				}
+				for _, choice := range jsonObjects(event["choices"]) {
+					delta, _ := choice["delta"].(map[string]any)
+					content.WriteString(stringValue(delta["content"]))
+					finishReason = firstStringValue(choice, "finish_reason")
+					if delta["reasoning_opaque"] != nil {
+						message = map[string]any{"reasoning_opaque": delta["reasoning_opaque"]}
+					}
+					for _, candidate := range jsonObjects(delta["tool_calls"]) {
+						if toolCall == nil {
+							toolCall = map[string]any{"function": map[string]any{}}
+						}
+						for _, field := range []string{"id", "type", "index"} {
+							if candidate[field] != nil {
+								toolCall[field] = candidate[field]
+							}
+						}
+						function, _ := toolCall["function"].(map[string]any)
+						candidateFunction, _ := candidate["function"].(map[string]any)
+						for _, field := range []string{"name", "arguments"} {
+							if value := stringValue(candidateFunction[field]); value != "" {
+								function[field] = stringValue(function[field]) + value
+							}
+						}
+						toolCall["function"] = function
+					}
+				}
+			}
+			if finishReason != "tool_calls" {
+				t.Fatalf("Chat matrix stream finish_reason = %q, want tool_calls: %s", finishReason, body)
+			}
+			if message == nil {
+				message = map[string]any{}
+			}
+			message["content"] = content.String()
+			if toolCall != nil {
+				message["tool_calls"] = []any{toolCall}
+			}
+		} else {
+			var response map[string]any
+			if err := json.Unmarshal(body, &response); err != nil {
+				t.Fatalf("decode Chat matrix response: %v: %s", err, body)
+			}
+			output.Model = stringValue(response["model"])
+			choices := jsonObjects(response["choices"])
+			if len(choices) != 1 {
+				t.Fatalf("Chat matrix response has %d choices: %s", len(choices), body)
+			}
+			if choices[0]["finish_reason"] != "tool_calls" {
+				t.Fatalf("Chat matrix response finish_reason = %v, want tool_calls: %s", choices[0]["finish_reason"], body)
+			}
+			message, _ = choices[0]["message"].(map[string]any)
+		}
+		if message == nil {
+			t.Fatalf("Chat matrix response has no assistant message: %s", body)
+		}
+		output.Text = stringValue(message["content"])
+		output.ChatOpaque = message["reasoning_opaque"]
+		output.Signature = stringValue(output.ChatOpaque)
+		output.Redacted = stringValue(message["reasoning_content"])
+		if len(jsonObjects(message["tool_calls"])) != 1 {
+			t.Fatalf("Chat matrix response has no single tool call: %+v", message)
+		}
+		call := jsonObjects(message["tool_calls"])[0]
+		output.CallID = stringValue(call["id"])
+		output.ItemID = output.CallID
+		if itemID, _, ok := translate.DecodeClaudeToolIDs(output.CallID); ok {
+			output.ItemID = itemID
+		}
+		function, _ := call["function"].(map[string]any)
+		output.ToolName = stringValue(function["name"])
+		output.ToolArguments = stringValue(function["arguments"])
 	} else {
 		var response map[string]any
 		if stream {
@@ -1158,6 +1577,9 @@ func firstStringValue(value map[string]any, keys ...string) string {
 
 func assertMatrixOutputSemantics(t *testing.T, route matrixRoute, output matrixOutput) {
 	t.Helper()
+	if route.clientFormat == "openai" && output.Model != route.model {
+		t.Fatalf("Chat response model = %q on %s, want original upstream model %q", output.Model, route.name, route.model)
+	}
 	if output.Text == "" || !strings.Contains(output.Text, matrixOutputText) {
 		t.Fatalf("output text was dropped on %s: %+v", route.name, output)
 	}
@@ -1166,6 +1588,12 @@ func assertMatrixOutputSemantics(t *testing.T, route matrixRoute, output matrixO
 	}
 	switch route.upstreamPath {
 	case "/chat/completions":
+		if route.clientFormat == "openai" {
+			if output.ChatOpaque != matrixSignature || output.CallID != matrixChatCallID {
+				t.Fatalf("Chat opaque reasoning or call ID changed on %s: opaque=%v call=%q", route.name, output.ChatOpaque, output.CallID)
+			}
+			return
+		}
 		decoded := assertChatReasoningCarrier(t, output.Signature, route.model)
 		if decoded != matrixSignature || output.CallID != matrixChatCallID {
 			t.Fatalf("Chat opaque reasoning or call ID changed on %s: opaque=%q call=%q", route.name, decoded, output.CallID)
@@ -1174,10 +1602,31 @@ func assertMatrixOutputSemantics(t *testing.T, route matrixRoute, output matrixO
 			t.Fatalf("Chat route unexpectedly returned a redacted thinking block: %+v", output)
 		}
 	case "/responses":
+		if route.clientFormat == "openai" {
+			if !matrixOpaqueContains(output.ChatOpaque, matrixSignature) || !matrixOpaqueContains(output.ChatOpaque, matrixRedacted) || output.CallID == "" {
+				t.Fatalf("Chat output lost Responses opaque blocks or tool ID on %s: %+v", route.name, output)
+			}
+			itemID, callID, ok := translate.DecodeClaudeToolIDs(output.CallID)
+			if !ok || itemID != matrixResponseItemID || callID != matrixResponseCallID {
+				t.Fatalf("Chat output lost distinct Responses tool IDs on %s: carrier=%q decoded=(%q,%q,%v), want (%q,%q)", route.name, output.CallID, itemID, callID, ok, matrixResponseItemID, matrixResponseCallID)
+			}
+			return
+		}
 		if output.Signature != matrixSignature || output.Redacted != matrixRedacted || output.ItemID != matrixResponseItemID || output.CallID != matrixResponseCallID {
 			t.Fatalf("Responses output lost opaque history or separate tool IDs on %s: %+v", route.name, output)
 		}
 	case "/v1/messages":
+		if route.clientFormat == "openai" {
+			signature := matrixSignatureForTurn(output.Turn)
+			redacted := matrixRedactedForTurn(output.Turn)
+			if !matrixOpaqueContains(output.ChatOpaque, signature) || !matrixOpaqueContains(output.ChatOpaque, redacted) || output.CallID == "" {
+				t.Fatalf("Chat output lost Messages thinking blocks or tool ID on %s: %+v", route.name, output)
+			}
+			if callID := matrixMessagesToolIDFromOutput(t, output); callID != matrixMessagesToolIDForTurn(output.Turn) {
+				t.Fatalf("Chat output changed Messages tool ID on %s: got %q, want %q", route.name, callID, matrixMessagesToolIDForTurn(output.Turn))
+			}
+			return
+		}
 		if output.Signature != matrixSignature || output.Redacted != matrixRedacted || output.CallID != matrixMessagesToolID {
 			t.Fatalf("Messages output lost signed/redacted thinking or tool ID on %s: %+v", route.name, output)
 		}
@@ -1196,6 +1645,52 @@ func assertMatrixOutputSemantics(t *testing.T, route matrixRoute, output matrixO
 			}
 		}
 	}
+}
+
+func matrixOpaqueContains(value any, expected string) bool {
+	switch current := value.(type) {
+	case string:
+		raw := current
+		if raw == expected || strings.Contains(raw, expected) {
+			return true
+		}
+		if strings.HasPrefix(raw, "cpa-copilot-reasoning-auth:v2:") {
+			payload, _, ok := strings.Cut(strings.TrimPrefix(raw, "cpa-copilot-reasoning-auth:v2:"), ".")
+			decoded, err := base64.RawURLEncoding.DecodeString(payload)
+			return ok && err == nil && matrixOpaqueContains(string(decoded), expected)
+		}
+		if strings.HasPrefix(raw, "cpa-copilot-reasoning:v1:") {
+			envelope, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(raw, "cpa-copilot-reasoning:v1:"))
+			var carrier struct {
+				RawJSONB64 string `json:"raw_json_b64"`
+			}
+			if err == nil && json.Unmarshal(envelope, &carrier) == nil {
+				decoded, err := base64.RawURLEncoding.DecodeString(carrier.RawJSONB64)
+				return err == nil && matrixOpaqueContains(string(decoded), expected)
+			}
+		}
+		var decoded any
+		if json.Unmarshal([]byte(raw), &decoded) != nil {
+			return false
+		}
+		if decodedString, ok := decoded.(string); ok && decodedString == raw {
+			return false
+		}
+		return matrixOpaqueContains(decoded, expected)
+	case []any:
+		for _, nested := range current {
+			if matrixOpaqueContains(nested, expected) {
+				return true
+			}
+		}
+	case map[string]any:
+		for _, nested := range current {
+			if matrixOpaqueContains(nested, expected) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func assertChatReasoningCarrier(t *testing.T, carrier, model string) string {
@@ -1262,6 +1757,24 @@ func assertChatReasoningCarrier(t *testing.T, carrier, model string) string {
 }
 
 func matrixFollowupRequest(route matrixRoute, output matrixOutput) map[string]any {
+	if route.clientFormat == "openai" {
+		initial := matrixInitialRequest(route, false)
+		messages, _ := initial["messages"].([]any)
+		arguments := output.ToolArguments
+		if arguments == "" {
+			arguments = matrixToolArguments
+		}
+		messages = append(messages,
+			map[string]any{"role": "assistant", "content": output.Text, "reasoning_opaque": output.ChatOpaque, "tool_calls": []any{map[string]any{"id": output.CallID, "type": "function", "function": map[string]any{"name": output.ToolName, "arguments": arguments}}}},
+			map[string]any{"role": "tool", "tool_call_id": output.CallID, "content": matrixToolResult},
+			map[string]any{"role": "user", "content": matrixContinuation},
+		)
+		request := map[string]any{"model": route.model, "stream": false, "messages": messages}
+		if route.upstreamPath == "/v1/messages" {
+			request["reasoning_effort"] = matrixChatFollowupThinkingEffort
+		}
+		return request
+	}
 	if route.clientFormat == "claude" {
 		initial := matrixInitialRequest(route, false)
 		messages, _ := initial["messages"].([]any)
@@ -1310,10 +1823,34 @@ func matrixFollowupRequest(route matrixRoute, output matrixOutput) map[string]an
 	return request
 }
 
+func matrixThirdTurnRequest(t *testing.T, route matrixRoute, firstOutput, secondOutput matrixOutput) map[string]any {
+	t.Helper()
+	if route.clientFormat != "openai" || route.upstreamPath != "/v1/messages" {
+		t.Fatalf("third-turn fixture is only defined for Chat to Messages: %+v", route)
+	}
+	request := matrixFollowupRequest(route, firstOutput)
+	messages := request["messages"].([]any)
+	arguments := secondOutput.ToolArguments
+	if arguments == "" {
+		arguments = matrixToolArguments
+	}
+	messages = append(messages,
+		map[string]any{"role": "assistant", "content": secondOutput.Text, "reasoning_opaque": secondOutput.ChatOpaque, "tool_calls": []any{map[string]any{"id": secondOutput.CallID, "type": "function", "function": map[string]any{"name": secondOutput.ToolName, "arguments": arguments}}}},
+		map[string]any{"role": "tool", "tool_call_id": secondOutput.CallID, "content": matrixToolResult},
+		map[string]any{"role": "user", "content": matrixThirdContinuation},
+	)
+	request["messages"] = messages
+	return request
+}
+
 func assertMatrixFollowupRequest(t *testing.T, route matrixRoute, request map[string]any, output matrixOutput) {
 	t.Helper()
 	if !containsJSONScalar(request, matrixContinuation) || !containsJSONScalar(request, matrixToolResult) {
 		t.Fatalf("follow-up text or tool result was dropped on %s: %+v", route.name, request)
+	}
+	if route.clientFormat == "openai" {
+		assertChatClientFollowup(t, route, request, output)
+		return
 	}
 	switch route.upstreamPath {
 	case "/chat/completions":
@@ -1386,7 +1923,7 @@ func assertMatrixFollowupRequest(t *testing.T, route matrixRoute, request map[st
 		if !signatureFound || !redactedFound || !callFound || !outputFound {
 			t.Fatalf("Messages replay dropped signed/redacted reasoning or tool correlation: %+v", request["messages"])
 		}
-		assertAdaptiveThinkingRequest(t, request)
+		assertAdaptiveThinkingRequest(t, request, "high")
 		if route.clientFormat == "openai-response" {
 			itemID, callID, ok := translate.DecodeClaudeToolIDs(toolID)
 			if !ok || itemID != output.ItemID || callID != output.CallID {
@@ -1396,12 +1933,181 @@ func assertMatrixFollowupRequest(t *testing.T, route matrixRoute, request map[st
 	}
 }
 
-func assertAdaptiveThinkingRequest(t *testing.T, request map[string]any) {
+func assertChatClientFollowup(t *testing.T, route matrixRoute, request map[string]any, output matrixOutput) {
+	t.Helper()
+	switch route.upstreamPath {
+	case "/chat/completions":
+		messages := jsonObjects(request["messages"])
+		var opaqueFound, callFound, resultFound bool
+		for _, message := range messages {
+			opaqueFound = opaqueFound || message["role"] == "assistant" && message["reasoning_opaque"] == matrixSignature
+			for _, call := range jsonObjects(message["tool_calls"]) {
+				callFound = callFound || call["id"] == output.CallID && call["function"] != nil
+			}
+			resultFound = resultFound || message["role"] == "tool" && message["tool_call_id"] == output.CallID && containsJSONScalar(message["content"], matrixToolResult)
+		}
+		if !opaqueFound || !callFound || !resultFound {
+			t.Fatalf("Chat replay dropped prior opaque thinking or tool correlation: %+v", request["messages"])
+		}
+	case "/responses":
+		items := jsonObjects(request["input"])
+		var signatureFound, redactedFound, callFound, outputFound bool
+		itemID, callID, ok := translate.DecodeClaudeToolIDs(output.CallID)
+		if !ok || itemID != matrixResponseItemID || callID != matrixResponseCallID {
+			t.Fatalf("Chat replay did not receive the composite Responses call ID: %q decoded=(%q,%q,%v)", output.CallID, itemID, callID, ok)
+		}
+		for _, item := range items {
+			switch item["type"] {
+			case "reasoning":
+				signatureFound = signatureFound || matrixOpaqueContains(item["encrypted_content"], matrixSignature)
+				redactedFound = redactedFound || matrixOpaqueContains(item["encrypted_content"], matrixRedacted)
+			case "function_call":
+				callFound = callFound || item["call_id"] == callID && item["id"] == itemID
+			case "function_call_output":
+				outputFound = outputFound || item["call_id"] == callID && item["output"] == matrixToolResult
+			}
+		}
+		if !signatureFound || !redactedFound || !callFound || !outputFound {
+			t.Fatalf("Responses replay dropped Chat opaque thinking or tool correlation: %+v", request["input"])
+		}
+	case "/v1/messages":
+		messages := jsonObjects(request["messages"])
+		var signatureFound, redactedFound, callFound, outputFound bool
+		var toolID string
+		for _, message := range messages {
+			for _, block := range jsonObjects(message["content"]) {
+				switch block["type"] {
+				case "thinking":
+					signatureFound = signatureFound || block["signature"] == matrixSignature
+				case "redacted_thinking":
+					redactedFound = redactedFound || block["data"] == matrixRedacted
+				case "tool_use":
+					toolID = stringValue(block["id"])
+					callFound = callFound || toolID != ""
+				case "tool_result":
+					outputFound = outputFound || block["tool_use_id"] == toolID && containsJSONScalar(block["content"], matrixToolResult)
+				}
+			}
+		}
+		if !signatureFound || !redactedFound || !callFound || !outputFound {
+			t.Fatalf("Messages replay dropped Chat opaque thinking or tool correlation: %+v", request["messages"])
+		}
+		if expectedCallID := matrixMessagesToolIDFromOutput(t, output); toolID != expectedCallID {
+			t.Fatalf("Chat tool-call ID changed in Messages replay: got %q, want %q", toolID, expectedCallID)
+		}
+		assertAdaptiveThinkingRequest(t, request, matrixChatFollowupThinkingEffort)
+	}
+}
+
+func assertChatClientThirdTurnRequest(t *testing.T, request map[string]any, firstOutput, secondOutput matrixOutput) {
+	t.Helper()
+	if request["model"] != matrixChatMessagesModel || !containsJSONScalar(request, matrixThirdContinuation) {
+		t.Fatalf("third Chat continuation or model was lost: %+v", request)
+	}
+	wantSignatures := map[string]bool{matrixSignatureForTurn(1): false, matrixSignatureForTurn(2): false}
+	wantRedacted := map[string]bool{matrixRedactedForTurn(1): false, matrixRedactedForTurn(2): false}
+	wantThinking := map[string]bool{matrixReasoningForTurn(1): false, matrixReasoningForTurn(2): false}
+	wantCalls := map[string]bool{matrixMessagesToolIDFromOutput(t, firstOutput): false, matrixMessagesToolIDFromOutput(t, secondOutput): false}
+	toolResults := make(map[string]bool, len(wantCalls))
+	for _, message := range jsonObjects(request["messages"]) {
+		for _, block := range jsonObjects(message["content"]) {
+			switch block["type"] {
+			case "thinking":
+				if thinking := stringValue(block["thinking"]); thinking != "" {
+					if _, exists := wantThinking[thinking]; exists {
+						wantThinking[thinking] = true
+					}
+				}
+				if signature := stringValue(block["signature"]); signature != "" {
+					if _, exists := wantSignatures[signature]; exists {
+						wantSignatures[signature] = true
+					}
+				}
+			case "redacted_thinking":
+				if data := stringValue(block["data"]); data != "" {
+					if _, exists := wantRedacted[data]; exists {
+						wantRedacted[data] = true
+					}
+				}
+			case "tool_use":
+				if id := stringValue(block["id"]); id != "" {
+					if _, exists := wantCalls[id]; exists {
+						wantCalls[id] = true
+					}
+				}
+			case "tool_result":
+				id := stringValue(block["tool_use_id"])
+				if _, exists := wantCalls[id]; exists && containsJSONScalar(block["content"], matrixToolResult) {
+					toolResults[id] = true
+				}
+			}
+		}
+	}
+	for value, found := range wantSignatures {
+		if !found {
+			t.Errorf("third Chat call dropped prior thinking signature %q", value)
+		}
+	}
+	for value, found := range wantThinking {
+		if !found {
+			t.Errorf("third Chat call dropped prior thinking text %q", value)
+		}
+	}
+	for value, found := range wantRedacted {
+		if !found {
+			t.Errorf("third Chat call dropped prior redacted thinking block %q", value)
+		}
+	}
+	for id, found := range wantCalls {
+		if !found || !toolResults[id] {
+			t.Errorf("third Chat call dropped tool_use/tool_result ID pair %q: calls=%v results=%v", id, wantCalls, toolResults)
+		}
+	}
+	assertAdaptiveThinkingRequest(t, request, matrixChatFollowupThinkingEffort)
+}
+
+func matrixMessagesToolIDFromOutput(t *testing.T, output matrixOutput) string {
+	t.Helper()
+	itemID, callID, ok := translate.DecodeClaudeToolIDs(output.CallID)
+	wantCallID := matrixMessagesToolIDForTurn(output.Turn)
+	if ok {
+		if itemID != matrixMessagesItemIDForTurn(output.Turn) || callID != wantCallID {
+			t.Fatalf("Chat tool carrier changed Messages IDs: carrier=%q decoded=(%q,%q), want (%q,%q)", output.CallID, itemID, callID, matrixMessagesItemIDForTurn(output.Turn), wantCallID)
+		}
+		return callID
+	}
+	if output.CallID != wantCallID {
+		t.Fatalf("Chat tool ID changed on the wire: got %q, want %q", output.CallID, wantCallID)
+	}
+	return output.CallID
+}
+
+func assertChatClientToolResultEcho(t *testing.T, route matrixRoute, request map[string]any, output matrixOutput) {
+	t.Helper()
+	if route.clientFormat != "openai" {
+		return
+	}
+	messages := jsonObjects(request["messages"])
+	var callID, resultID string
+	for _, message := range messages {
+		for _, call := range jsonObjects(message["tool_calls"]) {
+			callID = stringValue(call["id"])
+		}
+		if message["role"] == "tool" {
+			resultID = stringValue(message["tool_call_id"])
+		}
+	}
+	if callID != output.CallID || resultID != output.CallID || callID != resultID {
+		t.Fatalf("Chat tool result did not echo the received call ID on %s: call=%q result=%q received=%q", route.name, callID, resultID, output.CallID)
+	}
+}
+
+func assertAdaptiveThinkingRequest(t *testing.T, request map[string]any, expectedEffort string) {
 	t.Helper()
 	thinking, _ := request["thinking"].(map[string]any)
 	outputConfig, _ := request["output_config"].(map[string]any)
-	if thinking["type"] != "adaptive" || outputConfig["effort"] != "high" {
-		t.Fatalf("Messages request did not preserve adaptive thinking at high effort: %+v", request)
+	if thinking["type"] != "adaptive" || outputConfig["effort"] != expectedEffort {
+		t.Fatalf("Messages request did not preserve adaptive thinking at %q effort: %+v", expectedEffort, request)
 	}
 	if _, exists := thinking["budget_tokens"]; exists {
 		t.Fatalf("Messages request used legacy budget_tokens with adaptive thinking: %+v", request)
@@ -1477,11 +2183,14 @@ func assertCompactionReplay(t *testing.T, base string, state *fixture, capsule, 
 	if includeTrigger {
 		replayInput = append(replayInput, map[string]any{"type": "compaction_trigger"})
 	}
-	request := map[string]any{"model": "bridge-responses", "input": replayInput}
+	request := map[string]any{"model": "bridge-responses", "input": replayInput, "prompt_cache_key": matrixCompactCacheKey}
 	callProxy(t, base+"/v1/responses", request)
 	captured, path := lastUpstreamRequest(t, state)
 	if path != "/responses" {
 		t.Fatalf("replay request used upstream path %q", path)
+	}
+	if captured["prompt_cache_key"] != matrixCompactCacheKey {
+		t.Fatalf("compaction replay changed the explicit prompt cache key: %+v", captured)
 	}
 	capturedInput, err := json.Marshal(captured["input"])
 	if err != nil {

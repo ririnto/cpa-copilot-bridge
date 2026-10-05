@@ -33,7 +33,7 @@ func TestDefaultConfigEnablesPromptCacheKey(t *testing.T) {
 }
 
 func TestParseConfigCanDisablePromptCacheKey(t *testing.T) {
-	config, err := ParseConfig([]byte("prompt_cache_key: false\n"))
+	config, err := ParseConfig([]byte("support-prompt-cache-key: false\n"))
 	if err != nil {
 		t.Fatalf("parse config: %v", err)
 	}

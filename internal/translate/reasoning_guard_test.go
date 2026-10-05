@@ -106,9 +106,4 @@ func TestOpaqueReasoningRejectsLossyStreamingRoutes(t *testing.T) {
 	if signed != "opaque-signature" || redacted != redactedThinkingPrefix+"opaque-data" {
 		t.Fatalf("Claude SSE reasoning data was not preserved: signed=%q redacted=%q frames=%q", signed, redacted, translated)
 	}
-	responsesFrame := []byte("event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"opaque-signature\"}}\n\n")
-	var responsesState any
-	if _, err := StreamFromEndpoint(context.Background(), EndpointResponses, "openai", "gpt-test", nil, nil, responsesFrame, &responsesState); err == nil {
-		t.Fatal("Responses signature stream was silently converted")
-	}
 }

@@ -34,14 +34,13 @@ The provider packages are intentionally separated:
 
 - `internal/provider`: OAuth, storage, Copilot token exchange/cache, models,
   endpoint selection, and execution
-- `internal/translate`: official translator SDK integration plus the missing
-  Claude Messages ↔ OpenAI Responses bridge
+- `internal/translate`: official translator SDK integration and missing protocol routes
 - `internal/transport`: host HTTP/stream callback abstraction
 - `internal/sse`: chunk-safe SSE framing
 - `internal/redact`: bounded, token-redacting error text
 
-Claude Messages and Codex Responses requests can use Copilot Chat Completions, Responses, or Messages endpoints.
-The plugin supports six routes between the two client formats and three Copilot endpoints.
+Chat Completions, Responses, and Messages requests can use Copilot Chat Completions, Responses, or Messages endpoints.
+The plugin supports nine routes between the three client formats and three Copilot endpoints.
 The plugin selects an endpoint from model metadata.
 Set `model_endpoint_overrides` when a model needs a fixed route.
 The plugin preserves provider-native reasoning state for same-format Messages and Responses requests.
@@ -53,15 +52,17 @@ Send full caller history to Copilot Chat or Messages because the plugin does not
 Send full caller history for cross-format requests because the bridge cannot reconstruct it from `previous_response_id` alone.
 Use `previous_response_id` only with a native Copilot Responses endpoint that supports it.
 The plugin derives `prompt_cache_key` for Copilot Responses requests when a stable session identity exists.
-Set `prompt_cache_key: false` in the plugin configuration to omit generated keys.
+Set `support-prompt-cache-key: false` in the plugin configuration to omit generated keys.
 The plugin preserves explicit caller keys.
 Copilot's implicit cache lifetime can differ from Codex's.
-Response compaction is optional and requires support from CLIProxyAPI and explicit configuration for the model.
+Responses compaction is optional and requires explicit configuration for the model.
+The official CLIProxyAPI v8.0.15 host supports both plugin compaction routes.
 Claude token-count requests are estimated locally with the same O200k tokenizer
 approach used by CLIProxyAPI for translated Claude requests.
-Copilot model prefixes can be excluded from discovery to avoid collisions with
-native providers; the included dual-subscription deployment excludes
-`claude-*` so native Claude OAuth always owns those model IDs.
+The deployment lists model exclusions under CLIProxyAPI's native `oauth.excluded-models.copilot` setting.
+CLIProxyAPI applies exact model IDs and `*` wildcard patterns to the Copilot catalog.
+The template sets `gpt-6.1-sol` and `gpt-6-luna` context limits to 272000 through `oauth.settings.copilot`.
+Native model aliases accept hyphenated Claude versions while preserving Copilot's original dotted model IDs upstream.
 
 ## Authentication and token handling
 
@@ -245,7 +246,7 @@ Responses request:
 curl http://127.0.0.1:8317/v1/responses \
   -H "Authorization: Bearer $API_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"model":"gpt-5.6-sol","input":"Reply with ok."}'
+  -d '{"model":"gpt-6-luna","input":"Reply with ok."}'
 ```
 
 Claude Messages request:
@@ -255,7 +256,7 @@ curl http://127.0.0.1:8317/v1/messages \
   -H "x-api-key: $API_KEY" \
   -H 'anthropic-version: 2023-06-01' \
   -H 'Content-Type: application/json' \
-  -d '{"model":"gpt-5.6-terra","max_tokens":32,"messages":[{"role":"user","content":"Reply with ok."}]}'
+  -d '{"model":"gpt-6-luna","max_tokens":32,"messages":[{"role":"user","content":"Reply with ok."}]}'
 ```
 
 The discovered catalog carries endpoint, context/output limits, tools, vision,
@@ -275,16 +276,16 @@ API_KEY=$(sed -n 's/^CLIPROXYAPI_API_KEY=//p' .runtime/secrets.env)
 
 ANTHROPIC_BASE_URL="http://127.0.0.1:8317" \
   ANTHROPIC_AUTH_TOKEN="$API_KEY" \
-  ANTHROPIC_MODEL="gpt-5.6-sol" \
-  ANTHROPIC_DEFAULT_FABLE_MODEL="claude-fable-5" \
-  ANTHROPIC_DEFAULT_OPUS_MODEL="gpt-5.6-sol" \
-  ANTHROPIC_DEFAULT_HAIKU_MODEL="gpt-5.6-terra" \
+  ANTHROPIC_MODEL="gpt-6-luna" \
+  ANTHROPIC_DEFAULT_FABLE_MODEL="claude-fable-5-1" \
+  ANTHROPIC_DEFAULT_OPUS_MODEL="gpt-6-luna" \
+  ANTHROPIC_DEFAULT_HAIKU_MODEL="gpt-6-luna" \
   CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 \
   claude --setting-sources ""
 ```
 
 Append normal Claude Code arguments to the last line, for example
-`--model opus`, `--model haiku`, or `--model claude-sonnet-5`.
+`--model opus`, `--model haiku`, or `--model claude-sonnet-5-5`.
 
 ## Threat model and trust boundary
 
@@ -305,7 +306,7 @@ Append normal Claude Code arguments to the last line, for example
 
 ## Current translation scope
 
-Tests cover all six client-to-endpoint combinations over JSON and SSE.
+Tests cover all nine client-to-endpoint combinations over JSON and SSE.
 The bridge maps supported text, tool calls/results, reasoning state, usage, stop reasons, and base64/URL images.
 It rejects unsupported content and foreign signed or encrypted reasoning sent through Copilot Chat with HTTP 422.
 Copilot can issue opaque tool item IDs longer than 64 characters.

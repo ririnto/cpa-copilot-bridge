@@ -196,17 +196,60 @@ curl -fsS \
   http://127.0.0.1:8317/v1/models
 ```
 
-The list should include models from both subscriptions, including:
+The catalog reflects the models available to the authenticated Copilot account.
+Check `/v1/models` after authentication for the current model IDs.
 
-- `gpt-5.6-sol`
-- `gpt-5.6-terra`
-- `claude-fable-5`
-- `claude-opus-5`
-- `claude-sonnet-5`
+The Copilot filter excludes selected older model IDs by family and exact name.
+Review [GitHub's supported Copilot models](https://github.com/github/docs/blob/main/content/copilot/reference/ai-models/supported-models.md) when updating these exclusions.
+These OAuth exclusions affect Copilot only.
+Matching IDs from other provider catalogs remain available.
+The exact Claude exclusions do not filter `claude-opus-5.5` or `claude-sonnet-5.5`.
 
-The included configuration excludes `claude-*` from the Copilot plugin's
-catalog. This prevents duplicate Claude model IDs from being scheduled through
-Copilot instead of CLIProxyAPI's native Claude subscription provider.
+The template adds input aliases for selected GPT, Claude, and Gemini model IDs.
+
+```yaml
+model-alias:
+  copilot:
+    - name: "gpt-6.1-sol"
+      alias: "gpt-6-1-sol"
+      fork: true
+    - name: "claude-opus-5.5"
+      alias: "claude-opus-5-5"
+      fork: true
+    - name: "claude-sonnet-5.5"
+      alias: "claude-sonnet-5-5"
+      fork: true
+    - name: "claude-fable-5.1"
+      alias: "claude-fable-5-1"
+      fork: true
+    - name: "gemini-3.8-flash"
+      alias: "gemini-flash-3.8"
+      fork: true
+    - name: "gemini-3.8-flash"
+      alias: "gemini-flash-3-8"
+      fork: true
+```
+
+When Copilot exposes an upstream model, the aliases keep its dotted ID and add these client names.
+CLIProxyAPI sends the original dotted model IDs to Copilot for aliased requests.
+The configuration does not force response model IDs to change.
+
+The template sets the advertised context length to 272000 tokens for both GPT models.
+The `gpt-6-1-sol` alias uses the `gpt-6.1-sol` context setting when Copilot exposes that model.
+
+```yaml
+settings:
+  copilot:
+    - name: "gpt-6.1-sol"
+      max-context-length: 272000
+    - name: "gpt-6-luna"
+      max-context-length: 272000
+```
+
+The native host setting changes advertised context metadata only.
+It does not enforce a billing or usage-cost cap.
+Thinking support and other capabilities remain based on Copilot model metadata.
+The setting is global and needs no plugin-specific option or auth-file field.
 
 Test Copilot through the Responses API:
 
@@ -214,7 +257,7 @@ Test Copilot through the Responses API:
 curl -fsS http://127.0.0.1:8317/v1/responses \
   -H "Authorization: Bearer $API_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"model":"gpt-5.6-sol","input":"Reply exactly: copilot-ok","max_output_tokens":16}'
+  -d '{"model":"gpt-6-luna","input":"Reply exactly: copilot-ok","max_output_tokens":16}'
 ```
 
 Test Claude through the Messages API:
@@ -224,10 +267,10 @@ curl -fsS http://127.0.0.1:8317/v1/messages \
   -H "x-api-key: $API_KEY" \
   -H 'anthropic-version: 2023-06-01' \
   -H 'Content-Type: application/json' \
-  -d '{"model":"claude-sonnet-5","max_tokens":16,"messages":[{"role":"user","content":"Reply exactly: claude-ok"}]}'
+  -d '{"model":"claude-sonnet-5-5","max_tokens":16,"messages":[{"role":"user","content":"Reply exactly: claude-ok"}]}'
 ```
 
-Claude Messages and Codex Responses requests can route to Copilot Chat Completions, Responses, or Messages endpoints.
+Chat Completions, Responses, and Messages requests can route to Copilot Chat Completions, Responses, or Messages endpoints.
 The plugin selects an endpoint from model metadata.
 Set `model_endpoint_overrides` when a model needs a fixed route.
 Send full caller history to Copilot Chat or Messages because the plugin does not store conversations.
@@ -237,10 +280,16 @@ It accepts the carrier only for the same account, model, and endpoint.
 The plugin rejects foreign signed or encrypted reasoning on Copilot Chat with HTTP 422.
 Send full caller history for cross-format requests because the bridge cannot reconstruct it from `previous_response_id` alone.
 The plugin derives `prompt_cache_key` for Copilot Responses requests when a stable session identity exists.
-Set `prompt_cache_key: false` in the plugin configuration to omit generated keys.
+Set `support-prompt-cache-key: false` in the plugin configuration to omit generated keys.
 The plugin preserves explicit caller keys.
 Copilot's implicit cache lifetime can differ from Codex's.
-Response compaction is optional and requires CLIProxyAPI host support plus the model's `compaction_models` setting.
+Enable response compaction only on a compatible CLIProxyAPI host.
+Add this under `plugins.configs.cliproxyapi-copilot` when `gpt-6-luna` appears in `/v1/models`.
+
+```yaml
+compaction_models:
+  - "gpt-6-luna"
+```
 
 ## 8. Configure Claude Code globally
 
@@ -262,15 +311,14 @@ Merge the following values into `~/.claude/settings.json`. Replace the
 {
   "env": {
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:8317",
-    "ANTHROPIC_MODEL": "gpt-5.6-sol",
-    "ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-fable-5",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL": "gpt-5.6-sol",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-opus-5",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gpt-5.6-terra",
+    "ANTHROPIC_MODEL": "gpt-6-luna",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-fable-5-1",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "gpt-6-luna",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-5-5",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gemini-flash-3-8",
     "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"
   },
-  "apiKeyHelper": "sed -n 's/^CLIPROXYAPI_API_KEY=//p' /home/YOUR_USER/cliproxyapi-copilot-plugin/.runtime/secrets.env",
-  "model": "fable"
+  "apiKeyHelper": "sed -n 's/^CLIPROXYAPI_API_KEY=//p' /home/YOUR_USER/cliproxyapi-copilot-plugin/.runtime/secrets.env"
 }
 ```
 
@@ -289,13 +337,17 @@ claude
 
 The configured aliases are:
 
-| Claude Code selection | Routed model | Subscription |
+| Claude Code selection | Routed model | Possible subscription |
 | --- | --- | --- |
-| Default | `claude-fable-5` (via the `fable` alias) | Claude |
-| Fable | `claude-fable-5` | Claude |
-| Opus | `gpt-5.6-sol` | GitHub Copilot |
-| Sonnet | `claude-opus-5` | Claude |
-| Haiku | `gpt-5.6-terra` | GitHub Copilot |
+| Default | `gpt-6-luna` | GitHub Copilot |
+| Fable | `claude-fable-5-1` | Claude or GitHub Copilot |
+| Opus | `gpt-6-luna` | GitHub Copilot |
+| Sonnet | `claude-sonnet-5-5` | Claude or GitHub Copilot |
+| Haiku | `gemini-flash-3-8` | GitHub Copilot |
+
+Claude and Copilot can expose the same Fable and Sonnet IDs.
+Plain aliases keep the requested names and can route through either provider's registered credentials.
+Use a dotted Copilot ID, a unique alias, or a provider prefix to pin a request to one backend.
 
 Select aliases with `/model` or at launch:
 

@@ -23,7 +23,7 @@ func normalizeClaudeSourceRequest(sourceFormat string, payload []byte) ([]byte, 
 }
 
 func normalizeClaudeMessagesRequest(model upstreamModel, sourceFormat string, original, translated []byte) ([]byte, error) {
-	if !isClaudeFamilyModel(model) || sourceFormat != "claude" && sourceFormat != "openai-response" {
+	if !isClaudeFamilyModel(model) || sourceFormat != "claude" && sourceFormat != "openai-response" && sourceFormat != "openai" {
 		return translated, nil
 	}
 	var err error
@@ -103,10 +103,13 @@ func normalizeClaudeMessagesRequest(model upstreamModel, sourceFormat string, or
 			}
 		}
 	}
-	if sourceFormat != "openai-response" || !model.Capabilities.Supports.AdaptiveThinking || root.Get("thinking.type").String() != "enabled" {
+	if sourceFormat != "openai-response" && sourceFormat != "openai" || !model.Capabilities.Supports.AdaptiveThinking || root.Get("thinking.type").String() != "enabled" {
 		return normalizeClaudeThinkingDisplay(translated)
 	}
 	requestedEffort := gjson.GetBytes(original, "reasoning.effort").String()
+	if sourceFormat == "openai" {
+		requestedEffort = gjson.GetBytes(original, "reasoning_effort").String()
+	}
 	rootEffortExists := gjson.GetBytes(translated, "output_config.effort").Exists()
 	effort, effortOK := adaptiveClaudeEffort(requestedEffort, model.Capabilities.Supports.ReasoningEffort)
 	if !rootEffortExists && !effortOK {

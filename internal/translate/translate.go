@@ -50,7 +50,11 @@ func RequestForEndpointFrom(source, model string, body []byte, stream bool, endp
 	}
 	var out []byte
 	var opaqueSource []byte
-	if from == sdktranslator.FormatClaude && to == sdktranslator.FormatOpenAI {
+	if from == sdktranslator.FormatOpenAI && to == sdktranslator.FormatOpenAIResponse {
+		out, err = chatRequestToResponses(model, body, stream)
+	} else if from == sdktranslator.FormatOpenAI && to == sdktranslator.FormatClaude {
+		out, err = chatRequestToClaude(model, body, stream)
+	} else if from == sdktranslator.FormatClaude && to == sdktranslator.FormatOpenAI {
 		var intermediate []byte
 		intermediate, err = claudeRequestToResponses(model, body, stream)
 		if err == nil {
@@ -193,6 +197,7 @@ func response(ctx context.Context, from, to sdktranslator.Format, model string, 
 		if err := validateResponsesOutputForChat(root); err != nil {
 			return nil, err
 		}
+		return responsesResponseToChat(ctx, model, original, translated, body)
 	}
 	if from == sdktranslator.FormatOpenAI && to == sdktranslator.FormatOpenAIResponse {
 		return chatResponseToResponses(ctx, model, original, translated, body)
@@ -206,6 +211,13 @@ func response(ctx context.Context, from, to sdktranslator.Format, model string, 
 	}
 	if from == sdktranslator.FormatClaude && to == sdktranslator.FormatOpenAIResponse {
 		return claudeMessageResponseToResponses(ctx, model, original, translated, body)
+	}
+	if from == sdktranslator.FormatClaude && to == sdktranslator.FormatOpenAI {
+		responses, err := claudeMessageResponseToResponses(ctx, model, original, translated, body)
+		if err != nil {
+			return nil, err
+		}
+		return responsesResponseToChat(ctx, model, original, translated, responses)
 	}
 	if err := rejectOpaqueReasoningResponse(from, to, body); err != nil {
 		return nil, err
@@ -250,6 +262,12 @@ func stream(ctx context.Context, from, to sdktranslator.Format, model string, or
 	}
 	if from == sdktranslator.FormatOpenAIResponse && to == sdktranslator.FormatClaude {
 		return responsesStreamToClaude(model, frame, state)
+	}
+	if from == sdktranslator.FormatOpenAIResponse && to == sdktranslator.FormatOpenAI {
+		return responsesStreamToChat(ctx, model, original, translated, frame, state)
+	}
+	if from == sdktranslator.FormatClaude && to == sdktranslator.FormatOpenAI {
+		return claudeStreamToChat(ctx, model, original, translated, frame, state)
 	}
 	if from == sdktranslator.FormatClaude && to == sdktranslator.FormatOpenAIResponse {
 		if err := validateClaudeStreamFrame(frame); err != nil {

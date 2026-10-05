@@ -89,8 +89,7 @@ func (s *Service) ModelsForAuth(ctx context.Context, callbackID string, req plug
 	if errModels != nil {
 		return pluginapi.ModelResponse{}, errModels
 	}
-	cfg := s.Config()
-	available := filterModels(availableModels(models), cfg.ExcludedModelPrefixes)
+	available := availableModels(models)
 	return pluginapi.ModelResponse{Provider: providerID, Models: modelInfos(available)}, nil
 }
 
@@ -192,8 +191,7 @@ func (s *Service) endpointForModel(ctx context.Context, callbackID, authID strin
 	if errModels != nil {
 		return "", upstreamModel{}, copilotTokenEntry{}, errModels
 	}
-	cfg := s.Config()
-	for _, model := range filterModels(availableModels(models), cfg.ExcludedModelPrefixes) {
+	for _, model := range availableModels(models) {
 		if strings.EqualFold(model.ID, modelID) {
 			endpoint, errEndpoint := selectEndpoint(model, sourceFormat)
 			return endpoint, model, token, errEndpoint
@@ -289,27 +287,6 @@ func normalizeModels(models []upstreamModel) []upstreamModel {
 	sort.SliceStable(out, func(i, j int) bool {
 		return strings.ToLower(out[i].ID) < strings.ToLower(out[j].ID)
 	})
-	return out
-}
-
-func filterModels(models []upstreamModel, excludedPrefixes []string) []upstreamModel {
-	if len(excludedPrefixes) == 0 {
-		return models
-	}
-	out := make([]upstreamModel, 0, len(models))
-	for _, model := range models {
-		modelID := strings.ToLower(model.ID)
-		excluded := false
-		for _, prefix := range excludedPrefixes {
-			if strings.HasPrefix(modelID, prefix) {
-				excluded = true
-				break
-			}
-		}
-		if !excluded {
-			out = append(out, model)
-		}
-	}
 	return out
 }
 

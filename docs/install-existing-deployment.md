@@ -1,9 +1,8 @@
 # Install into an existing CLIProxyAPI deployment
 
-This guide adds the GitHub Copilot plugin to an existing official CLIProxyAPI
-deployment without replacing its configuration, API keys, or existing
-providers. The plugin currently targets CLIProxyAPI `v8.0.15`, ABI version 1,
-on Linux `amd64`.
+This guide adds the GitHub Copilot plugin to an existing official CLIProxyAPI deployment.
+It keeps the existing configuration, API keys, and providers.
+The plugin targets CLIProxyAPI `v8.0.15`, ABI version 1, on Linux `amd64`.
 
 ## 1. Build the plugin
 
@@ -67,7 +66,8 @@ configuration and auth-volume mounts.
 
 ## 3. Merge the plugin configuration
 
-Add or merge this block in the existing `config.yaml`:
+This example uses the CLIProxyAPI v8 configuration layout.
+Add or merge this block under the top-level `plugins` key in the existing `config.yaml`:
 
 ```yaml
 plugins:
@@ -85,8 +85,7 @@ plugins:
       oauth_timeout_seconds: 900
       model_cache_ttl_seconds: 600
       token_expiry_buffer_seconds: 300
-      prompt_cache_key: true
-      excluded_model_prefixes: []
+      support-prompt-cache-key: true
 ```
 
 For the Docker mount above, use:
@@ -101,11 +100,79 @@ There must be only one top-level `plugins` key. Preserve other entries already
 present under `plugins.configs`. Global `plugins.enabled` and the individual
 `cliproxyapi-copilot.enabled` setting must both be `true`.
 
-The existing `auth-dir` must be writable and persistent. The plugin stores its
-GitHub OAuth credential through CLIProxyAPI's normal auth storage; it does not
-need a separate credential volume.
+The `oauth.auth-dir` directory must be writable and persistent.
+CLIProxyAPI stores the plugin's GitHub OAuth credential there.
 
-Claude Messages and Codex Responses requests can route to Copilot Chat Completions, Responses, or Messages endpoints.
+Review [GitHub's supported Copilot models](https://github.com/github/docs/blob/main/content/copilot/reference/ai-models/supported-models.md) when updating this filter.
+The v8 OAuth filter excludes selected older Copilot model IDs by family and exact name.
+It affects Copilot only.
+Matching IDs from other provider catalogs remain available.
+Copilot model registration shows only upstream models available to the authenticated account.
+
+```yaml
+excluded-models:
+  copilot:
+    - "gpt-5*"
+    - "gpt-6-sol"
+    - "claude-fable-5"
+    - "claude-sonnet-4*"
+    - "claude-sonnet-5"
+    - "claude-opus-4*"
+    - "claude-opus-5"
+    - "gemini-3.7-flash"
+    - "grok-4.5"
+    - "grok-4.6"
+```
+
+The exact Claude exclusions do not filter `claude-opus-5.5` or `claude-sonnet-5.5`.
+
+Add this native v8 `model-alias` block to the existing top-level `oauth` section.
+
+```yaml
+model-alias:
+  copilot:
+    - name: "gpt-6.1-sol"
+      alias: "gpt-6-1-sol"
+      fork: true
+    - name: "claude-opus-5.5"
+      alias: "claude-opus-5-5"
+      fork: true
+    - name: "claude-sonnet-5.5"
+      alias: "claude-sonnet-5-5"
+      fork: true
+    - name: "claude-fable-5.1"
+      alias: "claude-fable-5-1"
+      fork: true
+    - name: "gemini-3.8-flash"
+      alias: "gemini-flash-3.8"
+      fork: true
+    - name: "gemini-3.8-flash"
+      alias: "gemini-flash-3-8"
+      fork: true
+```
+
+When Copilot exposes an upstream model, the aliases keep its dotted ID and add these client names.
+CLIProxyAPI sends the original dotted model IDs to Copilot for aliased requests.
+The configuration does not force response model IDs to change.
+
+Add this native v8 `settings` block to the existing top-level `oauth` section.
+
+```yaml
+settings:
+  copilot:
+    - name: "gpt-6.1-sol"
+      max-context-length: 272000
+    - name: "gpt-6-luna"
+      max-context-length: 272000
+```
+
+The `gpt-6-1-sol` alias uses the `gpt-6.1-sol` context setting when Copilot exposes that model.
+This global setting changes only the advertised context metadata for Copilot OAuth accounts.
+It does not enforce a billing or usage-cost cap.
+Thinking support and other capabilities remain based on Copilot model metadata.
+The native host setting needs no plugin-specific option or auth-file field.
+
+Chat Completions, Responses, and Messages requests can route to Copilot Chat Completions, Responses, or Messages endpoints.
 The plugin selects an endpoint from model metadata.
 Set `model_endpoint_overrides` when a model needs a fixed route.
 Send full caller history to Copilot Chat or Messages because the plugin does not store conversations.
@@ -115,21 +182,25 @@ It accepts the carrier only for the same account, model, and endpoint.
 The plugin rejects foreign signed or encrypted reasoning on Copilot Chat with HTTP 422.
 Send full caller history for cross-format requests because the bridge cannot reconstruct it from `previous_response_id` alone.
 The plugin derives `prompt_cache_key` for Copilot Responses requests when a stable session identity exists.
-Set `prompt_cache_key: false` to omit generated keys.
+Set `support-prompt-cache-key: false` to omit generated keys.
 The plugin preserves explicit caller keys.
 Copilot's implicit cache lifetime can differ from Codex's.
-Response compaction is optional and requires CLIProxyAPI host support plus the model's `compaction_models` setting.
-
-If the deployment also uses CLIProxyAPI's native Claude subscription provider,
-prevent duplicate Claude model IDs from being scheduled through Copilot:
+Enable response compaction only on a compatible CLIProxyAPI host.
+Add this under `plugins.configs.cliproxyapi-copilot` when `gpt-6-luna` appears in `/v1/models`.
 
 ```yaml
-plugins:
-  configs:
-    cliproxyapi-copilot:
-      excluded_model_prefixes:
-        - "claude-"
+compaction_models:
+  - "gpt-6-luna"
 ```
+
+Codex also needs remote compaction enabled for its configured model provider.
+
+```toml
+[model_providers.cliproxyapi.capabilities]
+remote_compaction = "v2"
+```
+
+Replace `cliproxyapi` with the provider name in your Codex configuration.
 
 ## 4. Restart and authenticate
 
@@ -173,8 +244,8 @@ curl -fsS \
   http://127.0.0.1:8317/v1/models
 ```
 
-The result should include Copilot models such as `gpt-5.6-sol` and
-`gpt-5.6-terra`. Existing Claude and other provider models remain available.
+The result reflects the models available to the authenticated Copilot account.
+Existing Claude and other provider models remain available.
 
 ## Updating or removing the plugin
 

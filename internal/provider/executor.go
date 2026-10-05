@@ -425,6 +425,16 @@ func (s *Service) pumpStream(ctx context.Context, outputID, endpoint, destinatio
 				}
 				output = sealed
 			}
+			if destination == "openai" {
+				chunk, shouldEmit, errUnwrap := chatClientChunk(output)
+				if errUnwrap != nil {
+					return errUnwrap
+				}
+				if !shouldEmit {
+					continue
+				}
+				output = chunk
+			}
 			if errEmit := s.host.Emit(ctx, outputID, output); errEmit != nil {
 				return errEmit
 			}

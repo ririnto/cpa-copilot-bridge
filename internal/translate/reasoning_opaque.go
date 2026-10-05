@@ -54,6 +54,8 @@ type chatOpaqueStreamState struct {
 	Model        string
 	Chat         any
 	Claude       any
+	ID           string
+	Created      string
 	LastSequence int64
 	Raw          []byte
 	Content      strings.Builder
@@ -681,6 +683,12 @@ func (s *chatOpaqueStreamState) observe(frame, request []byte, model string) err
 	_, data, done, err := parseSSEFrame(frame)
 	if err != nil || done || len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
 		return err
+	}
+	if id := gjson.GetBytes(data, "id").String(); id != "" {
+		s.ID = id
+	}
+	if created := gjson.GetBytes(data, "created"); created.Exists() {
+		s.Created = created.Raw
 	}
 	choices := gjson.GetBytes(data, "choices")
 	if !choices.IsArray() {

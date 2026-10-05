@@ -43,6 +43,29 @@ func TestNormalizeClaudeMessagesAdaptiveResponsesThinking(t *testing.T) {
 	}
 }
 
+func TestNormalizeClaudeMessagesAdaptiveChatThinking(t *testing.T) {
+	t.Parallel()
+	model := adaptiveClaudeModel()
+	for _, effort := range []string{"low", "high"} {
+		effort := effort
+		t.Run(effort, func(t *testing.T) {
+			t.Parallel()
+			original := []byte(`{"reasoning_effort":"` + effort + `"}`)
+			translated := []byte(`{"thinking":{"type":"enabled","budget_tokens":1024},"max_tokens":4096,"messages":[]}`)
+			got, err := normalizeClaudeMessagesRequest(model, "openai", original, translated)
+			if err != nil {
+				t.Fatalf("normalize adaptive thinking: %v", err)
+			}
+			if gjson.GetBytes(got, "thinking.type").String() != "adaptive" || gjson.GetBytes(got, "thinking.budget_tokens").Exists() {
+				t.Fatalf("thinking config = %s, want adaptive without a budget", gjson.GetBytes(got, "thinking"))
+			}
+			if gotEffort := gjson.GetBytes(got, "output_config.effort").String(); gotEffort != effort {
+				t.Fatalf("output_config.effort = %q, want %q; request=%s", gotEffort, effort, got)
+			}
+		})
+	}
+}
+
 func TestAdaptiveClaudeEffortPrefersAdvertisedValue(t *testing.T) {
 	t.Parallel()
 	for _, test := range []struct {
