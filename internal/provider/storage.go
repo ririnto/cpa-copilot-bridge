@@ -12,17 +12,18 @@ import (
 )
 
 type authStorage struct {
-	Type                  string `json:"type"`
-	GitHubAccessToken     string `json:"github_access_token"`
-	GitHubRefreshToken    string `json:"github_refresh_token,omitempty"`
-	TokenType             string `json:"token_type,omitempty"`
-	Scope                 string `json:"scope,omitempty"`
-	ExpiresAt             int64  `json:"expires_at,omitempty"`
-	RefreshTokenExpiresAt int64  `json:"refresh_token_expires_at,omitempty"`
-	GitHubLogin           string `json:"github_login"`
-	GitHubUserID          int64  `json:"github_user_id,omitempty"`
-	OAuthClientID         string `json:"oauth_client_id,omitempty"`
-	UpdatedAt             string `json:"updated_at"`
+	Type                  string             `json:"type"`
+	GitHubAccessToken     string             `json:"github_access_token"`
+	GitHubRefreshToken    string             `json:"github_refresh_token,omitempty"`
+	TokenType             string             `json:"token_type,omitempty"`
+	Scope                 string             `json:"scope,omitempty"`
+	ExpiresAt             int64              `json:"expires_at,omitempty"`
+	RefreshTokenExpiresAt int64              `json:"refresh_token_expires_at,omitempty"`
+	GitHubLogin           string             `json:"github_login"`
+	GitHubUserID          int64              `json:"github_user_id,omitempty"`
+	OAuthClientID         string             `json:"oauth_client_id,omitempty"`
+	ContinuityKeyring     *continuityKeyring `json:"continuity_keyring,omitempty"`
+	UpdatedAt             string             `json:"updated_at"`
 }
 
 func parseStorage(raw []byte) (authStorage, error) {
