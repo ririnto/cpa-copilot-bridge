@@ -14,7 +14,7 @@ import (
 
 	"github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin/internal/redact"
 	"github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin/internal/transport"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 const deviceGrantType = "urn:ietf:params:oauth:grant-type:device_code"
