@@ -11,7 +11,7 @@ See [NOTICE.md](NOTICE.md) for attribution.
 - CLIProxyAPI v8 with its native plugin loader enabled.
 - A GitHub account with access to Copilot subscription models.
 
-The module uses CLIProxyAPI SDK v8.0.13.
+The plugin builds against SDK v8.0.15 and requires [CLIProxyAPI fork release `v8.0.15-cpa.1`](https://github.com/ririnto/CLIProxyAPI/tree/v8.0.15-cpa.1), based on upstream v8.0.15.
 Build the host and plugin for the same operating system and architecture.
 
 ## Build and Install
@@ -114,15 +114,27 @@ flowchart LR
 
 The bridge preserves native content blocks, block order, and opaque identifiers on same-format routes.
 Across formats, the bridge translates supported tool-call input and carries opaque reasoning through reversible carriers.
+Responses-to-Chat routes use a reversible carrier when item and call IDs differ or are unsafe.
+Matching tool-result IDs reuse the carrier across later turns.
+The Copilot Responses endpoint accepts native item and call IDs up to 64 characters.
+It rejects either native ID when it exceeds that boundary.
+Chat and Claude carriers can exceed 64 characters when they encode a valid pair of native IDs.
+This carrier length is distinct from the limit on each native Responses ID.
+Malformed or unknown reserved carrier versions fail closed.
 For Chat opaque state, the inner carrier preserves the exact opaque JSON value.
-The authenticated outer wrapper binds Chat replay to the selected auth entry, GitHub credential, API origin, model, and endpoint.
-It remains valid across restarts and short-lived Copilot token renewal while the GitHub access credential stays unchanged.
-A GitHub access-credential change, including OAuth rotation, invalidates old wrappers.
+The authenticated outer wrapper binds Chat replay to the selected auth entry, API origin, model, and endpoint.
+A random account-bound root in provider-owned auth data protects wrappers and compaction capsules.
+Verified same-account GitHub OAuth refresh, short-lived Copilot token renewal, and process restart preserve that root.
+New sign-in creates a new account-bound root.
+Direct credential replacement invalidates existing replay state with HTTP 409 and requires a new sign-in.
+Legacy wrappers and capsules migrate only after verifying the current GitHub token, account, and Copilot API origin.
 The bridge rejects caller-supplied v1 carrier data without its authenticated wrapper.
 Each cross-format route handles only its defined block types.
 The bridge rejects non-empty blocks without a target mapping instead of dropping them.
 Opaque replay requires the matching Copilot scope and a unique assistant or tool-call anchor.
 The bridge rejects opaque conversions that cannot retain verification data and tool identifiers it cannot represent safely.
+Foreign signed or encrypted reasoning sent to Chat returns HTTP 422 instead of placeholder text.
+Native Responses item or call IDs over 64 characters return HTTP 422 with a clear error before model dispatch.
 The bridge preflights request, response, and SSE shapes and returns errors when conversion would drop content.
 Native Responses routes preserve `previous_response_id` references.
 Chat Completions and Messages routes cannot resolve server-side Responses context.
@@ -157,10 +169,11 @@ Reasoning replay can restore missing reasoning next to matching tool calls in th
 The cache expires after fifteen minutes and has bounded entry and byte limits.
 Replay requires a stable session identity and an exact tool-call match.
 It does not guess a conversation from prompt text.
+This in-memory cache does not survive process restarts.
 
 ## Prompt Cache Keys
 
-CLIProxyAPI v8.0.13 can generate cache keys for its OpenAI-compatible providers with `support-prompt-cache-key: true`.
+Upstream CLIProxyAPI v8.0.15 supports `support-prompt-cache-key: true` for OpenAI-compatible providers.
 The bridge has a separate opt-in setting, `prompt_cache_key`, for Responses requests.
 The bridge uses an explicit caller key when one exists.
 Otherwise, the bridge derives a stable key from the SDK session identity.
@@ -175,13 +188,12 @@ The bridge supports plugin-managed compaction for buffered JSON requests and Res
 It handles Codex `compaction_trigger` requests and the host `responses/compact` operation.
 The bridge asks the Responses endpoint for a summary and appends one authenticated opaque compaction item.
 The bridge passes completed native compaction output through unchanged.
-The bridge encrypts each capsule and binds it to the account credential, API origin, model, and protocol endpoint.
-The bridge replays its capsule after a host or plugin restart when the same credential and scope remain available.
+The bridge encrypts each capsule and binds it to the account, API origin, model, and protocol endpoint.
+The bridge replays capsules after restart and verified same-account GitHub OAuth refresh when their scope remains valid.
 The plugin expands its own valid capsule into background history on a later request.
 The bridge rejects tampered capsules and capsules from a different scope.
-A GitHub access-credential change, including OAuth rotation, invalidates old capsules.
-The bridge binds capsule state to its Copilot auth entry because the public SDK offers no generic selected-auth keyring.
-The public plugin SDK does not expose Codex duplex steer or queue operations, so those compaction requests are unsupported.
+An account mismatch rejects existing capsules.
+Native Codex WebSocket duplex steering and queue operations remain host-owned and are unavailable to plugins.
 
 This compatibility summary does not recreate a provider's hidden reasoning state.
 Enable it only for models where a plain text summary meets the client's history requirement.
@@ -191,7 +203,6 @@ Enable it only for models where a plain text summary meets the client's history 
 The plugin can preserve only data that the client sends or that its scoped replay cache retains.
 Codex can remove certain provider item IDs before sending a request.
 An upstream model can reject unsupported parameters or protocol features.
-A reversible tool-ID carrier can exceed another provider's identifier length limit.
 
 Package tests use synthetic data and mock transports.
 Native host integration starts a disposable CLIProxyAPI process and a local mock upstream.

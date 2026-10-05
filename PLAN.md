@@ -145,3 +145,58 @@ Passed installed Claude Code and Codex tool execution and resume on the affected
 Reject an API-origin transition during a model retry before sending the prepared history to the new origin.
 Keep same-origin token renewal and retry behavior intact.
 Validate typed thinking signatures regardless of message role before forwarding.
+
+## Remaining State and SDK Delivery
+
+Resolve the tracked identifier, compaction lifecycle, and credential continuity limits.
+Main owns Git delivery, SDK dependency selection, private live checks, and the shared plan.
+Use `codex/plugin-state-lifecycle` against `main` for the bridge.
+Use `codex/plugin-lifecycle-sdk` against `main` in the maintained host fork when SDK changes are required.
+Use the named upstream `v8.0.15` release as the host baseline.
+Preserve upstream history and existing operator configuration.
+
+The provider owner designs stable authenticated state across legitimate OAuth token renewal.
+The translator owner handles bounded tool identifiers with exact replay correlation.
+The host owner adds selected-auth and duplex lifecycle seams required by supported compaction.
+The integration owner verifies coupled native plugin and host behavior after interfaces settle.
+Independent reviewers inspect each published coherent delivery unit.
+
+Test cancellation, queued turn preservation, selected-auth isolation, restart continuity, and changed-account rejection.
+Run affected deterministic checks and native host integration without post-connect timeouts.
+Repeat affected authenticated client routes and inspect metadata-only evidence for token renewal and replay.
+Keep auth material and provider bodies outside commits and publication.
+Record exact checks and merge each accepted unit into its authorized `main`.
+
+### Current Decisions and Evidence
+
+Upgraded both plugin SDK dependencies from `v8.0.13` to upstream `v8.0.15`.
+Built the latest upstream host with Go 1.26.8.
+Fast-forwarded the isolated maintained fork to the existing native compaction branch without rewriting authorship.
+Passed focused native compaction checks before applying selected-auth isolation corrections.
+Keep generic and native Codex duplex compaction in the host because Copilot HTTP cannot receive in-flight websocket steering.
+Reuse the existing scoped host HTTP callback for catalog cancellation with explicit bounded transport capability.
+Persist bridge continuity keys in provider auth storage and retain only verified current-credential legacy migration keys.
+Main captured live legacy Chat reasoning and Responses compaction state for post-migration replay checks.
+Keep temporary SDK workspaces and private migration evidence outside Git.
+
+### Final Lifecycle Acceptance
+
+Use the maintained host release `v8.0.15-cpa.1` through a portable Go module replacement.
+The host keeps native Codex and generic Responses compaction, including queued WebSocket turns.
+The bridge keeps Copilot HTTP execution and authenticated reasoning replay.
+OAuth continuity uses a persisted random key bound to the verified account.
+Static API credentials retain credential-bound isolation.
+Reject unsupported foreign Chat reasoning before dispatch instead of substituting a placeholder.
+Reject Responses item IDs and tool call IDs above the observed 64-character upstream limit.
+Preserve valid original IDs and decode longer transport carriers before native dispatch.
+
+Passed all twelve authenticated JSON and SSE protocol combinations with tool replay and a third turn.
+Passed all six routes using 64-character original IDs and a 203-character reversible carrier.
+Passed installed Codex 0.160.0 and Claude Code 2.1.289 tool execution and session resume.
+Clarified the Claude fixture prompt to exclude line numbers after one model copied tool formatting.
+Passed live legacy thinking and compaction replay after keyring migration and a host restart.
+Passed controlled API bearer expiry with real Copilot responses `200`, `401`, and `200`.
+The bridge acquired a new API token and retried the model request successfully.
+The current GitHub login has no OAuth refresh grant, so grant rotation uses deterministic authenticated fixtures.
+Passed buffered and SSE compaction followed by capsule replay.
+The README Mermaid source still matches the successfully rendered and inspected diagram.
