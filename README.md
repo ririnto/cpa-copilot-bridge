@@ -89,9 +89,8 @@ remain implemented by this plugin.
 
 ## Build and test
 
-Requirements: Docker with Compose v2 and a local Go 1.26 toolchain for `make
-test`. The production plugin build runs inside `golang:1.26-bookworm`, matching
-the Debian Bookworm runtime used by the official image.
+Use Docker with Compose v2 and Go 1.26.8 or newer for `make test`.
+The production plugin build uses `golang:1.26-bookworm`, matching the Debian Bookworm runtime of the official image.
 
 ```sh
 make test
@@ -99,10 +98,22 @@ make build
 make test-native
 ```
 
-`make test-native` loads the built plugin in a temporary CLIProxyAPI host from the SDK version selected in `go.mod`.
-Its provider responses and credentials are synthetic fixtures served on loopback addresses.
-It does not require a Copilot login.
-Run `scripts/test-native-host.sh` directly to test a prebuilt plugin for the local platform with the installed Go toolchain.
+`make test-native` prepares a CLIProxyAPI host from the SDK version selected in `go.mod` and compiles the integration test executable.
+Preparation may download dependencies.
+The runtime loads the built plugin and uses committed synthetic seeds under `integration/testdata/native/v1`.
+Linux runs the prepared binaries in a container with `--network=none` and only loopback available.
+The fixtures require no Copilot login.
+Missing artifacts or seed files fail the required lane.
+
+To test a prebuilt plugin for the local platform, prepare the host and test executable before running the fixtures.
+
+```sh
+scripts/prepare-native-host.sh
+scripts/test-native-host.sh
+```
+
+macOS requires `sandbox-exec` to run the prepared fixtures with only loopback networking and an isolated child environment.
+The runner fails if the sandbox tool or profile is unavailable.
 
 The loader artifact is:
 
@@ -128,7 +139,8 @@ Every push and pull request runs the Go tests and builds a production-compatible
 Linux `amd64` marketplace package. Pushes do not publish releases.
 
 CI and release builds run the native host fixtures against the packaged plugin before publishing artifacts.
-The fixture suite covers all nine client-to-endpoint routes over JSON and SSE, original tool IDs, reasoning replay, native model settings, and compaction.
+The suite covers all nine client-to-endpoint routes over JSON and SSE, original tool IDs, reasoning replay, native model settings, and compaction.
+Canonical model cases use the checked-in deployment template for normal summary requests, configured compaction, and plugin Responses WebSocket calls.
 
 To publish a marketplace-compatible release, create and push a dotted numeric
 version tag:

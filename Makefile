@@ -29,24 +29,28 @@ build-local:
 package: build
 	scripts/package-release.sh "$(VERSION)"
 
+ifeq ($(shell uname -s),Linux)
 test-native:
-	mkdir -p $(CACHE_DIR)/go-build $(CACHE_DIR)/go-mod
-	set -eu; snapshot=$$(mktemp -d); trap 'rm -rf "$$snapshot"' EXIT; trap 'exit 1' HUP INT TERM; \
-		( cd "$(CURDIR)"; git ls-files -z -- '*.go' go.mod go.sum scripts/test-native-host.sh | tar --null -T - -cf - ) | tar -xf - -C "$$snapshot"; \
-		mkdir -p "$$snapshot/$(PLUGIN_DIR)"; cp "$(CURDIR)/$(PLUGIN_SO)" "$$snapshot/$(PLUGIN_SO)"; \
-		docker run --rm --platform=linux/amd64 --read-only --tmpfs /tmp:rw,exec,nosuid,size=1g,mode=1777 \
+	mkdir -p $(CACHE_DIR)/go-build $(CACHE_DIR)/go-mod $(CACHE_DIR)/home
+	docker run --rm --platform=linux/amd64 \
 		--user "$$(id -u):$$(id -g)" \
+		-e HOME=/src/$(CACHE_DIR)/home \
 		-e GOENV=off \
 		-e GOWORK=off \
-		-e TMPDIR=/tmp \
-		-e GOCACHE=/cache/go-build \
-		-e GOMODCACHE=/cache/go-mod \
-		-v "$$snapshot:/src:ro" \
-		-v "$(CURDIR)/$(CACHE_DIR)/go-build:/cache/go-build" \
-		-v "$(CURDIR)/$(CACHE_DIR)/go-mod:/cache/go-mod" \
+		-e GOTOOLCHAIN=local \
+		-e GOCACHE=/src/$(CACHE_DIR)/go-build \
+		-e GOMODCACHE=/src/$(CACHE_DIR)/go-mod \
+		-e NATIVE_HOST_GOOS=linux \
+		-e NATIVE_HOST_GOARCH=amd64 \
+		-v "$(CURDIR):/src" \
 		-w /src \
-		$(GO_IMAGE) \
-		sh -ec 'scripts/test-native-host.sh'
+		$(GO_IMAGE) scripts/prepare-native-host.sh
+	NATIVE_HOST_GOOS=linux NATIVE_HOST_GOARCH=amd64 NATIVE_HOST_IMAGE="$(GO_IMAGE)" scripts/test-native-host.sh
+else
+test-native:
+	scripts/prepare-native-host.sh
+	NATIVE_HOST_IMAGE="$(GO_IMAGE)" scripts/test-native-host.sh
+endif
 
 clean:
 	rm -rf build dist $(CACHE_DIR)

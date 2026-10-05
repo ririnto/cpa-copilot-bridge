@@ -185,14 +185,41 @@ compaction_models:
   - "mai-code-1.1-flash"
 ```
 
-Codex also needs remote compaction enabled for its configured model provider.
+Configure a custom Responses provider to fetch the proxy catalog and select its compaction capability.
+The example requires a Codex build with provider capability support.
 
 ```toml
+model = "gpt-6-luna"
+model_provider = "cliproxyapi"
+
+[model_providers.cliproxyapi]
+name = "CLIProxyAPI"
+base_url = "http://127.0.0.1:8317/v1"
+model_catalog_url = "http://127.0.0.1:8317/v1/models"
+env_key = "CLIPROXYAPI_API_KEY"
+wire_api = "responses"
+
 [model_providers.cliproxyapi.capabilities]
 remote_compaction = "v2"
 ```
 
 Replace `cliproxyapi` with the provider name in your Codex configuration.
+Use the proxy key for the provider's API-key authentication.
+Enable V2 only when the selected model appears in `compaction_models`.
+The Codex main branch accepts `unsupported` and `v2` for this capability.
+Its configuration does not accept `v1`.
+The proxy's `/v1/responses/compact` endpoint remains available to clients that call it.
+
+Set `remote_compaction = "unsupported"` to use Codex's local compaction flow.
+Codex sends an ordinary Responses request to summarize the conversation.
+After success, it replaces compacted history with the summary and recent user messages.
+It does not retain earlier thinking blocks as separate history items.
+The proxy's compaction allowlist does not restrict these ordinary summary requests.
+
+An `openai_base_url` override retains the built-in OpenAI provider's V2 and WebSocket defaults.
+Codex ignores user-defined `[model_providers.openai]` entries.
+API-key discovery requires an explicit catalog URL when you override that endpoint.
+The custom provider above uses HTTP/SSE and fetches the proxy catalog.
 
 ## 4. Restart and authenticate
 

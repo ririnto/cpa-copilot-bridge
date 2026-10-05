@@ -3,9 +3,7 @@ package integration
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -32,6 +30,9 @@ type fixture struct {
 	canceled          chan struct{}
 	oauthRefreshCount int
 	githubUserAuth    []string
+	seeds             map[string][]byte
+	modelCatalog      []byte
+	modelTurns        map[string]int
 }
 
 const (
@@ -110,7 +111,7 @@ func TestNativeHostProtocolRoundTrips(t *testing.T) {
 	if binary == "" {
 		t.Skip("set CPA_BINARY to a built CLIProxyAPI v8 server for native host integration")
 	}
-	state := &fixture{canceled: make(chan struct{})}
+	state := newNativeFixture(t)
 	upstream := httptest.NewServer(state)
 	t.Cleanup(upstream.Close)
 	base := startProxy(t, binary, upstream.URL)
@@ -216,16 +217,16 @@ func TestNativeHostProtocolRoundTrips(t *testing.T) {
 		}
 	})
 	t.Run("ResponsesCompactionTriggerRoundTrip", func(t *testing.T) {
-		input := append(matrixCompactionHistory(), map[string]any{"type": "compaction_trigger"})
-		response := callProxy(t, base+"/v1/responses", map[string]any{"model": "bridge-responses", "input": input, "prompt_cache_key": matrixCompactCacheKey})
+		input := append(matrixCompactionHistory(t), map[string]any{"type": "compaction_trigger"})
+		response := callProxy(t, base+"/v1/responses", map[string]any{"model": "gpt-6-luna", "input": input, "prompt_cache_key": matrixCompactCacheKey})
 		captured, path := lastUpstreamRequest(t, state)
 		assertCompactionRequest(t, captured, path)
 		capsule := assertSingleCompaction(t, response)
-		assertCompactionReplay(t, base, state, capsule, "Continue the bridge task.", false)
+		assertCompactionReplay(t, base, state, capsule, "gpt-6-luna", "Continue the bridge task.", false)
 	})
 	t.Run("ResponsesCompactionTriggerStreamingRoundTrip", func(t *testing.T) {
-		input := append(matrixCompactionHistory(), map[string]any{"type": "compaction_trigger"})
-		stream := callProxy(t, base+"/v1/responses", map[string]any{"model": "bridge-responses", "stream": true, "input": input, "prompt_cache_key": matrixCompactCacheKey})
+		input := append(matrixCompactionHistory(t), map[string]any{"type": "compaction_trigger"})
+		stream := callProxy(t, base+"/v1/responses", map[string]any{"model": "gpt-6-luna", "stream": true, "input": input, "prompt_cache_key": matrixCompactCacheKey})
 		captured, path := lastUpstreamRequest(t, state)
 		assertCompactionRequest(t, captured, path)
 		events := parseSSEDataEvents(t, stream)
@@ -243,7 +244,7 @@ func TestNativeHostProtocolRoundTrips(t *testing.T) {
 		if !ok {
 			t.Fatalf("completed event has no response object: %+v", terminal)
 		}
-		if completed["id"] != "resp_fixture" || completed["status"] != "completed" {
+		if !strings.HasPrefix(stringValue(completed["id"]), "resp_fixture_") || completed["status"] != "completed" {
 			t.Fatalf("completed response metadata changed: %+v", completed)
 		}
 		usage, ok := completed["usage"].(map[string]any)
@@ -280,9 +281,12 @@ func TestNativeHostProtocolRoundTrips(t *testing.T) {
 			if !ok {
 				t.Fatalf("completed output item %d has type %T", i, item)
 			}
-			if itemMap["id"] == "msg_summary" {
+			if strings.HasPrefix(stringValue(itemMap["id"]), "summary_fixture_") {
 				summaryFound = true
-				assertEqualJSON(t, itemMap, map[string]any{"type": "message", "id": "msg_summary", "status": "completed", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "The active goal is to finish the native host bridge. The next step is integration."}}})
+				assertEqualJSON(t, itemMap["type"], "message")
+				assertEqualJSON(t, itemMap["status"], "completed")
+				assertEqualJSON(t, itemMap["role"], "assistant")
+				assertEqualJSON(t, itemMap["content"], []any{map[string]any{"type": "output_text", "text": "The active goal is to finish the native host bridge. The next step is integration."}})
 			}
 			if itemMap["type"] == "compaction" {
 				capsuleDoneCount++
@@ -294,19 +298,19 @@ func TestNativeHostProtocolRoundTrips(t *testing.T) {
 		if !summaryFound || capsuleDoneCount != 1 {
 			t.Fatalf("stream did not preserve the summary and exactly one completed capsule: summary=%v capsules=%d", summaryFound, capsuleDoneCount)
 		}
-		assertCompactionReplay(t, base, state, capsule, "Continue the streamed bridge task.", true)
+		assertCompactionReplay(t, base, state, capsule, "gpt-6-luna", "Continue the streamed bridge task.", true)
 	})
 	t.Run("ResponsesCompactRouteRoundTrip", func(t *testing.T) {
 		request := map[string]any{
-			"model":            "bridge-responses",
-			"input":            matrixCompactionHistory(),
+			"model":            "gpt-6-luna",
+			"input":            matrixCompactionHistory(t),
 			"prompt_cache_key": matrixCompactCacheKey,
 		}
 		response := callProxy(t, base+"/v1/responses/compact", request)
 		captured, path := lastUpstreamRequest(t, state)
 		assertCompactionRequest(t, captured, path)
 		capsule := assertSingleCompaction(t, response)
-		assertCompactionReplay(t, base, state, capsule, "Continue after the compact route.", false)
+		assertCompactionReplay(t, base, state, capsule, "gpt-6-luna", "Continue after the compact route.", false)
 	})
 	t.Run("ForeignOpaqueReasoningToGeminiChatFailsClosed", func(t *testing.T) {
 		cases := []struct {
@@ -383,11 +387,10 @@ func TestNativeHostOAuthExcludedModelsFilterPluginModels(t *testing.T) {
 	if binary == "" {
 		t.Skip("set CPA_BINARY to a built CLIProxyAPI v8 server for native host integration")
 	}
-	state := &fixture{canceled: make(chan struct{})}
+	state := newNativeFixture(t)
 	upstream := httptest.NewServer(state)
 	defer upstream.Close()
-	oauthConfig := "  excluded-models:\n    copilot:\n      - \"gpt-5*\"\n      - \"gpt-6-sol\"\n      - \"claude-fable-5\"\n      - \"claude-sonnet-4*\"\n      - \"claude-sonnet-5\"\n      - \"claude-opus-4*\"\n      - \"claude-opus-5\"\n      - \"gemini-3.7-flash\"\n      - \"grok-4.5\"\n      - \"grok-4.6\"\n  model-alias:\n    copilot:\n      - name: \"claude-sonnet-5.5\"\n        alias: \"claude-sonnet-5-5\"\n        fork: true\n      - name: \"claude-opus-5.5\"\n        alias: \"claude-opus-5-5\"\n        fork: true\n      - name: \"claude-fable-5.1\"\n        alias: \"claude-fable-5-1\"\n        fork: true\n"
-	base, _ := startProxyInRoot(t, binary, upstream.URL, t.TempDir(), nil, "", oauthConfig)
+	base, _ := startProxyInRoot(t, binary, upstream.URL, t.TempDir(), nil, "")
 	request, err := http.NewRequest(http.MethodGet, base+"/v1/models", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -461,13 +464,12 @@ func TestNativeHostOAuthSettingsOverrideCopilotModelContext(t *testing.T) {
 	if binary == "" {
 		t.Skip("set CPA_BINARY to a built CLIProxyAPI v8 server for native host integration")
 	}
-	state := &fixture{canceled: make(chan struct{})}
+	state := newNativeFixture(t)
 	upstream := httptest.NewServer(state)
 	defer upstream.Close()
-	baselineBase, _ := startProxyInRoot(t, binary, upstream.URL, t.TempDir(), nil, "", "")
+	baselineBase, _ := startProxyInRoot(t, binary, upstream.URL, t.TempDir(), nil, "", "  settings: {}\n")
 	baseline := requestNativeCodexModels(t, baselineBase)
-	oauthSettings := "  settings:\n    copilot:\n      - name: gpt-6.1-sol\n        max-context-length: 272000\n      - name: gpt-6-luna\n        max-context-length: 272000\n"
-	base, _ := startProxyInRoot(t, binary, upstream.URL, t.TempDir(), nil, "", oauthSettings)
+	base, _ := startProxyInRoot(t, binary, upstream.URL, t.TempDir(), nil, "")
 	configured := requestNativeCodexModels(t, base)
 	for _, modelID := range []string{"gpt-6.1-sol", "gpt-6-luna"} {
 		before, beforeExists := baseline[modelID]
@@ -548,36 +550,7 @@ func (f *fixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "fixture-new-github-token", "refresh_token": "fixture-new-refresh-token", "token_type": "bearer", "scope": "read:user user:email", "expires_in": 86400, "refresh_token_expires_in": 2592000})
 	case "/models":
-		_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{
-			map[string]any{"id": "bridge-responses", "supported_endpoints": []string{"/responses"}, "capabilities": map[string]any{"type": "chat", "supports": map[string]bool{"streaming": true, "tool_calls": true}}},
-			map[string]any{"id": "bridge-messages", "supported_endpoints": []string{"/v1/messages", "/chat/completions"}, "capabilities": map[string]any{"type": "chat"}},
-			map[string]any{"id": "bridge-chat", "supported_endpoints": []string{"/chat/completions"}, "capabilities": map[string]any{"type": "chat"}},
-			map[string]any{"id": "grok-4.5", "vendor": "xAI", "supported_endpoints": []string{"/responses"}, "capabilities": map[string]any{"type": "chat", "family": "grok"}},
-			map[string]any{"id": "grok-4.6", "vendor": "xAI", "supported_endpoints": []string{"/responses"}, "capabilities": map[string]any{"type": "chat", "family": "grok"}},
-			map[string]any{"id": "grok-4.7", "vendor": "xAI", "supported_endpoints": []string{"/responses"}, "capabilities": map[string]any{"type": "chat", "family": "grok"}},
-			map[string]any{"id": "gpt-5.5", "vendor": "OpenAI", "supported_endpoints": []string{"/responses"}, "capabilities": map[string]any{"type": "chat", "family": "gpt"}},
-			map[string]any{"id": "gpt-5-copilot-only", "vendor": "OpenAI", "supported_endpoints": []string{"/responses"}, "capabilities": map[string]any{"type": "chat", "family": "gpt"}},
-			map[string]any{"id": "gpt-6-sol", "vendor": "OpenAI", "supported_endpoints": []string{"/responses"}, "capabilities": map[string]any{"type": "chat", "family": "gpt"}},
-			map[string]any{"id": "claude-fable-5", "vendor": "Anthropic", "supported_endpoints": []string{"/v1/messages"}, "capabilities": map[string]any{"type": "chat", "family": "claude"}},
-			map[string]any{"id": "claude-fable-5.1", "vendor": "Anthropic", "supported_endpoints": []string{"/v1/messages"}, "capabilities": map[string]any{"type": "chat", "family": "claude"}},
-			map[string]any{"id": "claude-sonnet-4.8-fast", "vendor": "Anthropic", "supported_endpoints": []string{"/v1/messages"}, "capabilities": map[string]any{"type": "chat", "family": "claude"}},
-			map[string]any{"id": "claude-sonnet-4-8-fast", "vendor": "Anthropic", "supported_endpoints": []string{"/v1/messages"}, "capabilities": map[string]any{"type": "chat", "family": "claude"}},
-			map[string]any{"id": "claude-sonnet-5", "vendor": "Anthropic", "supported_endpoints": []string{"/v1/messages"}, "capabilities": map[string]any{"type": "chat", "family": "claude"}},
-			map[string]any{"id": "claude-sonnet-5.5", "vendor": "Anthropic", "supported_endpoints": []string{"/v1/messages"}, "capabilities": map[string]any{"type": "chat", "family": "claude", "supports": map[string]any{"adaptive_thinking": true, "reasoning_effort": []string{"low", "high"}}, "limits": map[string]int{"max_context_window_tokens": 32768}}},
-			map[string]any{"id": "claude-opus-4.8-fast", "vendor": "Anthropic", "supported_endpoints": []string{"/v1/messages"}, "capabilities": map[string]any{"type": "chat", "family": "claude"}},
-			map[string]any{"id": "claude-opus-4-8-fast", "vendor": "Anthropic", "supported_endpoints": []string{"/v1/messages"}, "capabilities": map[string]any{"type": "chat", "family": "claude"}},
-			map[string]any{"id": "claude-opus-5", "vendor": "Anthropic", "supported_endpoints": []string{"/v1/messages"}, "capabilities": map[string]any{"type": "chat", "family": "claude"}},
-			map[string]any{"id": "claude-opus-5.5", "vendor": "Anthropic", "supported_endpoints": []string{"/v1/messages"}, "capabilities": map[string]any{"type": "chat", "family": "claude"}},
-			map[string]any{"id": "gemini-3.7-flash", "vendor": "Google", "supported_endpoints": []string{"/responses"}, "capabilities": map[string]any{"type": "chat", "family": "gemini"}},
-			map[string]any{"id": "gpt-6.1-sol", "vendor": "OpenAI", "supported_endpoints": []string{"/responses"}, "capabilities": map[string]any{"type": "chat", "family": "gpt", "supports": map[string]any{"adaptive_thinking": true, "reasoning_effort": []string{"low", "medium", "high", "xhigh"}}, "limits": map[string]int{"max_context_window_tokens": 128000}}},
-			map[string]any{"id": "gpt-6-luna", "vendor": "OpenAI", "supported_endpoints": []string{"/responses"}, "capabilities": map[string]any{"type": "chat", "family": "gpt", "supports": map[string]any{"adaptive_thinking": true, "reasoning_effort": []string{"low", "medium", "high"}}, "limits": map[string]int{"max_context_window_tokens": 96000}}},
-			map[string]any{"id": "gemini-3.8-flash", "vendor": "Google", "supported_endpoints": []string{"/chat/completions"}, "capabilities": map[string]any{"type": "chat", "family": "gemini"}},
-			map[string]any{"id": "mai-code-1.1-flash", "model_picker_enabled": true, "policy": map[string]string{"state": "enabled"}, "supported_endpoints": []string{"/responses"}, "capabilities": map[string]any{"type": "chat", "family": "mai", "supports": map[string]any{"adaptive_thinking": true, "reasoning_effort": []string{"low", "medium", "high"}}}},
-			map[string]any{"id": "bridge-gemini-3.8", "vendor": "Google", "supported_endpoints": []string{"/chat/completions"}, "capabilities": map[string]any{"type": "chat", "family": "gemini", "supports": map[string]bool{"streaming": true, "tool_calls": true}}},
-			map[string]any{"id": "bridge-gpt-6-luna", "vendor": "OpenAI", "supported_endpoints": []string{"/responses"}, "capabilities": map[string]any{"type": "chat", "family": "gpt", "supports": map[string]bool{"streaming": true, "tool_calls": true}}},
-			map[string]any{"id": "bridge-chat-sonnet-5.5", "vendor": "Anthropic", "supported_endpoints": []string{"/v1/messages"}, "capabilities": map[string]any{"type": "chat", "family": "claude", "supports": map[string]any{"streaming": true, "tool_calls": true, "adaptive_thinking": true, "reasoning_effort": []string{"low", "medium", "high", "max"}}, "limits": map[string]int{"max_context_window_tokens": 81920}}},
-			map[string]any{"id": "bridge-sonnet-5.5", "vendor": "Anthropic", "supported_endpoints": []string{"/chat/completions", "/v1/messages"}, "capabilities": map[string]any{"type": "chat", "family": "claude", "supports": map[string]any{"streaming": true, "tool_calls": true, "adaptive_thinking": true, "reasoning_effort": []string{"low", "medium", "high", "max"}}, "limits": map[string]int{"max_context_window_tokens": 81920}}},
-		}})
+		_, _ = w.Write(f.modelCatalog)
 	case "/responses", "/v1/messages", "/chat/completions":
 		if r.Header.Get("Authorization") != "Bearer fixture-copilot-token" {
 			w.WriteHeader(http.StatusUnauthorized)
@@ -591,6 +564,9 @@ func (f *fixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		f.requests = append(f.requests, request)
 		f.paths = append(f.paths, r.URL.Path)
+		model := stringValue(request["model"])
+		f.modelTurns[model]++
+		turn := f.modelTurns[model]
 		f.mu.Unlock()
 		if request["fixture_cancel"] == true {
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -601,6 +577,10 @@ func (f *fixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if isMatrixModel(stringValue(request["model"])) {
 			writeMatrixResponse(w, r.URL.Path, request)
+			return
+		}
+		if model != "bridge-responses" && model != "bridge-messages" && model != "bridge-chat" {
+			f.writeSeededResponse(w, r.URL.Path, request, model, turn)
 			return
 		}
 		if r.URL.Path == "/v1/messages" {
@@ -632,6 +612,45 @@ func (f *fixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusNotFound)
 	}
+}
+
+func (f *fixture) writeSeededResponse(w http.ResponseWriter, path string, request map[string]any, model string, turn int) {
+	name := "responses.json"
+	if path == "/chat/completions" {
+		name = "chat.json"
+	}
+	if path == "/v1/messages" {
+		name = "messages.json"
+	}
+	if path == "/responses" && request["tool_choice"] == "none" {
+		name = "responses-compaction.json"
+	}
+	if request["stream"] == true {
+		name = strings.TrimSuffix(name, ".json") + ".sse"
+		if path == "/responses" && request["tool_choice"] == "none" {
+			name = "responses-compaction.sse"
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+	} else {
+		w.Header().Set("Content-Type", "application/json")
+	}
+	seed, ok := f.seeds[name]
+	if !ok {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	seed = bytes.ReplaceAll(seed, []byte("fixture-model"), []byte(model))
+	seed = bytes.ReplaceAll(seed, []byte("fixture-response-id"), []byte(fmt.Sprintf("resp_fixture_%d", turn)))
+	seed = bytes.ReplaceAll(seed, []byte("fixture-reasoning-id"), []byte(fmt.Sprintf("reasoning_fixture_%d/+", turn)))
+	seed = bytes.ReplaceAll(seed, []byte("fixture-summary-id"), []byte(fmt.Sprintf("summary_fixture_%d", turn)))
+	seed = bytes.ReplaceAll(seed, []byte("fixture-chat-response-id"), []byte(fmt.Sprintf("chat_fixture_%d", turn)))
+	seed = bytes.ReplaceAll(seed, []byte("fixture-chat-chunk-id"), []byte(fmt.Sprintf("chatcmpl_fixture_%d", turn)))
+	seed = bytes.ReplaceAll(seed, []byte("fixture-messages-response-id"), []byte(fmt.Sprintf("msg_fixture_%d", turn)))
+	seed = bytes.ReplaceAll(seed, []byte("fixture-function-item-id"), []byte(fmt.Sprintf("fixture-function-item-%d/+", turn)))
+	seed = bytes.ReplaceAll(seed, []byte("fixture-call-id"), []byte(fmt.Sprintf("fixture-call-%d/+", turn)))
+	seed = bytes.ReplaceAll(seed, []byte("fixture-chat-call-id"), []byte(fmt.Sprintf("fixture-chat-call-%d/+", turn)))
+	seed = bytes.ReplaceAll(seed, []byte("fixture-messages-tool-id"), []byte(fmt.Sprintf("fixture-messages-tool-%d/+", turn)))
+	_, _ = w.Write(seed)
 }
 
 func isMatrixModel(model string) bool {
@@ -867,9 +886,12 @@ func startProxyInRoot(t *testing.T, binary, upstream, root string, authJSON []by
 	for _, fragment := range oauthConfigYAML {
 		oauthConfig.WriteString(fragment)
 	}
-	config := fmt.Sprintf("config-version: 8\nserver:\n  host: 127.0.0.1\n  port: %d\nmanagement:\n  disable-control-panel: true\n  secret-key: %q\naccess:\n  api-keys: [fixture-client-key]\noauth:\n  auth-dir: %q\n%splugins:\n  enabled: true\n  dir: %q\n  configs:\n    cliproxyapi-copilot:\n      enabled: true\n      allow_insecure_base_urls: true\n      compaction_models: [\"bridge-responses\", \"gpt-6-luna\", \"gpt-6.1-sol\", \"mai-code-1.1-flash\"]\n      reasoning_replay: true\n      github_base_url: %q\n      github_api_url: %q\n      copilot_api_url: %q\n", port, managementSecret, authDir, oauthConfig.String(), filepath.Join(root, "plugins"), upstream, upstream, upstream)
+	config, configuredAuthDir := nativeRuntimeConfig(t, root, port, upstream, managementSecret, oauthConfig.String())
+	if configuredAuthDir != authDir {
+		t.Fatalf("native template configured auth directory %q, want %q", configuredAuthDir, authDir)
+	}
 	configPath := filepath.Join(root, "config.yaml")
-	if err := os.WriteFile(configPath, []byte(config), 0600); err != nil {
+	if err := os.WriteFile(configPath, config, 0600); err != nil {
 		t.Fatal(err)
 	}
 	logPath := filepath.Join(root, "host.log")
@@ -914,31 +936,6 @@ func startProxyInRoot(t *testing.T, binary, upstream, root string, authJSON []by
 			}
 		}
 	}
-}
-
-func nativeAuthFixtureJSON(t *testing.T) []byte {
-	t.Helper()
-	token := "fixture-github-token"
-	fingerprint := sha256.Sum256([]byte(token))
-	storage := map[string]any{
-		"type":                "copilot",
-		"github_access_token": token,
-		"github_login":        "fixture",
-		"github_user_id":      4242,
-		"expires_at":          int64(4102444800),
-		"continuity_keyring": map[string]any{
-			"version":                1,
-			"key_id":                 "00112233445566778899aabbccddeeff",
-			"account_id":             4242,
-			"root_key":               base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x5a}, 32)),
-			"credential_fingerprint": hex.EncodeToString(fingerprint[:]),
-		},
-	}
-	data, err := json.Marshal(storage)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return data
 }
 
 func callProxy(t *testing.T, url string, payload any) []byte {
@@ -1027,13 +1024,13 @@ func lastUpstreamRequest(t *testing.T, state *fixture) (map[string]any, string) 
 	return state.requests[last], state.paths[last]
 }
 
-func matrixCompactionHistory() []any {
-	return []any{
-		map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "Remember the active goal: finish the native host bridge."}}},
-		map[string]any{"type": "reasoning", "id": matrixCompactReasoningID, "summary": []any{}, "encrypted_content": matrixCompactOpaque},
-		map[string]any{"type": "function_call", "id": matrixCompactFunctionID, "call_id": matrixCompactCallID, "name": "inspect", "arguments": `{"query":"original"}`},
-		map[string]any{"type": "function_call_output", "call_id": matrixCompactCallID, "output": "original result"},
+func matrixCompactionHistory(t *testing.T) []any {
+	t.Helper()
+	var history []any
+	if err := json.Unmarshal(readNativeSeed(t, "responses-history.json"), &history); err != nil {
+		t.Fatalf("decode synthetic Responses history: %v", err)
 	}
+	return history
 }
 
 func assertCompactionRequest(t *testing.T, request map[string]any, path string) {
@@ -1932,9 +1929,11 @@ func assertMatrixFollowupRequest(t *testing.T, route matrixRoute, request map[st
 		}
 		assertAdaptiveThinkingRequest(t, request, "high")
 		if route.clientFormat == "openai-response" {
-			itemID, callID, ok := translate.DecodeClaudeToolIDs(toolID)
-			if !ok || itemID != output.ItemID || callID != output.CallID {
-				t.Fatalf("Responses tool identity changed during Messages replay: id=%q decoded=(%q,%q,%v), want (%q,%q)", toolID, itemID, callID, ok, output.ItemID, output.CallID)
+			if toolID != output.CallID || output.ItemID != "fc_"+output.CallID {
+				itemID, callID, ok := translate.DecodeClaudeToolIDs(toolID)
+				if !ok || itemID != output.ItemID || callID != output.CallID {
+					t.Fatalf("Responses tool identity changed during Messages replay: id=%q decoded=(%q,%q,%v), want (%q,%q)", toolID, itemID, callID, ok, output.ItemID, output.CallID)
+				}
 			}
 		}
 	}
@@ -2181,7 +2180,7 @@ func assertSingleCompaction(t *testing.T, response []byte) string {
 	return capsule
 }
 
-func assertCompactionReplay(t *testing.T, base string, state *fixture, capsule, continuation string, includeTrigger bool) {
+func assertCompactionReplay(t *testing.T, base string, state *fixture, capsule, model, continuation string, includeTrigger bool) {
 	t.Helper()
 	replayInput := []any{
 		map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": continuation}}},
@@ -2190,11 +2189,14 @@ func assertCompactionReplay(t *testing.T, base string, state *fixture, capsule, 
 	if includeTrigger {
 		replayInput = append(replayInput, map[string]any{"type": "compaction_trigger"})
 	}
-	request := map[string]any{"model": "bridge-responses", "input": replayInput, "prompt_cache_key": matrixCompactCacheKey}
+	request := map[string]any{"model": model, "input": replayInput, "prompt_cache_key": matrixCompactCacheKey}
 	callProxy(t, base+"/v1/responses", request)
 	captured, path := lastUpstreamRequest(t, state)
 	if path != "/responses" {
 		t.Fatalf("replay request used upstream path %q", path)
+	}
+	if captured["model"] != model {
+		t.Fatalf("compaction replay model = %v, want %q", captured["model"], model)
 	}
 	if captured["prompt_cache_key"] != matrixCompactCacheKey {
 		t.Fatalf("compaction replay changed the explicit prompt cache key: %+v", captured)

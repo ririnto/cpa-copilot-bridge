@@ -21,7 +21,7 @@ func TestNativeHostOAuthContinuityPersistsAcrossRestart(t *testing.T) {
 	if binary == "" {
 		t.Skip("set CPA_BINARY to a built CLIProxyAPI v8 server for native host integration")
 	}
-	state := &fixture{canceled: make(chan struct{})}
+	state := newNativeFixture(t)
 	upstream := httptest.NewServer(state)
 	t.Cleanup(upstream.Close)
 	root := t.TempDir()
@@ -77,21 +77,7 @@ type persistedOAuthStorage struct {
 
 func legacyOAuthAuthFixtureJSON(t *testing.T) []byte {
 	t.Helper()
-	storage := map[string]any{
-		"type":                     "copilot",
-		"github_access_token":      "fixture-old-github-token",
-		"github_refresh_token":     "fixture-refresh-token",
-		"github_login":             "fixture",
-		"github_user_id":           4242,
-		"oauth_client_id":          "fixture-oauth-client-id",
-		"expires_at":               time.Now().Add(-time.Hour).Unix(),
-		"refresh_token_expires_at": time.Now().Add(24 * time.Hour).Unix(),
-	}
-	body, err := json.Marshal(storage)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return body
+	return readNativeSeed(t, "legacy-auth.json")
 }
 
 func forceRefreshAuthFile(t *testing.T, base, secret, name string) {

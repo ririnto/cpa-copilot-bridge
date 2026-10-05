@@ -32,6 +32,7 @@ func responsesRequestToClaude(model string, body []byte, stream bool) ([]byte, e
 	reasoningRestore := make(map[string]responsesClaudeReasoningPayload)
 	toolRestore := make(map[string]responsesClaudeToolPayload)
 	toolCallsByCallID := make(map[string]responsesClaudeToolPayload)
+	toolCallsByClaudeID := make(map[string]struct{})
 	if input.IsArray() {
 		for index, item := range input.Array() {
 			switch item.Get("type").String() {
@@ -59,15 +60,22 @@ func responsesRequestToClaude(model string, body []byte, stream bool) ([]byte, e
 				}
 				temporary = updated
 			case "function_call", "custom_tool_call":
-				payload, ok := responsesClaudeToolPayloadFromItem(item)
+				payload, ok, err := responsesClaudeToolPayloadFromItem(item)
+				if err != nil {
+					return nil, err
+				}
 				if !ok {
 					continue
 				}
 				if _, exists := toolCallsByCallID[payload.callID]; exists {
 					return nil, fmt.Errorf("Responses tool call identity is ambiguous for Claude translation")
 				}
+				if _, exists := toolCallsByClaudeID[payload.claudeID]; exists {
+					return nil, fmt.Errorf("Responses tool call identity is ambiguous for Claude translation")
+				}
 				payload.marker = temporaryResponsesMarker(body, "tool", index)
 				toolCallsByCallID[payload.callID] = payload
+				toolCallsByClaudeID[payload.claudeID] = struct{}{}
 				toolRestore[payload.marker] = payload
 				updated, err := sjson.SetBytes(temporary, fmt.Sprintf("input.%d.call_id", index), payload.marker)
 				if err != nil {
@@ -190,11 +198,11 @@ func temporaryResponsesMarker(body []byte, kind string, index int) string {
 	return marker
 }
 
-func responsesClaudeToolPayloadFromItem(item gjson.Result) (responsesClaudeToolPayload, bool) {
+func responsesClaudeToolPayloadFromItem(item gjson.Result) (responsesClaudeToolPayload, bool, error) {
 	callID := responsesRequestItemCallID(item)
 	itemID := item.Get("id").String()
 	if callID == "" && itemID == "" {
-		return responsesClaudeToolPayload{}, false
+		return responsesClaudeToolPayload{}, false, nil
 	}
 	if callID == "" {
 		callID = itemID
@@ -208,7 +216,38 @@ func responsesClaudeToolPayloadFromItem(item gjson.Result) (responsesClaudeToolP
 		}
 	}
 	claudeID := claudeToolIDFromResponses(map[string]any{"id": itemID, "call_id": carrierCallID})
-	return responsesClaudeToolPayload{claudeID: claudeID, callID: callID}, true
+	if carrierCallID != "" {
+		decodedCallID, encoded, err := unwrapClaudeToolIDCarrier(itemID, carrierCallID)
+		if err != nil {
+			return responsesClaudeToolPayload{}, false, fmt.Errorf("Responses tool call has an invalid Claude identity")
+		}
+		if encoded {
+			claudeID = decodedCallID
+		} else {
+			itemPrefix := ""
+			switch item.Get("type").String() {
+			case "function_call":
+				itemPrefix = "fc_"
+			case "custom_tool_call":
+				itemPrefix = "ctc_"
+			}
+			if itemPrefix != "" && itemID == itemPrefix+carrierCallID {
+				claudeID = carrierCallID
+			}
+		}
+	}
+	return responsesClaudeToolPayload{claudeID: claudeID, callID: callID}, true, nil
+}
+
+func unwrapClaudeToolIDCarrier(itemID, value string) (string, bool, error) {
+	if !strings.HasPrefix(value, bridgeToolIDPrefix) {
+		return value, false, nil
+	}
+	carrierItemID, callID, wrapped, err := parseClaudeToolID(value)
+	if err != nil || !wrapped || callID == "" || strings.HasPrefix(callID, bridgeToolIDPrefix) || (carrierItemID != "" && carrierItemID != itemID) {
+		return "", false, errInvalidClaudeToolIDCarrier
+	}
+	return callID, true, nil
 }
 
 func responsesRequestItemCallID(item gjson.Result) string {
