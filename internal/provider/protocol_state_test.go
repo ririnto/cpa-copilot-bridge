@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ririnto/cpa-copilot-bridge/internal/translate"
+	"github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin/internal/translate"
 	"github.com/tidwall/gjson"
 )
 

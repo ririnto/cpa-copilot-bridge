@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ririnto/cpa-copilot-bridge/internal/compact"
-	"github.com/ririnto/cpa-copilot-bridge/internal/translate"
-	"github.com/ririnto/cpa-copilot-bridge/internal/transport"
+	"github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin/internal/compact"
+	"github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin/internal/translate"
+	"github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin/internal/transport"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	"github.com/tidwall/gjson"
 )

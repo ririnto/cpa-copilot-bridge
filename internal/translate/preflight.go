@@ -3,43 +3,9 @@ package translate
 import (
 	"fmt"
 	"strings"
-	"unicode/utf8"
 
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
-	"github.com/tidwall/gjson"
 )
-
-const copilotResponsesIDMaxCharacters = 64
-
-func ValidateCopilotResponsesToolIDLengths(body []byte) error {
-	input := gjson.GetBytes(body, "input")
-	if !input.IsArray() {
-		return nil
-	}
-	for index, item := range input.Array() {
-		if !item.IsObject() {
-			continue
-		}
-		if err := validateCopilotResponsesIdentifier(item, index, "id"); err != nil {
-			return err
-		}
-		switch item.Get("type").String() {
-		case "function_call", "custom_tool_call", "function_call_output", "custom_tool_call_output":
-			if err := validateCopilotResponsesIdentifier(item, index, "call_id"); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func validateCopilotResponsesIdentifier(item gjson.Result, index int, field string) error {
-	value := item.Get(field)
-	if value.Type == gjson.String && utf8.RuneCountInString(value.String()) > copilotResponsesIDMaxCharacters {
-		return fmt.Errorf("Responses input[%d].%s exceeds the Copilot Responses limit of %d characters", index, field, copilotResponsesIDMaxCharacters)
-	}
-	return nil
-}
 
 func validateResponsesRequestForTarget(body []byte, target sdktranslator.Format) error {
 	root, err := decodeObject(body)

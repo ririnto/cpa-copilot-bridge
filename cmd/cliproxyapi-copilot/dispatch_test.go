@@ -13,7 +13,7 @@ func TestRegistrationSupportsNativeClientFormats(t *testing.T) {
 		t.Fatal(err)
 	}
 	registration := result.(registration)
-	if registration.SchemaVersion != pluginabi.SchemaVersion || registration.Metadata.Name != "Copilot Bridge" {
+	if registration.SchemaVersion != pluginabi.SchemaVersion || registration.Metadata.Name != "GitHub Copilot subscription provider" || registration.Metadata.Author != "self-owned" || registration.Metadata.GitHubRepository != "https://github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin" {
 		t.Fatalf("unexpected registration: %+v", registration)
 	}
 	for _, format := range []string{"openai-response", "claude", "openai"} {
@@ -22,7 +22,7 @@ func TestRegistrationSupportsNativeClientFormats(t *testing.T) {
 		}
 	}
 	result, err = dispatch(pluginabi.MethodExecutorIdentifier, nil)
-	if err != nil || result.(identifierResponse).Identifier != "copilot-bridge" {
+	if err != nil || result.(identifierResponse).Identifier != "copilot" {
 		t.Fatalf("unexpected executor identifier: %+v %v", result, err)
 	}
 }

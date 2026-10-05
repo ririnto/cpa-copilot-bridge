@@ -1,6 +1,6 @@
 # Command and Host ABI
 
-- Keep `cmd/cpa-copilot-bridge` as the CLIProxyAPI host adapter and method dispatcher.
+- Keep `cmd/cliproxyapi-copilot` as the CLIProxyAPI host adapter and method dispatcher.
 - Keep provider behavior and protocol conversion in `internal` packages.
 - Use `sdk/pluginabi` and `sdk/pluginapi` as the source of truth for host methods, ABI versions, and shared types.
 - Treat exported C symbols, C struct layouts, JSON field names, envelopes, and buffer ownership as host contracts.

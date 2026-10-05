@@ -3,6 +3,7 @@ package provider
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,9 +13,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ririnto/cpa-copilot-bridge/internal/compact"
-	"github.com/ririnto/cpa-copilot-bridge/internal/translate"
-	"github.com/ririnto/cpa-copilot-bridge/internal/transport"
+	"github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin/internal/compact"
+	"github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin/internal/translate"
+	"github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin/internal/transport"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	"github.com/tidwall/gjson"
 )
@@ -506,133 +507,111 @@ func TestCollectStreamErrorRedactsSecretsAndCapsBody(t *testing.T) {
 	}
 }
 
-func TestResponsesToolIDLimitsRejectBeforeUpstreamAndPreserveValidIDs(t *testing.T) {
+func TestProviderIssuedLongResponsesItemIDReplaysUnchanged(t *testing.T) {
 	const model = "gpt-5.6-sol"
-	const id64 = "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii"
-	const callID64 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-	for _, stream := range []bool{false, true} {
-		for _, test := range []struct {
-			name   string
-			id     string
-			callID string
-			valid  bool
-		}{
-			{name: "item ID over limit", id: id64 + "x", callID: callID64},
-			{name: "call ID over limit", id: id64, callID: callID64 + "x"},
-			{name: "both IDs at limit", id: id64, callID: callID64, valid: true},
-		} {
-			t.Run(fmt.Sprintf("stream_%t/%s", stream, test.name), func(t *testing.T) {
-				host := newCompactionStreamHost(compactionStreamResponse("completed"))
-				host.allowStream = true
+	const callID = "call_123456789012345678901234"
+	longItemID := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x5a}, 318))
+	if len(longItemID) != 424 {
+		t.Fatalf("synthetic opaque item ID length = %d, want 424", len(longItemID))
+	}
+	responseBody, err := json.Marshal(map[string]any{
+		"id": "resp_tool_call", "object": "response", "status": "completed", "model": model,
+		"output": []any{map[string]any{
+			"type": "function_call", "id": longItemID, "call_id": callID,
+			"name": "inspect", "arguments": `{"query":"initial"}`,
+		}},
+		"usage": map[string]any{"input_tokens": 1, "output_tokens": 1},
+	})
+	if err != nil {
+		t.Fatalf("encode synthetic Responses output: %v", err)
+	}
+	for _, source := range []string{"openai-response", "claude"} {
+		for _, streamFollowup := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/stream_%t", source, streamFollowup), func(t *testing.T) {
+				host := newCompactionStreamHost(responseBody)
+				host.allowStream = streamFollowup
 				service := newCompactionStreamService(t, host)
-				payload, err := json.Marshal(map[string]any{
-					"model": model,
-					"input": []any{map[string]any{
-						"type": "function_call", "id": test.id, "call_id": test.callID, "name": "inspect", "arguments": "{}",
-					}},
-				})
-				if err != nil {
-					t.Fatalf("encode request: %v", err)
-				}
-				request := compactionStreamRequest(payload, "")
-				if stream {
-					_, err = service.ExecuteStream(context.Background(), request)
+				var firstPayload []byte
+				if source == "claude" {
+					firstPayload = []byte(`{"model":"` + model + `","max_tokens":64,"messages":[{"role":"user","content":"start"}],"tools":[{"name":"inspect","input_schema":{"type":"object"}}]}`)
 				} else {
-					_, err = service.Execute(context.Background(), request)
+					firstPayload = []byte(`{"model":"` + model + `","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"start"}]}]}`)
 				}
-				if !test.valid {
-					var statusErr *StatusError
-					if !errors.As(err, &statusErr) || statusErr.Code != "responses_tool_id_too_long" || statusErr.HTTPStatus != http.StatusUnprocessableEntity {
-						t.Fatalf("request error = %#v, want pre-upstream 422 tool ID error", err)
+				firstRequest := compactionStreamRequest(firstPayload, "")
+				firstRequest.SourceFormat = source
+				firstRequest.Headers = http.Header{"Session-Id": []string{"session-opaque-id"}}
+				first, err := service.Execute(context.Background(), firstRequest)
+				if err != nil {
+					t.Fatalf("execute initial tool turn: %v", err)
+				}
+				clientToolID := longItemID
+				if source == "claude" {
+					clientToolID = gjson.GetBytes(first.Payload, `content.#(type==tool_use).id`).String()
+					itemID, gotCallID, ok := translate.DecodeClaudeToolIDs(clientToolID)
+					if !ok || itemID != longItemID || gotCallID != callID {
+						t.Fatalf("Claude response did not carry the exact opaque tool IDs: item length=%d call=%q ok=%t", len(itemID), gotCallID, ok)
 					}
-					if !strings.Contains(statusErr.Message, "input[0]") || !strings.Contains(statusErr.Message, "64 characters") {
-						t.Fatalf("tool ID error lacks path or limit: %s", statusErr.Message)
-					}
-					for _, upstreamRequest := range host.requestSnapshot() {
-						if strings.HasSuffix(upstreamRequest.URL, translate.EndpointResponses) {
-							t.Fatalf("invalid tool ID was sent upstream: %s", upstreamRequest.URL)
-						}
-					}
-					host.mu.Lock()
-					opened := host.openCount
-					host.mu.Unlock()
-					if opened != 0 || len(host.streamRequestBody()) != 0 {
-						t.Fatalf("invalid streaming tool ID opened upstream: opened=%d body=%s", opened, host.streamRequestBody())
-					}
-					return
+				} else if got := gjson.GetBytes(first.Payload, `output.#(type==function_call).id`).String(); got != longItemID {
+					t.Fatalf("Responses output item ID changed: length=%d", len(got))
+				}
+				var followupPayload []byte
+				if source == "claude" {
+					followupPayload, err = json.Marshal(map[string]any{
+						"model": model, "max_tokens": 64,
+						"messages": []any{
+							map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "tool_use", "id": clientToolID, "name": "inspect", "input": map[string]any{"query": "initial"}}}},
+							map[string]any{"role": "user", "content": []any{map[string]any{"type": "tool_result", "tool_use_id": clientToolID, "content": "done"}, map[string]any{"type": "text", "text": "continue"}}},
+						},
+						"tools": []any{map[string]any{"name": "inspect", "input_schema": map[string]any{"type": "object"}}},
+					})
+				} else {
+					followupPayload, err = json.Marshal(map[string]any{
+						"model": model,
+						"input": []any{
+							map[string]any{"type": "function_call", "id": longItemID, "call_id": callID, "name": "inspect", "arguments": `{"query":"initial"}`},
+							map[string]any{"type": "function_call_output", "call_id": callID, "output": "done"},
+							map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "continue"}}},
+						},
+					})
 				}
 				if err != nil {
-					t.Fatalf("request with 64-character IDs: %v", err)
+					t.Fatalf("encode tool follow-up: %v", err)
+				}
+				followupRequest := compactionStreamRequest(followupPayload, "")
+				followupRequest.SourceFormat = source
+				followupRequest.Headers = http.Header{"Session-Id": []string{"session-opaque-id"}}
+				if streamFollowup {
+					if _, err = service.ExecuteStream(context.Background(), followupRequest); err != nil {
+						t.Fatalf("execute streaming tool follow-up: %v", err)
+					}
+					if _, closeMessage := collectCompactionStreamFrames(t, host); closeMessage != "" {
+						t.Fatalf("stream follow-up closed with error: %s", closeMessage)
+					}
+				} else if _, err = service.Execute(context.Background(), followupRequest); err != nil {
+					t.Fatalf("execute buffered tool follow-up: %v", err)
 				}
 				var upstreamBody []byte
-				if stream {
+				if streamFollowup {
 					upstreamBody = host.streamRequestBody()
-					collectCompactionStreamFrames(t, host)
 				} else {
-					for _, upstreamRequest := range host.requestSnapshot() {
-						if strings.HasSuffix(upstreamRequest.URL, translate.EndpointResponses) {
-							upstreamBody = upstreamRequest.Body
+					requests := host.requestSnapshot()
+					for index := len(requests) - 1; index >= 0; index-- {
+						if strings.HasSuffix(requests[index].URL, translate.EndpointResponses) {
+							upstreamBody = requests[index].Body
+							break
 						}
 					}
 				}
-				if got := gjson.GetBytes(upstreamBody, "input.0.id").String(); got != id64 {
-					t.Fatalf("upstream item ID changed: length=%d body=%s", len(got), upstreamBody)
+				if got := gjson.GetBytes(upstreamBody, `input.#(type==function_call).id`).String(); got != longItemID {
+					t.Fatalf("replayed Responses item ID changed: length=%d body=%s", len(got), upstreamBody)
 				}
-				if got := gjson.GetBytes(upstreamBody, "input.0.call_id").String(); got != callID64 {
-					t.Fatalf("upstream call ID changed: length=%d body=%s", len(got), upstreamBody)
+				if got := gjson.GetBytes(upstreamBody, `input.#(type==function_call).call_id`).String(); got != callID {
+					t.Fatalf("replayed Responses call ID changed: %q body=%s", got, upstreamBody)
+				}
+				if got := gjson.GetBytes(upstreamBody, `input.#(type==function_call_output).call_id`).String(); got != callID {
+					t.Fatalf("replayed Responses tool result call ID changed: %q body=%s", got, upstreamBody)
 				}
 			})
 		}
-	}
-}
-
-func TestResponsesToolIDLimitDoesNotApplyToChatEndpoint(t *testing.T) {
-	const model = "gpt-5.6-sol"
-	longID := strings.Repeat("i", 65)
-	longCallID := strings.Repeat("c", 65)
-	chatResponse := []byte(`{"id":"chatcmpl_test","object":"chat.completion","model":"` + model + `","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
-	host := newCompactionStreamHost(chatResponse)
-	service := New(host)
-	if err := service.Configure([]byte("model_endpoint_overrides:\n  " + model + ": /chat/completions\n")); err != nil {
-		t.Fatalf("configure service: %v", err)
-	}
-	_, generation := service.configSnapshot()
-	githubToken := "github-token-for-compaction-test"
-	service.tokenEntries["auth-id"] = copilotTokenEntry{
-		Token:            "copilot-token",
-		APIBaseURL:       "https://api.example",
-		ExpiresAt:        time.Now().Add(time.Hour),
-		Fingerprint:      tokenFingerprint(githubToken),
-		ConfigGeneration: generation,
-	}
-	payload, err := json.Marshal(map[string]any{
-		"model": model,
-		"input": []any{
-			map[string]any{"type": "function_call", "id": longID, "call_id": longCallID, "name": "inspect", "arguments": "{}"},
-			map[string]any{"type": "function_call_output", "call_id": longCallID, "output": "done"},
-		},
-	})
-	if err != nil {
-		t.Fatalf("encode request: %v", err)
-	}
-	if _, err := service.Execute(context.Background(), compactionStreamRequest(payload, "")); err != nil {
-		t.Fatalf("Chat endpoint rejected long Responses history IDs: %v", err)
-	}
-	var chatBody []byte
-	for _, request := range host.requestSnapshot() {
-		if strings.HasSuffix(request.URL, translate.EndpointChatCompletions) {
-			chatBody = request.Body
-		}
-	}
-	if len(chatBody) == 0 {
-		t.Fatal("Chat request was not sent upstream")
-	}
-	carrier := gjson.GetBytes(chatBody, "messages.0.tool_calls.0.id").String()
-	itemID, callID, ok := translate.DecodeClaudeToolIDs(carrier)
-	if !ok || itemID != longID || callID != longCallID {
-		t.Fatalf("Chat endpoint changed long history IDs: (%q, %q, %t); body=%s", itemID, callID, ok, chatBody)
-	}
-	if got := gjson.GetBytes(chatBody, "messages.1.tool_call_id").String(); got != carrier {
-		t.Fatalf("Chat tool output ID = %q, want matching carrier %q", got, carrier)
 	}
 }

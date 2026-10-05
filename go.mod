@@ -1,4 +1,4 @@
-module github.com/ririnto/cpa-copilot-bridge
+module github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin
 
 go 1.26.8
 

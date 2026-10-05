@@ -4,10 +4,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ririnto/cpa-copilot-bridge/internal/transport"
+	"github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin/internal/transport"
 )
 
-const providerID = "copilot-bridge"
+const providerID = "copilot"
 
 type Service struct {
 	host transport.Host

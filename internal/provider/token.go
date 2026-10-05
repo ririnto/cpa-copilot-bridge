@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ririnto/cpa-copilot-bridge/internal/redact"
-	"github.com/ririnto/cpa-copilot-bridge/internal/transport"
+	"github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin/internal/redact"
+	"github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin/internal/transport"
 )
 
 type copilotTokenResponse struct {

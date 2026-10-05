@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ririnto/cpa-copilot-bridge/internal/transport"
+	"github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin/internal/transport"
 )
 
 type tokenExchangeHost struct {

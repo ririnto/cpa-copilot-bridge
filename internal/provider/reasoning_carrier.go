@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/ririnto/cpa-copilot-bridge/internal/compact"
-	"github.com/ririnto/cpa-copilot-bridge/internal/translate"
+	"github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin/internal/compact"
+	"github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin/internal/translate"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )

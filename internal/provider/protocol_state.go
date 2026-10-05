@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ririnto/cpa-copilot-bridge/internal/translate"
+	"github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin/internal/translate"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	cliproxysession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
 )

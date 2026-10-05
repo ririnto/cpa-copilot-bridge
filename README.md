@@ -20,22 +20,22 @@ Build the host and plugin for the same operating system and architecture.
 go tool task check
 ```
 
-The native artifact is written to `build/plugins/<os>/<arch>/cpa-copilot-bridge.<ext>`.
+The native artifact is written to `build/plugins/<os>/<arch>/cliproxyapi-copilot.<ext>`.
 The extension is `dylib` on macOS, `so` on Linux, and `dll` on Windows.
-Copy the artifact into `<plugin-root>/<os>/<arch>/` and configure the host using [config.example.yaml](config.example.yaml).
+Copy the artifact into `<plugin-root>/<os>/<arch>/` and configure the host using [config.yaml](config/config.yaml).
 Restart the host after installing a new native library.
-The plugin identifier is `copilot-bridge`.
-The configuration key is the library basename, `cpa-copilot-bridge`.
+The plugin identifier is `copilot`.
+The configuration key is the library basename, `cliproxyapi-copilot`.
 
 ```yaml
 plugins:
   enabled: true
   dir: ./plugins
   configs:
-    cpa-copilot-bridge:
+    cliproxyapi-copilot:
       enabled: true
       reasoning_replay: true
-      prompt_cache_key: false
+      prompt_cache_key: true
       compaction_models: []
       model_endpoint_overrides: {}
 ```
@@ -45,7 +45,7 @@ Protect the host management endpoint with its configured management key.
 
 ## Login
 
-Use the host OAuth management API with `provider=copilot-bridge`.
+Use the host OAuth management API with `provider=copilot`.
 The plugin starts GitHub device authorization and exchanges the approved credential for a Copilot API token.
 The host stores the GitHub credential through its normal auth storage.
 The plugin refreshes short-lived Copilot tokens in memory.
@@ -64,7 +64,7 @@ The bridge treats GitHub's `invalid_grant` marker as a terminal refresh failure.
 The bridge preserves GitHub's 400 or 401 status and omits the upstream response body.
 
 ```text
-GET /v8/management/oauth/auth-url?provider=copilot-bridge
+GET /v8/management/oauth/auth-url?provider=copilot
 GET /v8/management/oauth/status?state=<returned-state>
 ```
 
@@ -116,10 +116,9 @@ The bridge preserves native content blocks, block order, and opaque identifiers 
 Across formats, the bridge translates supported tool-call input and carries opaque reasoning through reversible carriers.
 Responses-to-Chat routes use a reversible carrier when item and call IDs differ or are unsafe.
 Matching tool-result IDs reuse the carrier across later turns.
-The Copilot Responses endpoint accepts native item and call IDs up to 64 characters.
-It rejects either native ID when it exceeds that boundary.
-Chat and Claude carriers can exceed 64 characters when they encode a valid pair of native IDs.
-This carrier length is distinct from the limit on each native Responses ID.
+Copilot can issue opaque tool item IDs longer than 64 characters.
+The bridge preserves them and lets Copilot validate native request IDs.
+Chat and Claude carriers preserve separate item and call IDs without truncation.
 Malformed or unknown reserved carrier versions fail closed.
 For Chat opaque state, the inner carrier preserves the exact opaque JSON value.
 The authenticated outer wrapper binds Chat replay to the selected auth entry, API origin, model, and endpoint.
@@ -134,7 +133,6 @@ The bridge rejects non-empty blocks without a target mapping instead of dropping
 Opaque replay requires the matching Copilot scope and a unique assistant or tool-call anchor.
 The bridge rejects opaque conversions that cannot retain verification data and tool identifiers it cannot represent safely.
 Foreign signed or encrypted reasoning sent to Chat returns HTTP 422 instead of placeholder text.
-Native Responses item or call IDs over 64 characters return HTTP 422 with a clear error before model dispatch.
 The bridge preflights request, response, and SSE shapes and returns errors when conversion would drop content.
 Native Responses routes preserve `previous_response_id` references.
 Chat Completions and Messages routes cannot resolve server-side Responses context.
@@ -153,7 +151,7 @@ Claude-to-Responses requests use `reasoning.summary=auto` and the mapped reasoni
 Responses-to-Claude conversion accepts `encrypted_index` citation annotations.
 Other citation annotations and unknown meaningful output blocks return errors.
 Claude cache hints use Responses implicit prefix caching regardless of `prompt_cache_key` configuration.
-The opt-in setting adds a stable caller or session root key, with caller keys taking priority.
+The setting defaults to true and adds a stable caller or session root key, with caller keys taking priority.
 The bridge omits generated keys without stable session identity.
 Responses caching cannot reproduce Claude's exact TTL.
 Stream conversion reconciles terminal-only output and usage before closing the client stream.
@@ -174,7 +172,8 @@ This in-memory cache does not survive process restarts.
 ## Prompt Cache Keys
 
 Upstream CLIProxyAPI v8.0.15 supports `support-prompt-cache-key: true` for OpenAI-compatible providers.
-The bridge has a separate opt-in setting, `prompt_cache_key`, for Responses requests.
+The bridge defaults `prompt_cache_key` to true for Responses requests.
+Set it to false to omit generated cache keys.
 The bridge uses an explicit caller key when one exists.
 Otherwise, the bridge derives a stable key from the SDK session identity.
 The bridge scopes that key to the auth entry, model, Copilot API origin, endpoint, and agent.

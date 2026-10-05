@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/ririnto/cpa-copilot-bridge/internal/compact"
+	"github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin/internal/compact"
 )
 
 const continuityKeyringVersion = 1

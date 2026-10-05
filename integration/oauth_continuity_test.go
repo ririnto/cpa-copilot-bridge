@@ -78,7 +78,7 @@ type persistedOAuthStorage struct {
 func legacyOAuthAuthFixtureJSON(t *testing.T) []byte {
 	t.Helper()
 	storage := map[string]any{
-		"type":                     "copilot-bridge",
+		"type":                     "copilot",
 		"github_access_token":      "fixture-old-github-token",
 		"github_refresh_token":     "fixture-refresh-token",
 		"github_login":             "fixture",

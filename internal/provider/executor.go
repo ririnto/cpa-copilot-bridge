@@ -7,11 +7,11 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/ririnto/cpa-copilot-bridge/internal/compact"
-	"github.com/ririnto/cpa-copilot-bridge/internal/redact"
-	"github.com/ririnto/cpa-copilot-bridge/internal/sse"
-	"github.com/ririnto/cpa-copilot-bridge/internal/translate"
-	"github.com/ririnto/cpa-copilot-bridge/internal/transport"
+	"github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin/internal/compact"
+	"github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin/internal/redact"
+	"github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin/internal/sse"
+	"github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin/internal/translate"
+	"github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin/internal/transport"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
@@ -125,11 +125,6 @@ func (s *Service) Execute(ctx context.Context, req ExecuteRequest) (pluginapi.Ex
 		requestBody, errTranslate = setPromptCacheKey(requestBody, cacheKey)
 		if errTranslate != nil {
 			return pluginapi.ExecutorResponse{}, statusError("translation_error", errTranslate.Error(), http.StatusUnprocessableEntity)
-		}
-	}
-	if endpoint == translate.EndpointResponses {
-		if errValidate := translate.ValidateCopilotResponsesToolIDLengths(requestBody); errValidate != nil {
-			return pluginapi.ExecutorResponse{}, statusError("responses_tool_id_too_long", errValidate.Error(), http.StatusUnprocessableEntity)
 		}
 	}
 	resp, token, errDo := s.doModelRequest(ctx, req.HostCallbackID, req.AuthID, storage, token, endpoint, requestBody, false)
@@ -267,11 +262,6 @@ func (s *Service) ExecuteStream(ctx context.Context, req ExecuteRequest) (http.H
 		requestBody, errTranslate = setPromptCacheKey(requestBody, cacheKey)
 		if errTranslate != nil {
 			return nil, statusError("translation_error", errTranslate.Error(), http.StatusUnprocessableEntity)
-		}
-	}
-	if endpoint == translate.EndpointResponses {
-		if errValidate := translate.ValidateCopilotResponsesToolIDLengths(requestBody); errValidate != nil {
-			return nil, statusError("responses_tool_id_too_long", errValidate.Error(), http.StatusUnprocessableEntity)
 		}
 	}
 	upstream, token, errOpen := s.openModelStream(ctx, req.HostCallbackID, req.AuthID, storage, token, endpoint, requestBody)

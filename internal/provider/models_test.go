@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ririnto/cpa-copilot-bridge/internal/translate"
+	"github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin/internal/translate"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 

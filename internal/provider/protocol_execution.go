@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/ririnto/cpa-copilot-bridge/internal/translate"
+	"github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin/internal/translate"
 )
 
 func (s *Service) compactionEnabled(model string) bool {

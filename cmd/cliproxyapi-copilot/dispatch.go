@@ -6,7 +6,7 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/ririnto/cpa-copilot-bridge/internal/provider"
+	"github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin/internal/provider"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
@@ -96,7 +96,7 @@ func dispatch(method string, request []byte) (any, error) {
 		}
 		return pluginService.ModelsForAuth(ctx, req.HostCallbackID, req.AuthModelRequest)
 	case pluginabi.MethodAuthIdentifier, pluginabi.MethodExecutorIdentifier:
-		return identifierResponse{Identifier: "copilot-bridge"}, nil
+		return identifierResponse{Identifier: "copilot"}, nil
 	case pluginabi.MethodAuthParse:
 		var req pluginapi.AuthParseRequest
 		if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
@@ -162,10 +162,10 @@ func pluginRegistration() registration {
 	return registration{
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
-			Name:             "Copilot Bridge",
+			Name:             "GitHub Copilot subscription provider",
 			Version:          pluginVersion,
-			Author:           "ririnto",
-			GitHubRepository: "https://github.com/ririnto/cpa-copilot-bridge",
+			Author:           "self-owned",
+			GitHubRepository: "https://github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin",
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "github_client_id", Type: pluginapi.ConfigFieldTypeString, Description: "Public GitHub OAuth application client identifier used for device flow."},
 				{Name: "github_scope", Type: pluginapi.ConfigFieldTypeString, Description: "Space-delimited GitHub OAuth scopes; defaults to the least-privilege read:user scope."},

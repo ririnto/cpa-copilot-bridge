@@ -22,7 +22,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ririnto/cpa-copilot-bridge/internal/translate"
+	"github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin/internal/translate"
 )
 
 type fixture struct {
@@ -52,14 +52,15 @@ const (
 )
 
 var (
-	fixtureResponsesFunctionItemID = "opaque/+" + strings.Repeat("x", 64-len("opaque/+"))
+	fixtureResponsesFunctionItemID = strings.Repeat("f", 424)
 	fixtureResponsesReasoningID    = "reasoning/+" + strings.Repeat("r", 64-len("reasoning/+"))
+	fixtureResponsesCallID         = strings.Repeat("c", 29)
 	matrixChatCallID               = "chat-call/+" + strings.Repeat("h", 64-len("chat-call/+"))
-	matrixResponseItemID           = "fc-item/+" + strings.Repeat("i", 64-len("fc-item/+"))
-	matrixResponseCallID           = "fc-call/+" + strings.Repeat("c", 64-len("fc-call/+"))
+	matrixResponseItemID           = strings.Repeat("i", 424)
+	matrixResponseCallID           = strings.Repeat("c", 29)
 	matrixMessagesToolID           = "toolu_provider_" + strings.Repeat("p", 64-len("toolu_provider_"))
-	matrixInitialItemID            = "fc-initial/+" + strings.Repeat("j", 64-len("fc-initial/+"))
-	matrixInitialCallID            = "call-initial/+" + strings.Repeat("k", 64-len("call-initial/+"))
+	matrixInitialItemID            = strings.Repeat("j", 424)
+	matrixInitialCallID            = strings.Repeat("k", 29)
 )
 
 type matrixRoute struct {
@@ -93,8 +94,8 @@ func TestNativeHostProtocolRoundTrips(t *testing.T) {
 	longID := fixtureResponsesFunctionItemID
 	items := []any{
 		map[string]any{"type": "reasoning", "id": fixtureResponsesReasoningID, "summary": []any{}, "encrypted_content": "copilot-opaque/+not-fernet"},
-		map[string]any{"type": "function_call", "id": longID, "call_id": "call/+", "name": "inspect", "arguments": "{}"},
-		map[string]any{"type": "function_call_output", "call_id": "call/+", "output": "ok"},
+		map[string]any{"type": "function_call", "id": longID, "call_id": fixtureResponsesCallID, "name": "inspect", "arguments": "{}"},
+		map[string]any{"type": "function_call_output", "call_id": fixtureResponsesCallID, "output": "ok"},
 	}
 	for _, stream := range []bool{false, true} {
 		t.Run(fmt.Sprintf("ResponsesStream%v", stream), func(t *testing.T) {
@@ -107,7 +108,7 @@ func TestNativeHostProtocolRoundTrips(t *testing.T) {
 			if captured["previous_response_id"] != request["previous_response_id"] || captured["prompt_cache_key"] != "caller-key" || captured["temperature"] != 0.6 {
 				t.Fatalf("native request state changed: %+v", captured)
 			}
-			if !bytes.Contains(response, []byte("copilot-opaque/+not-fernet")) || !bytes.Contains(response, []byte(longID)) {
+			if !bytes.Contains(response, []byte("copilot-opaque/+not-fernet")) || !bytes.Contains(response, []byte(longID)) || !bytes.Contains(response, []byte(fixtureResponsesCallID)) {
 				t.Fatalf("native output lost opaque state: %s", response)
 			}
 			if stream && bytes.Count(response, []byte(`"type":"response.completed"`)) != 1 {
@@ -118,8 +119,8 @@ func TestNativeHostProtocolRoundTrips(t *testing.T) {
 	t.Run("ResponsesClientRemovedItemIDs", func(t *testing.T) {
 		withoutIDs := []any{
 			map[string]any{"type": "reasoning", "summary": []any{}, "encrypted_content": "copilot-opaque/+not-fernet"},
-			map[string]any{"type": "function_call", "call_id": "call/+", "name": "inspect", "arguments": "{}"},
-			map[string]any{"type": "function_call_output", "call_id": "call/+", "output": "ok"},
+			map[string]any{"type": "function_call", "call_id": fixtureResponsesCallID, "name": "inspect", "arguments": "{}"},
+			map[string]any{"type": "function_call_output", "call_id": fixtureResponsesCallID, "output": "ok"},
 		}
 		callProxy(t, base+"/v1/responses", map[string]any{"model": "bridge-responses", "input": withoutIDs})
 		state.mu.Lock()
@@ -410,7 +411,7 @@ func (f *fixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		output := []any{
 			map[string]any{"type": "reasoning", "id": fixtureResponsesReasoningID, "summary": []any{}, "encrypted_content": "copilot-opaque/+not-fernet"},
-			map[string]any{"type": "function_call", "id": fixtureResponsesFunctionItemID, "call_id": "call/+", "name": "inspect", "arguments": "{}", "status": "completed"},
+			map[string]any{"type": "function_call", "id": fixtureResponsesFunctionItemID, "call_id": fixtureResponsesCallID, "name": "inspect", "arguments": "{}", "status": "completed"},
 		}
 		if request["tool_choice"] == "none" {
 			output = []any{map[string]any{"type": "message", "id": "msg_summary", "status": "completed", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "The active goal is to finish the native host bridge. The next step is integration."}}}}
@@ -576,11 +577,11 @@ func startProxyInRoot(t *testing.T, binary, upstream, root string, authJSON []by
 	if runtime.GOOS == "windows" {
 		ext = ".dll"
 	}
-	artifact, err := os.ReadFile(filepath.Join("..", "build", "plugins", runtime.GOOS, runtime.GOARCH, "cpa-copilot-bridge"+ext))
+	artifact, err := os.ReadFile(filepath.Join("..", "build", "plugins", runtime.GOOS, runtime.GOARCH, "cliproxyapi-copilot"+ext))
 	if err != nil {
 		t.Fatalf("run go tool task build before host integration: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(pluginDir, "cpa-copilot-bridge"+ext), artifact, 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(pluginDir, "cliproxyapi-copilot"+ext), artifact, 0600); err != nil {
 		t.Fatal(err)
 	}
 	authDir := filepath.Join(root, "auths")
@@ -598,7 +599,7 @@ func startProxyInRoot(t *testing.T, binary, upstream, root string, authJSON []by
 	} else if err != nil {
 		t.Fatal(err)
 	}
-	config := fmt.Sprintf("config-version: 8\nserver:\n  host: 127.0.0.1\n  port: %d\nmanagement:\n  disable-control-panel: true\n  secret-key: %q\naccess:\n  api-keys: [fixture-client-key]\noauth:\n  auth-dir: %q\nplugins:\n  enabled: true\n  dir: %q\n  configs:\n    cpa-copilot-bridge:\n      enabled: true\n      allow_insecure_base_urls: true\n      compaction_models: [bridge-responses]\n      reasoning_replay: true\n      github_base_url: %q\n      github_api_url: %q\n      copilot_api_url: %q\n", port, managementSecret, authDir, filepath.Join(root, "plugins"), upstream, upstream, upstream)
+	config := fmt.Sprintf("config-version: 8\nserver:\n  host: 127.0.0.1\n  port: %d\nmanagement:\n  disable-control-panel: true\n  secret-key: %q\naccess:\n  api-keys: [fixture-client-key]\noauth:\n  auth-dir: %q\nplugins:\n  enabled: true\n  dir: %q\n  configs:\n    cliproxyapi-copilot:\n      enabled: true\n      allow_insecure_base_urls: true\n      compaction_models: [bridge-responses]\n      reasoning_replay: true\n      github_base_url: %q\n      github_api_url: %q\n      copilot_api_url: %q\n", port, managementSecret, authDir, filepath.Join(root, "plugins"), upstream, upstream, upstream)
 	configPath := filepath.Join(root, "config.yaml")
 	if err := os.WriteFile(configPath, []byte(config), 0600); err != nil {
 		t.Fatal(err)
@@ -651,7 +652,7 @@ func nativeAuthFixtureJSON(t *testing.T) []byte {
 	token := "fixture-github-token"
 	fingerprint := sha256.Sum256([]byte(token))
 	storage := map[string]any{
-		"type":                "copilot-bridge",
+		"type":                "copilot",
 		"github_access_token": token,
 		"github_login":        "fixture",
 		"github_user_id":      4242,
