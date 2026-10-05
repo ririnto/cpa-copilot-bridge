@@ -46,6 +46,7 @@ func DefaultConfig() Config {
 		ModelCacheTTLSeconds:     600,
 		TokenExpiryBufferSeconds: 300,
 		ModelEndpointOverrides:   map[string]string{},
+		PromptCacheKey:           true,
 		ReasoningReplay:          true,
 	}
 }

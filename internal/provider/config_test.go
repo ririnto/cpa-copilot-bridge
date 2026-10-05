@@ -8,7 +8,6 @@ model_endpoint_overrides:
   GPT-Model: responses
   chat-model: chat
 compaction_models: [ GPT-Model, " chat-model ", GPT-Model ]
-prompt_cache_key: true
 `))
 	if err != nil {
 		t.Fatalf("parse config: %v", err)
@@ -21,6 +20,25 @@ prompt_cache_key: true
 	}
 	if !config.PromptCacheKey || !config.ReasoningReplay {
 		t.Fatalf("prompt cache/reasoning replay defaults = %v/%v", config.PromptCacheKey, config.ReasoningReplay)
+	}
+}
+
+func TestDefaultConfigEnablesPromptCacheKey(t *testing.T) {
+	if !DefaultConfig().PromptCacheKey {
+		t.Fatal("default config must enable prompt cache keys")
+	}
+	if !New(nil).Config().PromptCacheKey {
+		t.Fatal("new service must enable prompt cache keys by default")
+	}
+}
+
+func TestParseConfigCanDisablePromptCacheKey(t *testing.T) {
+	config, err := ParseConfig([]byte("prompt_cache_key: false\n"))
+	if err != nil {
+		t.Fatalf("parse config: %v", err)
+	}
+	if config.PromptCacheKey {
+		t.Fatal("explicit false must disable prompt cache keys")
 	}
 }
 
