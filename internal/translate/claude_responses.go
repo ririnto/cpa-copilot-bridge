@@ -112,12 +112,19 @@ func claudeRequestToResponses(model string, body []byte, stream bool) ([]byte, e
 		}
 		role := stringValue(message["role"])
 		if role == "system" {
-			if _, okMarker, errMarker := claudeOutputConfigMarker(message); errMarker != nil {
-				return nil, errMarker
-			} else if okMarker {
-				continue
+			if _, hasOutputConfig := message["output_config"]; hasOutputConfig {
+				if _, okMarker, errMarker := claudeOutputConfigMarker(message); errMarker != nil {
+					return nil, errMarker
+				} else if okMarker {
+					continue
+				}
 			}
-			return nil, fmt.Errorf("unsupported Claude system message")
+			systemInput, errSystem := claudeSystemMessageToResponses(message)
+			if errSystem != nil {
+				return nil, errSystem
+			}
+			input = append(input, systemInput)
+			continue
 		}
 		if role != "user" && role != "assistant" {
 			if role != "" || hasMeaningfulValue(message["content"]) {
@@ -444,12 +451,14 @@ func claudeMessageEffortMarker(messages []any) (string, bool, error) {
 	for _, rawMessage := range messages {
 		message, ok := rawMessage.(map[string]any)
 		if ok && stringValue(message["role"]) == "system" {
-			markerEffort, okMarker, err := claudeOutputConfigMarker(message)
-			if err != nil {
-				return "", false, err
-			}
-			if okMarker {
-				effort, found = markerEffort, true
+			if _, exists := message["output_config"]; exists {
+				markerEffort, okMarker, err := claudeOutputConfigMarker(message)
+				if err != nil {
+					return "", false, err
+				}
+				if okMarker {
+					effort, found = markerEffort, true
+				}
 			}
 		}
 	}
@@ -482,6 +491,53 @@ func claudeOutputConfigMarker(message map[string]any) (string, bool, error) {
 	default:
 		return "", false, fmt.Errorf("unsupported Claude system reasoning effort")
 	}
+}
+
+func claudeSystemMessageToResponses(message map[string]any) (map[string]any, error) {
+	for field := range message {
+		switch field {
+		case "role", "content", "cache_control":
+		case "clear_at":
+			return nil, fmt.Errorf("unsupported Claude mid-conversation system clear_at")
+		default:
+			return nil, fmt.Errorf("unsupported Claude system message field %q", field)
+		}
+	}
+	parts, err := claudeContentPartsStrict(message["content"])
+	if err != nil {
+		return nil, err
+	}
+	content := make([]any, 0, len(parts))
+	lastText := -1
+	for _, part := range parts {
+		if stringValue(part["type"]) != "text" {
+			return nil, fmt.Errorf("unsupported non-text Claude system block type %q", stringValue(part["type"]))
+		}
+		for field := range part {
+			if field != "type" && field != "text" && field != "cache_control" {
+				return nil, fmt.Errorf("unsupported Claude system text block field %q", field)
+			}
+		}
+		text, okText := part["text"].(string)
+		if !okText {
+			return nil, fmt.Errorf("Claude system text block has no string text")
+		}
+		item := map[string]any{"type": "input_text", "text": text}
+		if cacheControl, exists := part["cache_control"]; exists {
+			item["cache_control"] = cacheControl
+		}
+		content = append(content, item)
+		lastText = len(content) - 1
+	}
+	if cacheControl, exists := message["cache_control"]; exists {
+		if lastText < 0 {
+			return nil, fmt.Errorf("Claude system message cache_control has no text block to preserve")
+		}
+		if _, exists := objectValue(content[lastText])["cache_control"]; !exists {
+			objectValue(content[lastText])["cache_control"] = cacheControl
+		}
+	}
+	return map[string]any{"type": "message", "role": "system", "content": content}, nil
 }
 
 func claudeContentParts(value any) []map[string]any {

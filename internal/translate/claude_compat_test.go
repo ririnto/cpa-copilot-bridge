@@ -222,6 +222,70 @@ func TestClaudeOutputConfigEffortMarkerIsNormalizedWithoutDroppingMessages(t *te
 	}
 }
 
+func TestClaudeMidConversationSystemMessagePreservesOrderAndCacheControl(t *testing.T) {
+	const model = "gemini-3.8-flash"
+	requestBody := []byte(`{"system":[{"type":"text","text":"root cached prefix","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":"Find a value."},{"role":"system","content":[{"type":"text","text":"Check the result carefully."},{"type":"text","text":"Keep this instruction cached.","cache_control":{"type":"ephemeral"}}]},{"role":"assistant","content":[{"type":"text","text":"I will look it up."},{"type":"tool_use","id":"toolu_lookup_1","name":"lookup","input":{"query":"value"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_lookup_1","content":"found"},{"type":"text","text":"Continue."}]}]}`)
+	intermediate, err := claudeRequestToResponses(model, requestBody, false)
+	if err != nil {
+		t.Fatalf("translate Claude request to Responses input: %v", err)
+	}
+	input := gjson.GetBytes(intermediate, "input").Array()
+	if len(input) != 7 {
+		t.Fatalf("Responses input has %d items, want 7; request=%s", len(input), intermediate)
+	}
+	if input[0].Get("role").String() != "system" || input[0].Get("content.0.text").String() != "root cached prefix" {
+		t.Fatalf("root cached system prefix moved: %s", intermediate)
+	}
+	if input[1].Get("role").String() != "user" || input[1].Get("content.0.text").String() != "Find a value." {
+		t.Fatalf("initial user message moved: %s", intermediate)
+	}
+	if input[2].Get("role").String() != "system" || input[2].Get("content.0.text").String() != "Check the result carefully." || input[2].Get("content.1.text").String() != "Keep this instruction cached." {
+		t.Fatalf("mid-conversation system content or order changed: %s", intermediate)
+	}
+	if input[2].Get("content.1.cache_control.type").String() != "ephemeral" {
+		t.Fatalf("mid-conversation cache_control was lost: %s", intermediate)
+	}
+	if input[3].Get("role").String() != "assistant" || input[4].Get("type").String() != "function_call" || input[5].Get("type").String() != "function_call_output" || input[6].Get("role").String() != "user" {
+		t.Fatalf("assistant and tool turn order changed: %s", intermediate)
+	}
+	chatRequest, err := RequestForEndpointFrom("claude", model, requestBody, false, EndpointChatCompletions)
+	if err != nil {
+		t.Fatalf("translate Claude request to Chat: %v", err)
+	}
+	messages := gjson.GetBytes(chatRequest, "messages").Array()
+	if len(messages) != 6 || messages[0].Get("role").String() != "system" || messages[1].Get("role").String() != "user" || messages[2].Get("role").String() != "system" || messages[3].Get("role").String() != "assistant" || messages[4].Get("role").String() != "tool" || messages[5].Get("role").String() != "user" {
+		t.Fatalf("Chat message order changed: %s", chatRequest)
+	}
+	if messages[2].Get("content.0.text").String() != "Check the result carefully." || messages[2].Get("content.1.text").String() != "Keep this instruction cached." || messages[2].Get("content.1.cache_control.type").String() != "ephemeral" {
+		t.Fatalf("Chat mid-conversation system content or cache boundary changed: %s", chatRequest)
+	}
+}
+
+func TestClaudeMidConversationSystemMessageRejectsUnsupportedSemantics(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "clear_at",
+			body: `{"messages":[{"role":"user","content":"start"},{"role":"system","content":"temporary instruction","clear_at":"next_user_message"}]}`,
+			want: "clear_at",
+		},
+		{
+			name: "tool_addition",
+			body: `{"messages":[{"role":"user","content":"start"},{"role":"system","content":[{"type":"tool_addition","tools":[] }]}]}`,
+			want: "tool_addition",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := claudeRequestToResponses("gpt-test", []byte(test.body), false); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("unsupported system semantics error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestNativeProtocolPassthroughPreservesToolIDs(t *testing.T) {
 	responsesRequest := []byte(`{"model":"old","stream":false,"input":[{"type":"function_call","id":"fc+opaque/1","call_id":"call+opaque/1","name":"lookup","arguments":"{}"}]}`)
 	translatedRequest, err := RequestForEndpointFrom("openai-response", "new", responsesRequest, true, EndpointResponses)

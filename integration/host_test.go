@@ -380,6 +380,193 @@ func TestNativeHostProtocolRoundTrips(t *testing.T) {
 			}
 		}
 	})
+	t.Run("ClaudeCodeMessagesToChatAndResponses", func(t *testing.T) {
+		routes := []matrixRoute{
+			{name: "ClaudeCodeToGeminiChat", clientFormat: "claude", model: matrixChatModel, upstreamPath: "/chat/completions"},
+			{name: "ClaudeCodeToLunaResponses", clientFormat: "claude", model: matrixResponsesModel, upstreamPath: "/responses"},
+		}
+		for _, route := range routes {
+			for _, stream := range []bool{false, true} {
+				route, stream := route, stream
+				t.Run(fmt.Sprintf("%s/Stream%v", route.name, stream), func(t *testing.T) {
+					response := callProxyWithSession(t, base+"/v1/messages", nativeClaudeCodeRequest(route.model, stream), fmt.Sprintf("claude-code-%s-%t", route.model, stream))
+					if stream && !bytes.Contains(response, []byte("message_stop")) {
+						t.Fatalf("Claude stream omitted message_stop: %s", response)
+					}
+					captured, path := lastUpstreamRequest(t, state)
+					assertNativeClaudeCodeRequest(t, route, captured, path, stream)
+				})
+			}
+		}
+	})
+}
+
+func nativeClaudeCodeRequest(model string, stream bool) map[string]any {
+	return map[string]any{
+		"model":            model,
+		"max_tokens":       512,
+		"stream":           stream,
+		"prompt_cache_key": "claude-code-native-cache-key",
+		"system": []any{
+			map[string]any{"type": "text", "text": "Synthetic Claude Code base instructions."},
+			map[string]any{"type": "text", "text": "Synthetic cached workspace rules.", "cache_control": map[string]any{"type": "ephemeral"}},
+		},
+		"tools": []any{
+			map[string]any{"name": "Read", "description": "Read a synthetic fixture file.", "input_schema": map[string]any{"type": "object", "properties": map[string]any{"file_path": map[string]any{"type": "string"}}, "required": []any{"file_path"}}},
+			map[string]any{"name": "Bash", "description": "Run a synthetic command.", "input_schema": map[string]any{"type": "object", "properties": map[string]any{"command": map[string]any{"type": "string"}}, "required": []any{"command"}}},
+		},
+		"tool_choice": map[string]any{"type": "auto"},
+		"messages": []any{
+			map[string]any{"role": "user", "content": "Synthetic request before the system update."},
+			map[string]any{"role": "system", "content": "Synthetic mid-conversation safety instruction."},
+			map[string]any{"role": "assistant", "content": []any{
+				map[string]any{"type": "text", "text": "I will inspect the synthetic fixture."},
+				map[string]any{"type": "tool_use", "id": "toolu_read_fixture", "name": "Read", "input": map[string]any{"file_path": "fixture.txt"}},
+			}},
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "tool_result", "tool_use_id": "toolu_read_fixture", "content": "Synthetic fixture contents."},
+				map[string]any{"type": "text", "text": "Continue using the fixture contents."},
+			}},
+		},
+	}
+}
+
+func assertNativeClaudeCodeRequest(t *testing.T, route matrixRoute, captured map[string]any, path string, stream bool) {
+	t.Helper()
+	assertMatrixRoute(t, route, captured, path, stream)
+	tools := jsonObjects(captured["tools"])
+	for _, want := range []struct {
+		name     string
+		property string
+	}{
+		{name: "Read", property: "file_path"},
+		{name: "Bash", property: "command"},
+	} {
+		var parameters map[string]any
+		for _, tool := range tools {
+			if tool["type"] != "function" {
+				continue
+			}
+			if route.upstreamPath == "/responses" && tool["name"] == want.name {
+				parameters, _ = tool["parameters"].(map[string]any)
+			}
+			if route.upstreamPath == "/chat/completions" {
+				function, _ := tool["function"].(map[string]any)
+				if function["name"] == want.name {
+					parameters, _ = function["parameters"].(map[string]any)
+				}
+			}
+		}
+		if parameters == nil {
+			t.Fatalf("Claude function tool %q was removed: %+v", want.name, captured["tools"])
+		}
+		if !containsJSONScalar(parameters, want.property) {
+			t.Fatalf("Claude tool %q lost its input schema: %+v", want.name, parameters)
+		}
+	}
+	if stringValue(captured["tool_choice"]) != "auto" {
+		t.Fatalf("Claude automatic tool choice changed: %+v", captured["tool_choice"])
+	}
+	if captured["prompt_cache_key"] != "claude-code-native-cache-key" {
+		t.Fatalf("Claude prompt cache key changed: %+v", captured["prompt_cache_key"])
+	}
+	if route.upstreamPath == "/chat/completions" {
+		messages := jsonObjects(captured["messages"])
+		globalSystem := nativeClaudeMessageIndex(messages, "system", "Synthetic Claude Code base instructions.")
+		cachedSystem := nativeClaudeMessageIndex(messages, "system", "Synthetic cached workspace rules.")
+		firstUser := nativeClaudeMessageIndex(messages, "user", "Synthetic request before the system update.")
+		midSystem := nativeClaudeMessageIndex(messages, "system", "Synthetic mid-conversation safety instruction.")
+		assistant := nativeClaudeMessageIndex(messages, "assistant", "I will inspect the synthetic fixture.")
+		toolCall, toolCallID := nativeClaudeToolCallIndex(messages, "Read")
+		toolResult := nativeClaudeToolResultIndex(messages, toolCallID, "Synthetic fixture contents.")
+		continuation := nativeClaudeMessageIndex(messages, "user", "Continue using the fixture contents.")
+		if globalSystem < 0 || cachedSystem < 0 || firstUser < 0 || midSystem < 0 || assistant < 0 || toolCall < 0 || toolCallID == "" || toolResult < 0 || continuation < 0 || !(globalSystem < firstUser && firstUser < midSystem && midSystem < assistant && assistant <= toolCall && toolCall < toolResult && toolResult < continuation) {
+			t.Fatalf("Claude Chat request changed system-message order or tool history: indexes=%d,%d,%d,%d,%d,%d,%d,%q messages=%+v", globalSystem, cachedSystem, firstUser, midSystem, assistant, toolCall, toolResult, toolCallID, messages)
+		}
+		if !nativeClaudeCacheControlForText(jsonObjects(messages[globalSystem]["content"]), "Synthetic cached workspace rules.") {
+			t.Fatalf("Claude Chat request lost the top-level system cache boundary: %+v", messages[globalSystem])
+		}
+		return
+	}
+	items := jsonObjects(captured["input"])
+	globalSystem := nativeResponsesMessageIndex(items, "system", "Synthetic Claude Code base instructions.")
+	cachedSystem := nativeResponsesMessageIndex(items, "system", "Synthetic cached workspace rules.")
+	firstUser := nativeResponsesMessageIndex(items, "user", "Synthetic request before the system update.")
+	midSystem := nativeResponsesMessageIndex(items, "system", "Synthetic mid-conversation safety instruction.")
+	assistant := nativeResponsesMessageIndex(items, "assistant", "I will inspect the synthetic fixture.")
+	toolCall, toolCallID := nativeResponsesToolCallIndex(items, "Read")
+	toolResult := nativeResponsesToolResultIndex(items, toolCallID, "Synthetic fixture contents.")
+	continuation := nativeResponsesMessageIndex(items, "user", "Continue using the fixture contents.")
+	if globalSystem < 0 || cachedSystem < 0 || firstUser < 0 || midSystem < 0 || assistant < 0 || toolCall < 0 || toolCallID == "" || toolResult < 0 || continuation < 0 || !(globalSystem < firstUser && firstUser < midSystem && midSystem < assistant && assistant < toolCall && toolCall < toolResult && toolResult < continuation) {
+		t.Fatalf("Claude Responses request changed system-message order or tool history: %+v", items)
+	}
+}
+
+func nativeClaudeMessageIndex(messages []map[string]any, role, text string) int {
+	for index, message := range messages {
+		if message["role"] == role && containsJSONScalar(message["content"], text) {
+			return index
+		}
+	}
+	return -1
+}
+
+func nativeClaudeToolCallIndex(messages []map[string]any, name string) (int, string) {
+	for index, message := range messages {
+		for _, call := range jsonObjects(message["tool_calls"]) {
+			function, _ := call["function"].(map[string]any)
+			if function["name"] == name {
+				return index, stringValue(call["id"])
+			}
+		}
+	}
+	return -1, ""
+}
+
+func nativeClaudeToolResultIndex(messages []map[string]any, callID, text string) int {
+	for index, message := range messages {
+		if message["role"] == "tool" && message["tool_call_id"] == callID && containsJSONScalar(message["content"], text) {
+			return index
+		}
+	}
+	return -1
+}
+
+func nativeResponsesMessageIndex(items []map[string]any, role, text string) int {
+	for index, item := range items {
+		if item["type"] == "message" && item["role"] == role && containsJSONScalar(item["content"], text) {
+			return index
+		}
+	}
+	return -1
+}
+
+func nativeResponsesToolCallIndex(items []map[string]any, name string) (int, string) {
+	for index, item := range items {
+		if item["type"] == "function_call" && item["name"] == name {
+			return index, stringValue(item["call_id"])
+		}
+	}
+	return -1, ""
+}
+
+func nativeResponsesToolResultIndex(items []map[string]any, callID, text string) int {
+	for index, item := range items {
+		if item["type"] == "function_call_output" && item["call_id"] == callID && containsJSONScalar(item["output"], text) {
+			return index
+		}
+	}
+	return -1
+}
+
+func nativeClaudeCacheControlForText(blocks []map[string]any, text string) bool {
+	for _, block := range blocks {
+		cacheControl, _ := block["cache_control"].(map[string]any)
+		if block["text"] == text && cacheControl["type"] == "ephemeral" {
+			return true
+		}
+	}
+	return false
 }
 
 func TestNativeHostOAuthExcludedModelsFilterPluginModels(t *testing.T) {
