@@ -3,6 +3,7 @@ package translate
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -221,6 +222,41 @@ func TestClaudeMessagesResponseToolInputFeedsResponsesCustomTools(t *testing.T) 
 			}
 			if got := gjson.GetBytes(response, "output.0.input").String(); got != test.wantInput {
 				t.Fatalf("Responses custom tool input = %q, want exact raw input %q; response=%s", got, test.wantInput, response)
+			}
+		})
+	}
+}
+
+func TestCopilotResponsesToolIDLengthPreflight(t *testing.T) {
+	const id64 = "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii"
+	const callID64 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	valid := []byte(`{"input":[{"type":"message","id":"` + id64 + `"},{"type":"function_call","id":"` + id64 + `","call_id":"` + callID64 + `"},{"type":"custom_tool_call","id":"` + id64 + `","call_id":"` + callID64 + `"},{"type":"function_call_output","id":"` + id64 + `","call_id":"` + callID64 + `"},{"type":"custom_tool_call_output","id":"` + id64 + `","call_id":"` + callID64 + `"}]}`)
+	if err := ValidateCopilotResponsesToolIDLengths(valid); err != nil {
+		t.Fatalf("64-character IDs rejected: %v", err)
+	}
+	missingOptionalIDs := []byte(`{"input":[{"type":"function_call","name":"run","arguments":"{}"},{"type":"function_call_output","output":"done"}]}`)
+	if err := ValidateCopilotResponsesToolIDLengths(missingOptionalIDs); err != nil {
+		t.Fatalf("absent optional IDs rejected: %v", err)
+	}
+	for _, test := range []struct {
+		name string
+		body string
+		path string
+	}{
+		{name: "function item ID", body: `{"input":[{"type":"message"},{"type":"function_call","id":"` + id64 + `x","call_id":"short"}]}`, path: "input[1].id"},
+		{name: "custom function item ID", body: `{"input":[{"type":"custom_tool_call","id":"` + id64 + `x","call_id":"short"}]}`, path: "input[0].id"},
+		{name: "function call ID", body: `{"input":[{"type":"function_call","id":"short","call_id":"` + callID64 + `x"}]}`, path: "input[0].call_id"},
+		{name: "custom output call ID", body: `{"input":[{"type":"custom_tool_call_output","id":"short","call_id":"` + callID64 + `x"}]}`, path: "input[0].call_id"},
+		{name: "output item ID", body: `{"input":[{"type":"function_call_output","id":"` + id64 + `x","call_id":"short"}]}`, path: "input[0].id"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			before := []byte(test.body)
+			err := ValidateCopilotResponsesToolIDLengths(before)
+			if err == nil || !strings.Contains(err.Error(), test.path) || !strings.Contains(err.Error(), "64 characters") {
+				t.Fatalf("validation error = %v, want path %s and 64-character limit", err, test.path)
+			}
+			if string(before) != test.body {
+				t.Fatal("identifier validation modified the request")
 			}
 		})
 	}

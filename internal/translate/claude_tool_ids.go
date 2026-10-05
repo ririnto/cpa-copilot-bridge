@@ -1,12 +1,18 @@
 package translate
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"io"
 	"strings"
 )
 
 const claudeToolIDPrefix = "cpa_tool_v1_"
+const bridgeToolIDPrefix = "cpa_tool_"
+
+var errInvalidClaudeToolIDCarrier = errors.New("invalid bridge tool ID carrier")
 
 type claudeToolIDCarrier struct {
 	ItemID string `json:"i,omitempty"`
@@ -17,7 +23,7 @@ func encodeClaudeToolID(itemID, callID string) string {
 	if itemID == "" && callID == "" {
 		return ""
 	}
-	if ((itemID == "" && callID != "") || (itemID == callID && itemID != "")) && safeClaudeToolID(callID) && !strings.HasPrefix(callID, claudeToolIDPrefix) {
+	if itemID != "" && itemID == callID && safeClaudeToolID(callID) && !strings.HasPrefix(callID, bridgeToolIDPrefix) {
 		return callID
 	}
 	encoded, err := json.Marshal(claudeToolIDCarrier{ItemID: itemID, CallID: callID})
@@ -28,18 +34,33 @@ func encodeClaudeToolID(itemID, callID string) string {
 }
 
 func decodeClaudeToolID(value string) (itemID, callID string, ok bool) {
+	itemID, callID, encoded, err := parseClaudeToolID(value)
+	return itemID, callID, encoded && err == nil
+}
+
+func parseClaudeToolID(value string) (itemID, callID string, encoded bool, err error) {
+	if !strings.HasPrefix(value, bridgeToolIDPrefix) {
+		return "", value, false, nil
+	}
 	if !strings.HasPrefix(value, claudeToolIDPrefix) {
-		return "", value, false
+		return "", "", false, errInvalidClaudeToolIDCarrier
 	}
-	encoded, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(value, claudeToolIDPrefix))
-	if err != nil {
-		return "", value, false
+	encodedValue := strings.TrimPrefix(value, claudeToolIDPrefix)
+	decoded, errDecode := base64.RawURLEncoding.DecodeString(encodedValue)
+	if errDecode != nil {
+		return "", "", false, errInvalidClaudeToolIDCarrier
 	}
+	decoder := json.NewDecoder(bytes.NewReader(decoded))
+	decoder.DisallowUnknownFields()
 	var carrier claudeToolIDCarrier
-	if errDecode := json.Unmarshal(encoded, &carrier); errDecode != nil || (carrier.CallID == "" && carrier.ItemID == "") {
-		return "", value, false
+	if decoder.Decode(&carrier) != nil || decoder.Decode(new(any)) != io.EOF || (carrier.CallID == "" && carrier.ItemID == "") {
+		return "", "", false, errInvalidClaudeToolIDCarrier
 	}
-	return carrier.ItemID, carrier.CallID, true
+	canonical, errMarshal := json.Marshal(carrier)
+	if errMarshal != nil || !bytes.Equal(decoded, canonical) || base64.RawURLEncoding.EncodeToString(canonical) != encodedValue {
+		return "", "", false, errInvalidClaudeToolIDCarrier
+	}
+	return carrier.ItemID, carrier.CallID, true, nil
 }
 
 // DecodeClaudeToolIDs returns the Responses IDs encoded in a Claude tool-use ID.
@@ -65,9 +86,10 @@ func claudeToolIDFromResponses(item map[string]any) string {
 	return encodeClaudeToolID(rawStringValue(item["id"]), rawStringValue(item["call_id"]))
 }
 
-func responsesToolIDsFromClaude(value string) (itemID, callID string) {
-	if decodedItemID, decodedCallID, ok := decodeClaudeToolID(value); ok {
-		return decodedItemID, decodedCallID
+func responsesToolIDsFromClaude(value string) (itemID, callID string, err error) {
+	itemID, callID, encoded, err := parseClaudeToolID(value)
+	if err != nil || encoded {
+		return itemID, callID, err
 	}
-	return "", value
+	return "", value, nil
 }

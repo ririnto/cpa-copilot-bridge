@@ -8,27 +8,31 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/ririnto/cpa-copilot-bridge/internal/compact"
+	"github.com/ririnto/cpa-copilot-bridge/internal/translate"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
 const (
 	translatorReasoningCarrierPrefix = "cpa-copilot-reasoning:v1:"
-	sealedReasoningCarrierPrefix     = "cpa-copilot-reasoning-auth:v1:"
 	reasoningCarrierNamespace        = "cpa-copilot-reasoning-auth:"
-	reasoningCarrierMACDomain        = "cpa-copilot-bridge-reasoning-carrier-v1"
+	sealedReasoningCarrierV1Prefix   = "cpa-copilot-reasoning-auth:v1:"
+	sealedReasoningCarrierV2Prefix   = "cpa-copilot-reasoning-auth:v2:"
+	reasoningCarrierMACDomainV1      = "cpa-copilot-bridge-reasoning-carrier-v1"
+	reasoningCarrierMACDomainV2      = "cpa-copilot-bridge-reasoning-carrier-v2"
 )
 
 type reasoningCarrierScope struct {
 	AuthID     string
-	Credential string
 	Model      string
 	Endpoint   string
 	APIBaseURL string
+	Keys       artifactKeyMaterials
 }
 
-func reasoningCarrierScopeFor(authID string, storage authStorage, model, endpoint string, token copilotTokenEntry) reasoningCarrierScope {
-	return reasoningCarrierScope{AuthID: authID, Credential: storage.GitHubAccessToken, Model: model, Endpoint: endpoint, APIBaseURL: token.APIBaseURL}
+func reasoningCarrierScopeFor(authID, model, endpoint, apiBaseURL string, keys artifactKeyMaterials) reasoningCarrierScope {
+	return reasoningCarrierScope{AuthID: authID, Model: model, Endpoint: endpoint, APIBaseURL: apiBaseURL, Keys: keys}
 }
 
 func unwrapRequestReasoningCarriers(sourceFormat string, payload []byte, scope reasoningCarrierScope) ([]byte, error) {
@@ -37,7 +41,7 @@ func unwrapRequestReasoningCarriers(sourceFormat string, payload []byte, scope r
 			return "", false, fmt.Errorf("unsealed Copilot reasoning carrier is not accepted")
 		}
 		if strings.HasPrefix(value, reasoningCarrierNamespace) {
-			if !strings.HasPrefix(value, sealedReasoningCarrierPrefix) {
+			if !strings.HasPrefix(value, sealedReasoningCarrierV1Prefix) && !strings.HasPrefix(value, sealedReasoningCarrierV2Prefix) {
 				return "", false, fmt.Errorf("unsupported Copilot reasoning carrier version")
 			}
 			inner, err := unsealReasoningCarrier(value, scope)
@@ -47,9 +51,46 @@ func unwrapRequestReasoningCarriers(sourceFormat string, payload []byte, scope r
 	})
 }
 
+func validateReasoningRequestForEndpoint(sourceFormat string, payload []byte, endpoint string) error {
+	if endpoint != translate.EndpointChatCompletions {
+		return nil
+	}
+	root := gjson.ParseBytes(payload)
+	switch normalizeRequestFormat(sourceFormat) {
+	case "claude":
+		for _, message := range root.Get("messages").Array() {
+			for _, block := range message.Get("content").Array() {
+				switch block.Get("type").String() {
+				case "thinking":
+					signature := block.Get("signature")
+					if signature.Type == gjson.String && signature.String() != "" && !strings.HasPrefix(signature.String(), translatorReasoningCarrierPrefix) {
+						return fmt.Errorf("foreign Claude thinking signatures cannot be replayed to Copilot Chat")
+					}
+				case "redacted_thinking":
+					data := block.Get("data")
+					if data.Type == gjson.String && data.String() != "" {
+						return fmt.Errorf("Claude redacted thinking cannot be replayed to Copilot Chat")
+					}
+				}
+			}
+		}
+	case "openai-response":
+		for _, item := range root.Get("input").Array() {
+			if item.Get("type").String() != "reasoning" {
+				continue
+			}
+			encryptedContent := item.Get("encrypted_content")
+			if encryptedContent.Type == gjson.String && encryptedContent.String() != "" && !strings.HasPrefix(encryptedContent.String(), translatorReasoningCarrierPrefix) {
+				return fmt.Errorf("foreign Responses reasoning cannot be replayed to Copilot Chat")
+			}
+		}
+	}
+	return nil
+}
+
 func sealResponseReasoningCarriers(sourceFormat string, payload []byte, scope reasoningCarrierScope) ([]byte, error) {
 	return transformReasoningCarrierPaths(payload, responseReasoningCarrierPaths(sourceFormat, payload), func(value string) (string, bool, error) {
-		if strings.HasPrefix(value, sealedReasoningCarrierPrefix) {
+		if strings.HasPrefix(value, sealedReasoningCarrierV1Prefix) || strings.HasPrefix(value, sealedReasoningCarrierV2Prefix) {
 			inner, err := unsealReasoningCarrier(value, scope)
 			if err != nil {
 				return "", false, err
@@ -72,19 +113,34 @@ func sealReasoningCarrier(inner string, scope reasoningCarrierScope) (string, er
 	if !strings.HasPrefix(inner, translatorReasoningCarrierPrefix) {
 		return "", fmt.Errorf("invalid Copilot reasoning carrier")
 	}
-	secret, scopeID, err := reasoningCarrierKeyMaterial(scope)
+	secret, scopeID, err := reasoningCarrierKeyMaterial(scope.Keys.Active)
 	if err != nil {
 		return "", err
 	}
-	mac := reasoningCarrierMAC(secret, scopeID, []byte(inner))
-	return sealedReasoningCarrierPrefix + base64.RawURLEncoding.EncodeToString([]byte(inner)) + "." + base64.RawURLEncoding.EncodeToString(mac), nil
+	mac := reasoningCarrierMAC(secret, scopeID, []byte(inner), reasoningCarrierMACDomainV2)
+	return sealedReasoningCarrierV2Prefix + base64.RawURLEncoding.EncodeToString([]byte(inner)) + "." + base64.RawURLEncoding.EncodeToString(mac), nil
 }
 
 func unsealReasoningCarrier(sealed string, scope reasoningCarrierScope) (string, error) {
-	if !strings.HasPrefix(sealed, sealedReasoningCarrierPrefix) {
+	var prefix string
+	var keys []compact.KeyMaterial
+	var domain string
+	switch {
+	case strings.HasPrefix(sealed, sealedReasoningCarrierV2Prefix):
+		prefix = sealedReasoningCarrierV2Prefix
+		keys = []compact.KeyMaterial{scope.Keys.Active}
+		domain = reasoningCarrierMACDomainV2
+	case strings.HasPrefix(sealed, sealedReasoningCarrierV1Prefix):
+		prefix = sealedReasoningCarrierV1Prefix
+		keys = scope.Keys.Legacy
+		domain = reasoningCarrierMACDomainV1
+	default:
 		return "", fmt.Errorf("invalid Copilot reasoning carrier")
 	}
-	encoded := strings.TrimPrefix(sealed, sealedReasoningCarrierPrefix)
+	if len(keys) == 0 {
+		return "", fmt.Errorf("Copilot reasoning carrier scope is unavailable")
+	}
+	encoded := strings.TrimPrefix(sealed, prefix)
 	payloadPart, macPart, ok := strings.Cut(encoded, ".")
 	if !ok || payloadPart == "" || macPart == "" || strings.Contains(macPart, ".") {
 		return "", fmt.Errorf("invalid Copilot reasoning carrier")
@@ -97,30 +153,28 @@ func unsealReasoningCarrier(sealed string, scope reasoningCarrierScope) (string,
 	if err != nil || len(providedMAC) != sha256.Size {
 		return "", fmt.Errorf("invalid Copilot reasoning carrier")
 	}
-	secret, scopeID, err := reasoningCarrierKeyMaterial(scope)
-	if err != nil {
-		return "", err
+	for _, key := range keys {
+		secret, scopeID, err := reasoningCarrierKeyMaterial(key)
+		if err != nil {
+			continue
+		}
+		if hmac.Equal(providedMAC, reasoningCarrierMAC(secret, scopeID, innerBytes, domain)) {
+			return string(innerBytes), nil
+		}
 	}
-	if !hmac.Equal(providedMAC, reasoningCarrierMAC(secret, scopeID, innerBytes)) {
-		return "", fmt.Errorf("Copilot reasoning carrier scope or authentication is invalid")
-	}
-	return string(innerBytes), nil
+	return "", fmt.Errorf("Copilot reasoning carrier scope or authentication is invalid")
 }
 
-func reasoningCarrierKeyMaterial(scope reasoningCarrierScope) ([]byte, string, error) {
-	if strings.TrimSpace(scope.Credential) == "" {
+func reasoningCarrierKeyMaterial(key compact.KeyMaterial) ([]byte, string, error) {
+	if strings.TrimSpace(key.Scope) == "" || len(key.Secret) != sha256.Size {
 		return nil, "", fmt.Errorf("Copilot reasoning carrier scope is unavailable")
 	}
-	scopeID, secret := compactionKeyMaterial(scope.AuthID, scope.Credential, scope.Model, scope.Endpoint, scope.APIBaseURL)
-	if scopeID == "" || len(secret) == 0 {
-		return nil, "", fmt.Errorf("Copilot reasoning carrier scope is unavailable")
-	}
-	return secret, scopeID, nil
+	return key.Secret, key.Scope, nil
 }
 
-func reasoningCarrierMAC(secret []byte, scopeID string, inner []byte) []byte {
+func reasoningCarrierMAC(secret []byte, scopeID string, inner []byte, domain string) []byte {
 	mac := hmac.New(sha256.New, secret)
-	_, _ = mac.Write([]byte(reasoningCarrierMACDomain))
+	_, _ = mac.Write([]byte(domain))
 	_, _ = mac.Write([]byte{0})
 	_, _ = mac.Write([]byte(scopeID))
 	_, _ = mac.Write([]byte{0})
@@ -283,7 +337,7 @@ func sealReasoningCarrierSSEFrame(destination string, frame []byte, scope reason
 
 func sealStreamReasoningCarriers(destination string, payload []byte, scope reasoningCarrierScope) ([]byte, error) {
 	return transformReasoningCarrierPaths(payload, streamReasoningCarrierPaths(destination, payload), func(value string) (string, bool, error) {
-		if strings.HasPrefix(value, sealedReasoningCarrierPrefix) {
+		if strings.HasPrefix(value, sealedReasoningCarrierV1Prefix) || strings.HasPrefix(value, sealedReasoningCarrierV2Prefix) {
 			inner, err := unsealReasoningCarrier(value, scope)
 			if err != nil {
 				return "", false, err

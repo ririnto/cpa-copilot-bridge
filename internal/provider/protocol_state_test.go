@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ririnto/cpa-copilot-bridge/internal/translate"
+	"github.com/tidwall/gjson"
 )
 
 func TestExecutionSessionMetadataProvidesStableAgentScopedIdentity(t *testing.T) {
@@ -20,7 +21,7 @@ func TestExecutionSessionMetadataProvidesStableAgentScopedIdentity(t *testing.T)
 		t.Fatalf("execution session/agent = %q/%q", sessionID, agentID)
 	}
 	cacheKey := func(sessionID, agentID string) string {
-		scope := protocolScopeKey("auth-a", "github-token-a", "model-a", "https://api.githubcopilot.com", translate.EndpointResponses, sessionID, agentID, 0)
+		scope := protocolScopeKey("auth-a", continuityTestStorage("github-token-a"), "model-a", "https://api.githubcopilot.com", translate.EndpointResponses, sessionID, agentID, 0)
 		return derivedPromptCacheKey(scope)
 	}
 	firstKey := cacheKey(sessionID, agentID)
@@ -50,7 +51,7 @@ func TestReasoningReplayUsesExactTranslatedToolCallAnchor(t *testing.T) {
 	service := New(nil)
 	now := time.Date(2026, 10, 3, 0, 0, 0, 0, time.UTC)
 	service.now = func() time.Time { return now }
-	scope := protocolScopeKey("auth-a", "github-token-a", "model-a", "https://api.githubcopilot.com", translate.EndpointResponses, "session-a", "main", 0)
+	scope := protocolScopeKey("auth-a", continuityTestStorage("github-token-a"), "model-a", "https://api.githubcopilot.com", translate.EndpointResponses, "session-a", "main", 0)
 	response := []byte(`{"status":"completed","output":[{"type":"reasoning","encrypted_content":"signature:opaque","summary":[]},{"type":"function_call","id":"resp_fc_1","call_id":"tool call:/東京","name":"run","arguments":"{\"x\":1}"}]}`)
 	claudeResponse, err := translate.ResponseFromEndpoint(context.Background(), translate.EndpointResponses, "claude", "model-a", nil, nil, response)
 	if err != nil {
@@ -116,7 +117,7 @@ func TestReasoningReplayRequiresSuccessfulUniqueCallsAndExpires(t *testing.T) {
 	service := New(nil)
 	now := time.Date(2026, 10, 3, 0, 0, 0, 0, time.UTC)
 	service.now = func() time.Time { return now }
-	scope := protocolScopeKey("auth-a", "github-token-a", "model-a", "https://api.githubcopilot.com", translate.EndpointResponses, "session-a", "main", 0)
+	scope := protocolScopeKey("auth-a", continuityTestStorage("github-token-a"), "model-a", "https://api.githubcopilot.com", translate.EndpointResponses, "session-a", "main", 0)
 	service.recordReasoningReplay(scope, []byte(`{"status":"incomplete","output":[{"type":"reasoning","encrypted_content":"sig"},{"type":"function_call","call_id":"call-1"}]}`))
 	if got := len(service.replayEntries); got != 0 {
 		t.Fatalf("incomplete response created %d replay entries", got)
@@ -138,7 +139,7 @@ func TestReasoningReplayRequiresSuccessfulUniqueCallsAndExpires(t *testing.T) {
 func TestNativeResponsesReplayRestoresOnlyMissingExactAnchoredIDs(t *testing.T) {
 	t.Parallel()
 	service := New(nil)
-	scope := protocolScopeKey("auth-a", "github-token-a", "model-a", "https://api.githubcopilot.com", translate.EndpointResponses, "session-a", "main", 0)
+	scope := protocolScopeKey("auth-a", continuityTestStorage("github-token-a"), "model-a", "https://api.githubcopilot.com", translate.EndpointResponses, "session-a", "main", 0)
 	response := []byte(`{"status":"completed","output":[{"type":"reasoning","id":"rs_upstream","encrypted_content":"opaque-signature","summary":[]},{"type":"function_call","id":"fc_upstream","call_id":"call-1","name":"run","arguments":"{\"x\":1}"}]}`)
 	service.recordReasoningReplay(scope, response)
 	secondTurn := []byte(`{"model":"model-a","input":[{"type":"reasoning","encrypted_content":"opaque-signature","summary":[]},{"type":"function_call","call_id":"call-1","name":"run","arguments":"{\"x\":1}"}]}`)
@@ -184,7 +185,7 @@ func TestNativeResponsesReplayRestoresOnlyMissingExactAnchoredIDs(t *testing.T) 
 	if got := service.restoreNativeResponsesReplay(scope, wrongTranslated); string(got) != string(wrongTranslated) {
 		t.Fatalf("replay restored an ID for a non-matching call: %s", got)
 	}
-	otherScope := protocolScopeKey("auth-a", "github-token-a", "model-a", "https://other-api.example", translate.EndpointResponses, "session-a", "main", 0)
+	otherScope := protocolScopeKey("auth-a", continuityTestStorage("github-token-a"), "model-a", "https://other-api.example", translate.EndpointResponses, "session-a", "main", 0)
 	if got := service.restoreNativeResponsesReplay(otherScope, translated); string(got) != string(translated) {
 		t.Fatalf("native replay crossed API-origin scope: %s", got)
 	}
@@ -193,7 +194,7 @@ func TestNativeResponsesReplayRestoresOnlyMissingExactAnchoredIDs(t *testing.T) 
 func TestReasoningReplayRejectsResultsFromPriorConfiguration(t *testing.T) {
 	t.Parallel()
 	service := New(nil)
-	oldScope := protocolScopeKey("auth-a", "github-token-a", "model-a", "https://api.githubcopilot.com", translate.EndpointResponses, "session-a", "main", 0)
+	oldScope := protocolScopeKey("auth-a", continuityTestStorage("github-token-a"), "model-a", "https://api.githubcopilot.com", translate.EndpointResponses, "session-a", "main", 0)
 	if err := service.Configure([]byte("enabled: true\n")); err != nil {
 		t.Fatalf("configure: %v", err)
 	}
@@ -209,7 +210,7 @@ func TestReasoningReplayCacheIsBounded(t *testing.T) {
 	service := New(nil)
 	now := time.Date(2026, 10, 3, 0, 0, 0, 0, time.UTC)
 	service.now = func() time.Time { return now }
-	scope := protocolScopeKey("auth-a", "github-token-a", "model-a", "https://api.githubcopilot.com", translate.EndpointResponses, "session-a", "main", 0)
+	scope := protocolScopeKey("auth-a", continuityTestStorage("github-token-a"), "model-a", "https://api.githubcopilot.com", translate.EndpointResponses, "session-a", "main", 0)
 	for index := 0; index < maxReasoningReplayEntries+8; index++ {
 		response := fmt.Sprintf(`{"status":"completed","output":[{"type":"reasoning","encrypted_content":"sig-%d"},{"type":"function_call","call_id":"call-%d"}]}`, index, index)
 		service.recordReasoningReplay(scope, []byte(response))
@@ -225,5 +226,37 @@ func TestReasoningReplayCacheIsBounded(t *testing.T) {
 		if strings.Contains(entry.ScopeKey, "github-token-a") {
 			t.Fatal("cache key exposed credential text")
 		}
+	}
+}
+
+func TestReasoningReplaySurvivesOAuthCredentialRotation(t *testing.T) {
+	t.Parallel()
+	service := New(nil)
+	original := continuityTestStorage("github-access-before-refresh")
+	oldScope := protocolScopeKey("auth-a", original, "model-a", "https://api.example", translate.EndpointResponses, "session-a", "main", 0)
+	service.recordReasoningReplay(oldScope, []byte(`{"status":"completed","output":[{"type":"reasoning","id":"rs_1","encrypted_content":"opaque","summary":[]},{"type":"function_call","id":"fc_1","call_id":"call-1","name":"run","arguments":"{}"}]}`))
+	rotated := original
+	rotated.GitHubAccessToken = "github-access-after-refresh"
+	rotatedRing := *original.ContinuityKeyring
+	rotatedRing.CredentialFingerprint = tokenFingerprint(rotated.GitHubAccessToken)
+	rotated.ContinuityKeyring = &rotatedRing
+	newScope := protocolScopeKey("auth-a", rotated, "model-a", "https://api.example", translate.EndpointResponses, "session-a", "main", 0)
+	if newScope != oldScope {
+		t.Fatal("same-account OAuth refresh changed the replay scope")
+	}
+	translated := []byte(`{"input":[{"type":"reasoning","encrypted_content":"opaque","summary":[]},{"type":"function_call","call_id":"call-1","name":"run","arguments":"{}"}]}`)
+	restored := service.restoreNativeResponsesReplay(newScope, translated)
+	if gjson.GetBytes(restored, "input.0.id").String() != "rs_1" || gjson.GetBytes(restored, "input.1.id").String() != "fc_1" {
+		t.Fatalf("replay cache did not survive authenticated credential rotation: %s", restored)
+	}
+	newLogin := continuityTestStorage("github-access-after-refresh")
+	newLoginRing, err := newContinuityKeyring(newLogin.GitHubUserID, newLogin.GitHubAccessToken)
+	if err != nil {
+		t.Fatalf("make replacement login keyring: %v", err)
+	}
+	newLogin.ContinuityKeyring = newLoginRing
+	newLoginScope := protocolScopeKey("auth-a", newLogin, "model-a", "https://api.example", translate.EndpointResponses, "session-a", "main", 0)
+	if newLoginScope == oldScope {
+		t.Fatal("replacement login reused the old replay scope")
 	}
 }

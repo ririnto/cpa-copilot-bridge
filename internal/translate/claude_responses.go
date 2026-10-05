@@ -211,7 +211,10 @@ func claudeRequestToResponses(model string, body []byte, stream bool) ([]byte, e
 				if errArguments != nil {
 					return nil, fmt.Errorf("encode Claude tool input: %w", errArguments)
 				}
-				itemID, callID := responsesToolIDsFromClaude(firstRawString(part, "id", "tool_use_id"))
+				itemID, callID, errIDs := responsesToolIDsFromClaude(firstRawString(part, "id", "tool_use_id"))
+				if errIDs != nil {
+					return nil, errIDs
+				}
 				functionCall := map[string]any{
 					"type":      "function_call",
 					"call_id":   callID,
@@ -228,7 +231,10 @@ func claudeRequestToResponses(model string, body []byte, stream bool) ([]byte, e
 				if errOutput != nil {
 					return nil, errOutput
 				}
-				_, callID := responsesToolIDsFromClaude(rawStringValue(part["tool_use_id"]))
+				_, callID, errIDs := responsesToolIDsFromClaude(rawStringValue(part["tool_use_id"]))
+				if errIDs != nil {
+					return nil, errIDs
+				}
 				functionOutput := map[string]any{
 					"type":    "function_call_output",
 					"call_id": callID,

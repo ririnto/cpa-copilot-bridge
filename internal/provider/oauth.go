@@ -265,6 +265,12 @@ func (s *Service) PollLogin(ctx context.Context, callbackID, state string) (plug
 		OAuthClientID:      clientID,
 		UpdatedAt:          createdAt.UTC().Format(time.RFC3339),
 	}
+	keyring, errKeyring := newContinuityKeyring(storage.GitHubUserID, storage.GitHubAccessToken)
+	if errKeyring != nil {
+		s.finishPoll(state, interval, true)
+		return pluginapi.AuthLoginPollResponse{}, errKeyring
+	}
+	storage.ContinuityKeyring = keyring
 	if token.ExpiresIn > 0 {
 		storage.ExpiresAt = createdAt.Add(time.Duration(token.ExpiresIn) * time.Second).Unix()
 	}
@@ -377,17 +383,42 @@ func (s *Service) RefreshAuth(ctx context.Context, callbackID string, req plugin
 	}
 	now := s.now()
 	if storage.ExpiresAt == 0 || time.Unix(storage.ExpiresAt, 0).After(now.Add(10*time.Minute)) {
+		if storage.ContinuityKeyring == nil {
+			if errInitialize := s.initializeContinuity(ctx, callbackID, req.AuthID, &storage); errInitialize != nil {
+				return pluginapi.AuthRefreshResponse{}, errInitialize
+			}
+		} else if _, errKeyring := validateContinuityKeyring(storage, req.AuthID); errKeyring != nil {
+			return pluginapi.AuthRefreshResponse{}, statusError("auth_state_invalid", "Copilot authentication state changed. Sign in again.", http.StatusConflict)
+		}
 		data, errData := authData(storage, req.AuthID, "", "", "", false, req.Metadata, req.Attributes)
 		if errData != nil {
 			return pluginapi.AuthRefreshResponse{}, errData
 		}
 		return pluginapi.AuthRefreshResponse{Auth: data, NextRefreshAfter: data.NextRefreshAfter}, nil
 	}
+	if storage.ContinuityKeyring != nil {
+		if _, errKeyring := validateContinuityKeyring(storage, req.AuthID); errKeyring != nil {
+			return pluginapi.AuthRefreshResponse{}, statusError("auth_state_invalid", "Copilot authentication state changed. Sign in again.", http.StatusConflict)
+		}
+	}
 	if storage.GitHubRefreshToken == "" {
 		return pluginapi.AuthRefreshResponse{}, statusError("auth_expired", "GitHub OAuth token expired and has no refresh token", http.StatusUnauthorized)
 	}
 	if storage.RefreshTokenExpiresAt > 0 && !time.Unix(storage.RefreshTokenExpiresAt, 0).After(now) {
 		return pluginapi.AuthRefreshResponse{}, statusError("auth_expired", "GitHub OAuth refresh token expired", http.StatusUnauthorized)
+	}
+	legacyAPIBase := ""
+	if storage.ContinuityKeyring == nil {
+		if user, errUser := s.fetchGitHubUser(ctx, callbackID, storage.GitHubAccessToken); errUser == nil {
+			if storage.GitHubUserID > 0 && user.ID != storage.GitHubUserID {
+				return pluginapi.AuthRefreshResponse{}, statusError("account_mismatch", "GitHub account changed. Sign in again.", http.StatusUnauthorized)
+			}
+			storage.GitHubUserID = user.ID
+			storage.GitHubLogin = user.Login
+			if token, errToken := s.copilotToken(ctx, callbackID, req.AuthID, storage); errToken == nil {
+				legacyAPIBase = token.APIBaseURL
+			}
+		}
 	}
 	clientID := storage.OAuthClientID
 	if clientID == "" {
@@ -422,7 +453,29 @@ func (s *Service) RefreshAuth(ctx context.Context, callbackID string, req plugin
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 || strings.TrimSpace(token.AccessToken) == "" {
 		return pluginapi.AuthRefreshResponse{}, upstreamStatusError(resp.StatusCode, redact.ErrorBody(resp.Body, storage.GitHubAccessToken, storage.GitHubRefreshToken))
 	}
-	storage.GitHubAccessToken = strings.TrimSpace(token.AccessToken)
+	newAccessToken := strings.TrimSpace(token.AccessToken)
+	user, errUser := s.fetchGitHubUser(ctx, callbackID, newAccessToken)
+	if errUser != nil {
+		return pluginapi.AuthRefreshResponse{}, errUser
+	}
+	if storage.GitHubUserID > 0 && user.ID != storage.GitHubUserID {
+		return pluginapi.AuthRefreshResponse{}, statusError("account_mismatch", "GitHub account changed. Sign in again.", http.StatusUnauthorized)
+	}
+	storage.GitHubUserID = user.ID
+	storage.GitHubLogin = user.Login
+	if storage.ContinuityKeyring == nil {
+		keyring, errKeyring := newContinuityKeyring(user.ID, newAccessToken)
+		if errKeyring != nil {
+			return pluginapi.AuthRefreshResponse{}, errKeyring
+		}
+		if legacyAPIBase != "" {
+			addLegacyContinuityKey(keyring, req.AuthID, storage.GitHubAccessToken, legacyAPIBase)
+		}
+		storage.ContinuityKeyring = keyring
+	} else {
+		storage.ContinuityKeyring.CredentialFingerprint = tokenFingerprint(newAccessToken)
+	}
+	storage.GitHubAccessToken = newAccessToken
 	if strings.TrimSpace(token.RefreshToken) != "" {
 		storage.GitHubRefreshToken = strings.TrimSpace(token.RefreshToken)
 	}
@@ -441,6 +494,27 @@ func (s *Service) RefreshAuth(ctx context.Context, callbackID string, req plugin
 		return pluginapi.AuthRefreshResponse{}, errData
 	}
 	return pluginapi.AuthRefreshResponse{Auth: data, NextRefreshAfter: data.NextRefreshAfter}, nil
+}
+
+func (s *Service) initializeContinuity(ctx context.Context, callbackID, authID string, storage *authStorage) error {
+	user, errUser := s.fetchGitHubUser(ctx, callbackID, storage.GitHubAccessToken)
+	if errUser != nil {
+		return statusError("auth_state_refresh_required", "Refresh Copilot authentication to initialize continuity state", http.StatusConflict)
+	}
+	if storage.GitHubUserID > 0 && user.ID != storage.GitHubUserID {
+		return statusError("account_mismatch", "GitHub account changed. Sign in again.", http.StatusUnauthorized)
+	}
+	storage.GitHubUserID = user.ID
+	storage.GitHubLogin = user.Login
+	keyring, errKeyring := newContinuityKeyring(user.ID, storage.GitHubAccessToken)
+	if errKeyring != nil {
+		return errKeyring
+	}
+	if token, errToken := s.copilotToken(ctx, callbackID, authID, *storage); errToken == nil {
+		addLegacyContinuityKey(keyring, authID, storage.GitHubAccessToken, token.APIBaseURL)
+	}
+	storage.ContinuityKeyring = keyring
+	return nil
 }
 
 func randomIdentifier(bytesCount int) (string, error) {

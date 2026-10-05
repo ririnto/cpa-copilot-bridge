@@ -20,6 +20,7 @@ type refreshTestHost struct {
 	oauthResponse     transport.Response
 	oauthCallbackID   string
 	oauthRequest      transport.Request
+	githubUserID      int64
 	copilotTokenCalls int
 	tokenAPIBaseURLs  []string
 	modelStatuses     []int
@@ -37,6 +38,17 @@ func (h *refreshTestHost) Do(ctx context.Context, callbackID string, request tra
 	defer h.mu.Unlock()
 	request.Body = append([]byte(nil), request.Body...)
 	request.Headers = request.Headers.Clone()
+	if strings.HasSuffix(request.URL, "/user") {
+		userID := h.githubUserID
+		if userID == 0 {
+			userID = 4242
+		}
+		body, err := json.Marshal(githubUser{Login: "fixture-user", ID: userID})
+		if err != nil {
+			return transport.Response{}, err
+		}
+		return transport.Response{StatusCode: http.StatusOK, Body: body}, nil
+	}
 	if strings.HasSuffix(request.URL, "/login/oauth/access_token") {
 		h.oauthCallbackID = callbackID
 		h.oauthRequest = request
@@ -115,7 +127,11 @@ func TestRefreshAuthReturnsRotatedGitHubAuthData(t *testing.T) {
 	host := &refreshTestHost{oauthResponse: transport.Response{StatusCode: http.StatusOK, Body: responseBody}}
 	service := New(host)
 	service.now = func() time.Time { return now }
-	storage := authStorage{Type: providerID, GitHubAccessToken: "old-access", GitHubRefreshToken: "old-refresh", GitHubLogin: "fixture-user", OAuthClientID: "stored-client", ExpiresAt: now.Add(-time.Minute).Unix(), RefreshTokenExpiresAt: now.Add(24 * time.Hour).Unix()}
+	keyring, err := newContinuityKeyring(4242, "old-access")
+	if err != nil {
+		t.Fatalf("make existing keyring: %v", err)
+	}
+	storage := authStorage{Type: providerID, GitHubAccessToken: "old-access", GitHubRefreshToken: "old-refresh", GitHubLogin: "fixture-user", GitHubUserID: 4242, OAuthClientID: "stored-client", ExpiresAt: now.Add(-time.Minute).Unix(), RefreshTokenExpiresAt: now.Add(24 * time.Hour).Unix(), ContinuityKeyring: keyring}
 	rawStorage, err := marshalStorage(storage)
 	if err != nil {
 		t.Fatalf("marshal auth storage: %v", err)
@@ -130,6 +146,9 @@ func TestRefreshAuthReturnsRotatedGitHubAuthData(t *testing.T) {
 	}
 	if refreshed.GitHubAccessToken != "rotated-access" || refreshed.GitHubRefreshToken != "rotated-refresh" || refreshed.TokenType != "bearer" || refreshed.Scope != "read:user user:email" {
 		t.Fatalf("rotated auth fields not returned: %#v", refreshed)
+	}
+	if refreshed.ContinuityKeyring == nil || refreshed.ContinuityKeyring.RootKey != keyring.RootKey || refreshed.ContinuityKeyring.KeyID != keyring.KeyID || refreshed.ContinuityKeyring.CredentialFingerprint != tokenFingerprint("rotated-access") {
+		t.Fatalf("continuity keyring did not survive the authenticated token refresh: %#v", refreshed.ContinuityKeyring)
 	}
 	wantAccessExpiry := now.Add(time.Hour).Unix()
 	wantRefreshExpiry := now.Add(24 * time.Hour).Unix()
@@ -149,6 +168,52 @@ func TestRefreshAuthReturnsRotatedGitHubAuthData(t *testing.T) {
 	form, err := url.ParseQuery(string(request.Body))
 	if err != nil || form.Get("grant_type") != "refresh_token" || form.Get("refresh_token") != "old-refresh" || form.Get("client_id") != "stored-client" {
 		t.Fatalf("OAuth refresh request form was incorrect: %v", err)
+	}
+}
+
+func TestRefreshAuthMigratesLegacyStateToPersistedContinuity(t *testing.T) {
+	t.Parallel()
+	host := &refreshTestHost{tokenAPIBaseURLs: []string{"https://api.example"}}
+	service := New(host)
+	storage := authStorage{Type: providerID, GitHubAccessToken: "existing-access", GitHubLogin: "fixture-user", GitHubUserID: 4242}
+	rawStorage, err := marshalStorage(storage)
+	if err != nil {
+		t.Fatalf("marshal legacy storage: %v", err)
+	}
+	result, err := service.RefreshAuth(context.Background(), "callback", pluginapi.AuthRefreshRequest{AuthID: "auth-id", StorageJSON: rawStorage})
+	if err != nil {
+		t.Fatalf("RefreshAuth migration: %v", err)
+	}
+	var migrated authStorage
+	if err := json.Unmarshal(result.Auth.StorageJSON, &migrated); err != nil {
+		t.Fatalf("decode migrated storage: %v", err)
+	}
+	if migrated.ContinuityKeyring == nil || migrated.ContinuityKeyring.AccountID != 4242 || migrated.ContinuityKeyring.CredentialFingerprint != tokenFingerprint("existing-access") {
+		t.Fatalf("migrated continuity keyring = %#v", migrated.ContinuityKeyring)
+	}
+	legacy := migrated.ContinuityKeyring.LegacyV1
+	if legacy == nil || legacy.AuthID != "auth-id" || legacy.AccountID != 4242 || legacy.CredentialFingerprint != tokenFingerprint("existing-access") || legacy.APIBaseURL != "https://api.example" {
+		t.Fatalf("legacy continuity binding = %#v", legacy)
+	}
+	materials, err := continuityKeyMaterialsFor(migrated, "auth-id", "gpt-6-luna", "/responses", "https://api.example")
+	if err != nil || len(materials.Legacy) != 1 {
+		t.Fatalf("migrated key materials = %#v, err=%v", materials, err)
+	}
+	wantScope, wantSecret := compactionKeyMaterial("auth-id", "existing-access", "gpt-6-luna", "/responses", "https://api.example")
+	if materials.Legacy[0].Scope != wantScope || string(materials.Legacy[0].Secret) != string(wantSecret) {
+		t.Fatal("migration did not reproduce the v0.2.0 compaction key material")
+	}
+	reloadedRaw, err := marshalStorage(migrated)
+	if err != nil {
+		t.Fatalf("marshal reloaded state: %v", err)
+	}
+	reloaded, err := parseStorage(reloadedRaw)
+	if err != nil {
+		t.Fatalf("parse reloaded state: %v", err)
+	}
+	reloadedMaterials, err := continuityKeyMaterialsFor(reloaded, "auth-id", "gpt-6-luna", "/responses", "https://api.example")
+	if err != nil || reloadedMaterials.Active.Scope != materials.Active.Scope || string(reloadedMaterials.Active.Secret) != string(materials.Active.Secret) {
+		t.Fatalf("persisted keyring changed across reload: %#v, err=%v", reloadedMaterials, err)
 	}
 }
 

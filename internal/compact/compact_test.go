@@ -14,7 +14,7 @@ const testScope = "account:42|origin:https://api.example.test|model:gpt-test"
 
 func TestPrepareAdaptsCompactionRequest(t *testing.T) {
 	body := []byte(`{"model":"gpt-test","tools":[{"type":"function","name":"danger"}],"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Keep the active goal."}]},{"type":"compaction_trigger"}]}`)
-	prepared, requested, err := Prepare(body, testScope, testSecret)
+	prepared, requested, err := Prepare(body, KeyMaterial{Scope: testScope, Secret: testSecret}, nil)
 	if err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
@@ -53,7 +53,7 @@ func TestPrepareAdaptsCompactionRequest(t *testing.T) {
 
 func TestCompleteCapsuleReplaysOnLaterRequest(t *testing.T) {
 	response := []byte(`{"id":"resp_123","object":"response","status":"completed","model":"gpt-test","output":[{"id":"msg_123","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"The active goal is to finish the bridge. The next step is integration."}]}],"usage":{"input_tokens":41,"output_tokens":18}}`)
-	completed, err := Complete(response, testScope, testSecret)
+	completed, err := Complete(response, KeyMaterial{Scope: testScope, Secret: testSecret}, nil)
 	if err != nil {
 		t.Fatalf("Complete() error = %v", err)
 	}
@@ -85,7 +85,7 @@ func TestCompleteCapsuleReplaysOnLaterRequest(t *testing.T) {
 		t.Fatal("capsule exposed the plaintext summary")
 	}
 	request := []byte(`{"model":"gpt-test","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Continue."}]},{"type":"compaction","encrypted_content":"` + capsule + `"}]}`)
-	prepared, requested, err := Prepare(request, testScope, testSecret)
+	prepared, requested, err := Prepare(request, KeyMaterial{Scope: testScope, Secret: testSecret}, nil)
 	if err != nil {
 		t.Fatalf("replay Prepare() error = %v", err)
 	}
@@ -98,7 +98,7 @@ func TestCompleteCapsuleReplaysOnLaterRequest(t *testing.T) {
 	if !bytes.Contains(prepared, []byte("The active goal is to finish the bridge")) {
 		t.Fatal("replayed request omitted the decrypted summary")
 	}
-	idempotent, err := Complete(completed, testScope, testSecret)
+	idempotent, err := Complete(completed, KeyMaterial{Scope: testScope, Secret: testSecret}, nil)
 	if err != nil {
 		t.Fatalf("idempotent Complete() error = %v", err)
 	}
@@ -109,7 +109,7 @@ func TestCompleteCapsuleReplaysOnLaterRequest(t *testing.T) {
 
 func TestNativeCompactionPassesThrough(t *testing.T) {
 	body := []byte(` { "model":"gpt-test", "input":[{"type":"compaction","encrypted_content":"native-opaque-content"}] } `)
-	prepared, requested, err := Prepare(body, "", nil)
+	prepared, requested, err := Prepare(body, KeyMaterial{}, nil)
 	if err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
@@ -117,7 +117,7 @@ func TestNativeCompactionPassesThrough(t *testing.T) {
 		t.Fatalf("native request changed: requested=%v prepared=%s", requested, prepared)
 	}
 	response := []byte(` { "status":"completed", "output":[{"type":"compaction","encrypted_content":"native-opaque-content"}], "usage":{"total_tokens":3} } `)
-	completed, err := Complete(response, "", nil)
+	completed, err := Complete(response, KeyMaterial{}, nil)
 	if err != nil {
 		t.Fatalf("Complete() error = %v", err)
 	}
@@ -128,14 +128,14 @@ func TestNativeCompactionPassesThrough(t *testing.T) {
 
 func TestCompleteRejectsDuplicateNativeCompactionItems(t *testing.T) {
 	response := []byte(`{"status":"completed","output":[{"type":"compaction","encrypted_content":"native-first"},{"type":"compaction","encrypted_content":"native-second"}]}`)
-	_, err := Complete(response, "", nil)
+	_, err := Complete(response, KeyMaterial{}, nil)
 	if !errors.Is(err, ErrInvalidResponse) {
 		t.Fatalf("Complete() error = %v, want ErrInvalidResponse", err)
 	}
 }
 
 func TestPrepareRejectsUntrustedCapsules(t *testing.T) {
-	completed, err := Complete(summaryResponse("keep this summary"), testScope, testSecret)
+	completed, err := Complete(summaryResponse("keep this summary"), KeyMaterial{Scope: testScope, Secret: testSecret}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +173,7 @@ func TestPrepareRejectsUntrustedCapsules(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			body := []byte(`{"input":[{"type":"compaction","encrypted_content":"` + test.capsule + `"}]}`)
-			_, _, err := Prepare(body, test.scope, test.secret)
+			_, _, err := Prepare(body, KeyMaterial{Scope: test.scope, Secret: test.secret}, nil)
 			if !errors.Is(err, test.want) {
 				t.Fatalf("Prepare() error = %v, want %v", err, test.want)
 			}
@@ -183,7 +183,7 @@ func TestPrepareRejectsUntrustedCapsules(t *testing.T) {
 
 func TestPrepareRejectsDuplicateTriggers(t *testing.T) {
 	body := []byte(`{"input":[{"type":"compaction_trigger"},{"type":"compaction_trigger"}]}`)
-	_, _, err := Prepare(body, testScope, testSecret)
+	_, _, err := Prepare(body, KeyMaterial{Scope: testScope, Secret: testSecret}, nil)
 	if !errors.Is(err, ErrDuplicateTrigger) {
 		t.Fatalf("Prepare() error = %v, want ErrDuplicateTrigger", err)
 	}
@@ -203,7 +203,7 @@ func TestCompleteRequiresSuccessfulPlainSummary(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			_, err := Complete(test.response, testScope, testSecret)
+			_, err := Complete(test.response, KeyMaterial{Scope: testScope, Secret: testSecret}, nil)
 			if !errors.Is(err, test.want) {
 				t.Fatalf("Complete() error = %v, want %v", err, test.want)
 			}
@@ -213,17 +213,17 @@ func TestCompleteRequiresSuccessfulPlainSummary(t *testing.T) {
 
 func TestPrepareRequiresKeyOnlyWhenCompactionIsPresent(t *testing.T) {
 	ordinary := []byte(`{"input":[{"type":"message","role":"user","content":"hello"}]}`)
-	prepared, requested, err := Prepare(ordinary, "", nil)
+	prepared, requested, err := Prepare(ordinary, KeyMaterial{}, nil)
 	if err != nil || requested || !bytes.Equal(prepared, ordinary) {
 		t.Fatalf("ordinary Prepare() = %s, %v, %v", prepared, requested, err)
 	}
 	trigger := []byte(`{"input":[{"type":"compaction_trigger"}]}`)
-	_, _, err = Prepare(trigger, "", nil)
+	_, _, err = Prepare(trigger, KeyMaterial{}, nil)
 	if !errors.Is(err, ErrScopeRequired) {
 		t.Fatalf("trigger Prepare() error = %v, want ErrScopeRequired", err)
 	}
 	longSecret := append(append([]byte(nil), testSecret...), 'x')
-	_, _, err = Prepare(trigger, testScope, longSecret)
+	_, _, err = Prepare(trigger, KeyMaterial{Scope: testScope, Secret: longSecret}, nil)
 	if !errors.Is(err, ErrScopeRequired) {
 		t.Fatalf("trigger Prepare() with a non-32-byte key error = %v, want ErrScopeRequired", err)
 	}
@@ -243,4 +243,52 @@ func summaryResponse(summary string) []byte {
 		panic(err)
 	}
 	return response
+}
+
+func TestPrepareMigratesLegacyCapsuleAndCompletesWithActiveKey(t *testing.T) {
+	legacy := KeyMaterial{Scope: "legacy-scope", Secret: bytes.Repeat([]byte{0x77}, 32)}
+	active := KeyMaterial{Scope: "stable-root-scope", Secret: bytes.Repeat([]byte{0x88}, 32)}
+	response := summaryResponse("Keep the capsule across token renewal.")
+	legacyResult, err := Complete(response, legacy, nil)
+	if err != nil {
+		t.Fatalf("complete legacy result: %v", err)
+	}
+	capsule := compactionCapsuleFromTestResponse(legacyResult)
+	if capsule == "" {
+		t.Fatalf("legacy result has no capsule: %s", legacyResult)
+	}
+	request := []byte(`{"input":[{"type":"compaction","encrypted_content":"` + capsule + `"},{"type":"compaction_trigger"}]}`)
+	prepared, requested, err := Prepare(request, active, []KeyMaterial{legacy})
+	if err != nil || !requested {
+		t.Fatalf("prepare migrated request: requested=%v error=%v", requested, err)
+	}
+	if !bytes.Contains(prepared, []byte("Keep the capsule across token renewal.")) || bytes.Contains(prepared, []byte(capsule)) {
+		t.Fatalf("legacy capsule was not expanded: %s", prepared)
+	}
+	activeResult, err := Complete(response, active, []KeyMaterial{legacy})
+	if err != nil {
+		t.Fatalf("complete active result: %v", err)
+	}
+	activeCapsule := compactionCapsuleFromTestResponse(activeResult)
+	activeReplay := []byte(`{"input":[{"type":"compaction","encrypted_content":"` + activeCapsule + `"}]}`)
+	if _, _, err := Prepare(activeReplay, active, nil); err != nil {
+		t.Fatalf("active capsule did not use stable key: %v", err)
+	}
+}
+
+func compactionCapsuleFromTestResponse(payload []byte) string {
+	var result map[string]any
+	if json.Unmarshal(payload, &result) != nil {
+		return ""
+	}
+	output, ok := result["output"].([]any)
+	if !ok || len(output) < 2 {
+		return ""
+	}
+	item, ok := output[1].(map[string]any)
+	if !ok {
+		return ""
+	}
+	value, _ := item["encrypted_content"].(string)
+	return value
 }

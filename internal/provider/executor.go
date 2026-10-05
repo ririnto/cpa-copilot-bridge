@@ -63,10 +63,17 @@ func (s *Service) Execute(ctx context.Context, req ExecuteRequest) (pluginapi.Ex
 	if errEndpoint != nil {
 		return pluginapi.ExecutorResponse{}, errEndpoint
 	}
-	carrierScope := reasoningCarrierScopeFor(req.AuthID, storage, req.Model, endpoint, token)
+	keyMaterials, errKeyMaterial := continuityKeyMaterialsFor(storage, req.AuthID, req.Model, endpoint, token.APIBaseURL)
+	if errKeyMaterial != nil {
+		return pluginapi.ExecutorResponse{}, statusError("auth_state_refresh_required", "Refresh Copilot authentication before making this request", http.StatusConflict)
+	}
+	carrierScope := reasoningCarrierScopeFor(req.AuthID, req.Model, endpoint, token.APIBaseURL, keyMaterials)
 	translationPayload, errClaudeInput = unwrapRequestReasoningCarriers(sourceFormat, translationPayload, carrierScope)
 	if errClaudeInput != nil {
 		return pluginapi.ExecutorResponse{}, statusError("reasoning_carrier_error", errClaudeInput.Error(), http.StatusUnprocessableEntity)
+	}
+	if errValidate := validateReasoningRequestForEndpoint(sourceFormat, translationPayload, endpoint); errValidate != nil {
+		return pluginapi.ExecutorResponse{}, statusError("translation_error", errValidate.Error(), http.StatusUnprocessableEntity)
 	}
 	if (v1Compact || v2Compact) && endpoint != translate.EndpointResponses {
 		return pluginapi.ExecutorResponse{}, statusError("unsupported_compaction_endpoint", "Responses compaction requires the Copilot Responses endpoint", http.StatusUnprocessableEntity)
@@ -86,7 +93,7 @@ func (s *Service) Execute(ctx context.Context, req ExecuteRequest) (pluginapi.Ex
 		sessionPayload = req.Payload
 	}
 	sessionID, agentID := protocolSessionIdentity(sessionPayload, req.Headers, req.Metadata)
-	scopeKey := protocolScopeKey(req.AuthID, storage.GitHubAccessToken, req.Model, token.APIBaseURL, endpoint, sessionID, agentID, token.ConfigGeneration)
+	scopeKey := protocolScopeKey(req.AuthID, storage, req.Model, token.APIBaseURL, endpoint, sessionID, agentID, token.ConfigGeneration)
 	if endpoint == translate.EndpointResponses {
 		if sourceFormat == "claude" {
 			requestBody = s.restoreReasoningReplay(scopeKey, req.OriginalRequest, requestBody)
@@ -94,7 +101,6 @@ func (s *Service) Execute(ctx context.Context, req ExecuteRequest) (pluginapi.Ex
 			requestBody = s.restoreNativeResponsesReplay(scopeKey, requestBody)
 		}
 	}
-	compactionScope, compactionSecret := compactionKeyMaterial(req.AuthID, storage.GitHubAccessToken, req.Model, endpoint, token.APIBaseURL)
 	compactionRequested := false
 	if s.compactionEnabled(req.Model) && endpoint == translate.EndpointResponses {
 		if v1Compact {
@@ -103,7 +109,7 @@ func (s *Service) Execute(ctx context.Context, req ExecuteRequest) (pluginapi.Ex
 				return pluginapi.ExecutorResponse{}, statusError("invalid_compaction_request", errTranslate.Error(), http.StatusBadRequest)
 			}
 		}
-		requestBody, compactionRequested, errTranslate = compact.Prepare(requestBody, compactionScope, compactionSecret)
+		requestBody, compactionRequested, errTranslate = compact.Prepare(requestBody, keyMaterials.Active, keyMaterials.Legacy)
 		if errTranslate != nil {
 			return pluginapi.ExecutorResponse{}, statusError("invalid_compaction_request", errTranslate.Error(), http.StatusBadRequest)
 		}
@@ -121,12 +127,17 @@ func (s *Service) Execute(ctx context.Context, req ExecuteRequest) (pluginapi.Ex
 			return pluginapi.ExecutorResponse{}, statusError("translation_error", errTranslate.Error(), http.StatusUnprocessableEntity)
 		}
 	}
+	if endpoint == translate.EndpointResponses {
+		if errValidate := translate.ValidateCopilotResponsesToolIDLengths(requestBody); errValidate != nil {
+			return pluginapi.ExecutorResponse{}, statusError("responses_tool_id_too_long", errValidate.Error(), http.StatusUnprocessableEntity)
+		}
+	}
 	resp, token, errDo := s.doModelRequest(ctx, req.HostCallbackID, req.AuthID, storage, token, endpoint, requestBody, false)
 	if errDo != nil {
 		return pluginapi.ExecutorResponse{}, errDo
 	}
 	if compactionRequested {
-		body, errComplete := compact.Complete(resp.Body, compactionScope, compactionSecret)
+		body, errComplete := compact.Complete(resp.Body, keyMaterials.Active, keyMaterials.Legacy)
 		if errComplete != nil {
 			return pluginapi.ExecutorResponse{}, statusError("compaction_error", redact.ErrorBody([]byte(errComplete.Error()), token.Token, storage.GitHubAccessToken), http.StatusBadGateway)
 		}
@@ -204,10 +215,17 @@ func (s *Service) ExecuteStream(ctx context.Context, req ExecuteRequest) (http.H
 	if errEndpoint != nil {
 		return nil, errEndpoint
 	}
-	carrierScope := reasoningCarrierScopeFor(req.AuthID, storage, req.Model, endpoint, token)
+	keyMaterials, errKeyMaterial := continuityKeyMaterialsFor(storage, req.AuthID, req.Model, endpoint, token.APIBaseURL)
+	if errKeyMaterial != nil {
+		return nil, statusError("auth_state_refresh_required", "Refresh Copilot authentication before making this request", http.StatusConflict)
+	}
+	carrierScope := reasoningCarrierScopeFor(req.AuthID, req.Model, endpoint, token.APIBaseURL, keyMaterials)
 	translationPayload, errClaudeInput = unwrapRequestReasoningCarriers(sourceFormat, translationPayload, carrierScope)
 	if errClaudeInput != nil {
 		return nil, statusError("reasoning_carrier_error", errClaudeInput.Error(), http.StatusUnprocessableEntity)
+	}
+	if errValidate := validateReasoningRequestForEndpoint(sourceFormat, translationPayload, endpoint); errValidate != nil {
+		return nil, statusError("translation_error", errValidate.Error(), http.StatusUnprocessableEntity)
 	}
 	requestBody, errTranslate := translate.RequestForEndpointFrom(sourceFormat, req.Model, translationPayload, true, endpoint)
 	if errTranslate != nil {
@@ -224,7 +242,7 @@ func (s *Service) ExecuteStream(ctx context.Context, req ExecuteRequest) (http.H
 		sessionPayload = req.Payload
 	}
 	sessionID, agentID := protocolSessionIdentity(sessionPayload, req.Headers, req.Metadata)
-	scopeKey := protocolScopeKey(req.AuthID, storage.GitHubAccessToken, req.Model, token.APIBaseURL, endpoint, sessionID, agentID, token.ConfigGeneration)
+	scopeKey := protocolScopeKey(req.AuthID, storage, req.Model, token.APIBaseURL, endpoint, sessionID, agentID, token.ConfigGeneration)
 	if endpoint == translate.EndpointResponses {
 		if sourceFormat == "claude" {
 			requestBody = s.restoreReasoningReplay(scopeKey, req.OriginalRequest, requestBody)
@@ -233,8 +251,7 @@ func (s *Service) ExecuteStream(ctx context.Context, req ExecuteRequest) (http.H
 		}
 	}
 	if s.compactionEnabled(req.Model) && endpoint == translate.EndpointResponses {
-		compactionScope, compactionSecret := compactionKeyMaterial(req.AuthID, storage.GitHubAccessToken, req.Model, endpoint, token.APIBaseURL)
-		requestBody, _, errTranslate = compact.Prepare(requestBody, compactionScope, compactionSecret)
+		requestBody, _, errTranslate = compact.Prepare(requestBody, keyMaterials.Active, keyMaterials.Legacy)
 		if errTranslate != nil {
 			return nil, statusError("invalid_compaction_request", errTranslate.Error(), http.StatusBadRequest)
 		}
@@ -250,6 +267,11 @@ func (s *Service) ExecuteStream(ctx context.Context, req ExecuteRequest) (http.H
 		requestBody, errTranslate = setPromptCacheKey(requestBody, cacheKey)
 		if errTranslate != nil {
 			return nil, statusError("translation_error", errTranslate.Error(), http.StatusUnprocessableEntity)
+		}
+	}
+	if endpoint == translate.EndpointResponses {
+		if errValidate := translate.ValidateCopilotResponsesToolIDLengths(requestBody); errValidate != nil {
+			return nil, statusError("responses_tool_id_too_long", errValidate.Error(), http.StatusUnprocessableEntity)
 		}
 	}
 	upstream, token, errOpen := s.openModelStream(ctx, req.HostCallbackID, req.AuthID, storage, token, endpoint, requestBody)

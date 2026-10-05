@@ -211,6 +211,9 @@ func copilotAnchorForMessage(message gjson.Result, request []byte) copilotOpaque
 	anchor := copilotOpaqueAnchor{}
 	message.Get("tool_calls").ForEach(func(_, call gjson.Result) bool {
 		id := call.Get("id").String()
+		if _, callID, encoded, err := parseClaudeToolID(id); err == nil && encoded {
+			id = callID
+		}
 		if id != "" {
 			anchor.ToolCallIDs = append(anchor.ToolCallIDs, id)
 			function := call.Get("function")
@@ -560,7 +563,11 @@ func sameToolCallIDs(message []byte, expected []string) bool {
 		return len(expected) == 0 && (!calls.Exists() || len(calls.Array()) == 0)
 	}
 	for index, call := range calls.Array() {
-		if call.Get("id").String() != expected[index] {
+		id := call.Get("id").String()
+		if _, callID, encoded, err := parseClaudeToolID(id); err == nil && encoded {
+			id = callID
+		}
+		if id != expected[index] {
 			return false
 		}
 	}

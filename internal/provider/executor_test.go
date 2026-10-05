@@ -167,7 +167,16 @@ func newCompactionStreamService(t *testing.T, host *compactionStreamHost) *Servi
 }
 
 func compactionStreamRequest(payload []byte, alt string) ExecuteRequest {
-	storage, _ := json.Marshal(authStorage{Type: providerID, GitHubAccessToken: "github-token-for-compaction-test", GitHubLogin: "test-user"})
+	fixture := continuityTestStorage("github-token-for-compaction-test")
+	fixture.Type = providerID
+	fixture.GitHubLogin = "test-user"
+	fixture.ContinuityKeyring.LegacyV1 = &legacyContinuityKey{
+		AccountID:             fixture.GitHubUserID,
+		AuthID:                "auth-id",
+		CredentialFingerprint: tokenFingerprint(fixture.GitHubAccessToken),
+		APIBaseURL:            "https://api.example",
+	}
+	storage, _ := json.Marshal(fixture)
 	return ExecuteRequest{
 		ExecutorRequest: pluginapi.ExecutorRequest{
 			AuthID:          "auth-id",
@@ -342,7 +351,7 @@ func TestExecuteStreamExpandsCompactionCapsuleBeforeUpstreamRequest(t *testing.T
 	const githubToken = "github-token-for-compaction-test"
 	model := "gpt-5.6-sol"
 	scope, secret := compactionKeyMaterial("auth-id", githubToken, model, translate.EndpointResponses, "https://api.example")
-	completed, err := compact.Complete(compactionStreamResponse("completed"), scope, secret)
+	completed, err := compact.Complete(compactionStreamResponse("completed"), compact.KeyMaterial{Scope: scope, Secret: secret}, nil)
 	if err != nil {
 		t.Fatalf("create compaction fixture: %v", err)
 	}
@@ -494,5 +503,136 @@ func TestCollectStreamErrorRedactsSecretsAndCapsBody(t *testing.T) {
 	}
 	if !host.closed {
 		t.Fatal("bounded error stream was not closed")
+	}
+}
+
+func TestResponsesToolIDLimitsRejectBeforeUpstreamAndPreserveValidIDs(t *testing.T) {
+	const model = "gpt-5.6-sol"
+	const id64 = "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii"
+	const callID64 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	for _, stream := range []bool{false, true} {
+		for _, test := range []struct {
+			name   string
+			id     string
+			callID string
+			valid  bool
+		}{
+			{name: "item ID over limit", id: id64 + "x", callID: callID64},
+			{name: "call ID over limit", id: id64, callID: callID64 + "x"},
+			{name: "both IDs at limit", id: id64, callID: callID64, valid: true},
+		} {
+			t.Run(fmt.Sprintf("stream_%t/%s", stream, test.name), func(t *testing.T) {
+				host := newCompactionStreamHost(compactionStreamResponse("completed"))
+				host.allowStream = true
+				service := newCompactionStreamService(t, host)
+				payload, err := json.Marshal(map[string]any{
+					"model": model,
+					"input": []any{map[string]any{
+						"type": "function_call", "id": test.id, "call_id": test.callID, "name": "inspect", "arguments": "{}",
+					}},
+				})
+				if err != nil {
+					t.Fatalf("encode request: %v", err)
+				}
+				request := compactionStreamRequest(payload, "")
+				if stream {
+					_, err = service.ExecuteStream(context.Background(), request)
+				} else {
+					_, err = service.Execute(context.Background(), request)
+				}
+				if !test.valid {
+					var statusErr *StatusError
+					if !errors.As(err, &statusErr) || statusErr.Code != "responses_tool_id_too_long" || statusErr.HTTPStatus != http.StatusUnprocessableEntity {
+						t.Fatalf("request error = %#v, want pre-upstream 422 tool ID error", err)
+					}
+					if !strings.Contains(statusErr.Message, "input[0]") || !strings.Contains(statusErr.Message, "64 characters") {
+						t.Fatalf("tool ID error lacks path or limit: %s", statusErr.Message)
+					}
+					for _, upstreamRequest := range host.requestSnapshot() {
+						if strings.HasSuffix(upstreamRequest.URL, translate.EndpointResponses) {
+							t.Fatalf("invalid tool ID was sent upstream: %s", upstreamRequest.URL)
+						}
+					}
+					host.mu.Lock()
+					opened := host.openCount
+					host.mu.Unlock()
+					if opened != 0 || len(host.streamRequestBody()) != 0 {
+						t.Fatalf("invalid streaming tool ID opened upstream: opened=%d body=%s", opened, host.streamRequestBody())
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("request with 64-character IDs: %v", err)
+				}
+				var upstreamBody []byte
+				if stream {
+					upstreamBody = host.streamRequestBody()
+					collectCompactionStreamFrames(t, host)
+				} else {
+					for _, upstreamRequest := range host.requestSnapshot() {
+						if strings.HasSuffix(upstreamRequest.URL, translate.EndpointResponses) {
+							upstreamBody = upstreamRequest.Body
+						}
+					}
+				}
+				if got := gjson.GetBytes(upstreamBody, "input.0.id").String(); got != id64 {
+					t.Fatalf("upstream item ID changed: length=%d body=%s", len(got), upstreamBody)
+				}
+				if got := gjson.GetBytes(upstreamBody, "input.0.call_id").String(); got != callID64 {
+					t.Fatalf("upstream call ID changed: length=%d body=%s", len(got), upstreamBody)
+				}
+			})
+		}
+	}
+}
+
+func TestResponsesToolIDLimitDoesNotApplyToChatEndpoint(t *testing.T) {
+	const model = "gpt-5.6-sol"
+	longID := strings.Repeat("i", 65)
+	longCallID := strings.Repeat("c", 65)
+	chatResponse := []byte(`{"id":"chatcmpl_test","object":"chat.completion","model":"` + model + `","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	host := newCompactionStreamHost(chatResponse)
+	service := New(host)
+	if err := service.Configure([]byte("model_endpoint_overrides:\n  " + model + ": /chat/completions\n")); err != nil {
+		t.Fatalf("configure service: %v", err)
+	}
+	_, generation := service.configSnapshot()
+	githubToken := "github-token-for-compaction-test"
+	service.tokenEntries["auth-id"] = copilotTokenEntry{
+		Token:            "copilot-token",
+		APIBaseURL:       "https://api.example",
+		ExpiresAt:        time.Now().Add(time.Hour),
+		Fingerprint:      tokenFingerprint(githubToken),
+		ConfigGeneration: generation,
+	}
+	payload, err := json.Marshal(map[string]any{
+		"model": model,
+		"input": []any{
+			map[string]any{"type": "function_call", "id": longID, "call_id": longCallID, "name": "inspect", "arguments": "{}"},
+			map[string]any{"type": "function_call_output", "call_id": longCallID, "output": "done"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("encode request: %v", err)
+	}
+	if _, err := service.Execute(context.Background(), compactionStreamRequest(payload, "")); err != nil {
+		t.Fatalf("Chat endpoint rejected long Responses history IDs: %v", err)
+	}
+	var chatBody []byte
+	for _, request := range host.requestSnapshot() {
+		if strings.HasSuffix(request.URL, translate.EndpointChatCompletions) {
+			chatBody = request.Body
+		}
+	}
+	if len(chatBody) == 0 {
+		t.Fatal("Chat request was not sent upstream")
+	}
+	carrier := gjson.GetBytes(chatBody, "messages.0.tool_calls.0.id").String()
+	itemID, callID, ok := translate.DecodeClaudeToolIDs(carrier)
+	if !ok || itemID != longID || callID != longCallID {
+		t.Fatalf("Chat endpoint changed long history IDs: (%q, %q, %t); body=%s", itemID, callID, ok, chatBody)
+	}
+	if got := gjson.GetBytes(chatBody, "messages.1.tool_call_id").String(); got != carrier {
+		t.Fatalf("Chat tool output ID = %q, want matching carrier %q", got, carrier)
 	}
 }

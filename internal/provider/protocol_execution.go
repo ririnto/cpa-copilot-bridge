@@ -22,7 +22,10 @@ func (s *Service) compactionEnabled(model string) bool {
 }
 
 func compactionKeyMaterial(authID, credential, model, endpoint, apiBaseURL string) (string, []byte) {
-	credentialHash := tokenFingerprint(credential)
+	return compactionKeyMaterialFromFingerprint(authID, tokenFingerprint(credential), model, endpoint, apiBaseURL)
+}
+
+func compactionKeyMaterialFromFingerprint(authID, credentialHash, model, endpoint, apiBaseURL string) (string, []byte) {
 	secret, err := hex.DecodeString(credentialHash)
 	if err != nil {
 		return "", nil

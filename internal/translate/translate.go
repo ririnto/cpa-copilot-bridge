@@ -94,7 +94,11 @@ func requestFromResponsesToChat(model string, body []byte, stream bool) ([]byte,
 	if err := rejectOpaqueReasoningRequest(sdktranslator.FormatOpenAIResponse, sdktranslator.FormatOpenAI, body); err != nil {
 		return nil, err
 	}
-	out := registry.TranslateRequest(sdktranslator.FormatOpenAIResponse, sdktranslator.FormatOpenAI, model, body, stream)
+	carriedBody, err := responsesRequestToChatToolIDs(body)
+	if err != nil {
+		return nil, err
+	}
+	out := registry.TranslateRequest(sdktranslator.FormatOpenAIResponse, sdktranslator.FormatOpenAI, model, carriedBody, stream)
 	if len(out) == 0 || !json.Valid(out) {
 		return nil, fmt.Errorf("official Responses-to-Chat request translation failed")
 	}

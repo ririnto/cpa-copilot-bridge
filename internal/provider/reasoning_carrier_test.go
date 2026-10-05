@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ririnto/cpa-copilot-bridge/internal/compact"
 	"github.com/ririnto/cpa-copilot-bridge/internal/translate"
 	"github.com/ririnto/cpa-copilot-bridge/internal/transport"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -53,7 +55,7 @@ func TestReasoningCarrierJSONRoundTripsForClaudeAndResponses(t *testing.T) {
 				t.Fatalf("seal translated response: %v", err)
 			}
 			sealedValue := gjson.GetBytes(sealed, test.responseAt).String()
-			if !strings.HasPrefix(sealedValue, sealedReasoningCarrierPrefix) {
+			if !strings.HasPrefix(sealedValue, sealedReasoningCarrierV2Prefix) {
 				t.Fatalf("response carrier was not sealed: %s", sealed)
 			}
 			inner, err := unsealReasoningCarrier(sealedValue, scope)
@@ -134,7 +136,7 @@ func TestReasoningCarrierStreamRoundTripsForClaudeAndResponses(t *testing.T) {
 			if test.dest == "openai-response" {
 				data = gjson.Get(dataJSON, "item.encrypted_content")
 			}
-			if !strings.HasPrefix(data.String(), sealedReasoningCarrierPrefix) {
+			if !strings.HasPrefix(data.String(), sealedReasoningCarrierV2Prefix) {
 				t.Fatalf("stream carrier was not sealed: %q", sealedFrame)
 			}
 			request := []byte(strings.ReplaceAll(test.request, "WRAPPED", data.String()))
@@ -161,7 +163,9 @@ func TestReasoningCarrierRejectsScopeChangesTamperingAndUnsealedValues(t *testin
 		change func(*reasoningCarrierScope)
 	}{
 		{name: "auth id", change: func(scope *reasoningCarrierScope) { scope.AuthID = "auth-b" }},
-		{name: "credential", change: func(scope *reasoningCarrierScope) { scope.Credential = "credential-b" }},
+		{name: "account key", change: func(scope *reasoningCarrierScope) {
+			scope.Keys = testCarrierKeysWithRoot(scope.AuthID, scope.Model, scope.Endpoint, scope.APIBaseURL, bytes.Repeat([]byte{0x55}, 32))
+		}},
 		{name: "API origin", change: func(scope *reasoningCarrierScope) { scope.APIBaseURL = "https://other.example" }},
 		{name: "model", change: func(scope *reasoningCarrierScope) { scope.Model = "other-model" }},
 		{name: "endpoint", change: func(scope *reasoningCarrierScope) { scope.Endpoint = translate.EndpointResponses }},
@@ -171,6 +175,9 @@ func TestReasoningCarrierRejectsScopeChangesTamperingAndUnsealedValues(t *testin
 			t.Parallel()
 			wrongScope := scope
 			test.change(&wrongScope)
+			if test.name != "account key" {
+				wrongScope.Keys = testCarrierKeys(wrongScope.AuthID, wrongScope.Model, wrongScope.Endpoint, wrongScope.APIBaseURL)
+			}
 			if _, err := unsealReasoningCarrier(sealed, wrongScope); err == nil {
 				t.Fatal("carrier accepted under a different scope")
 			}
@@ -188,15 +195,27 @@ func TestReasoningCarrierRejectsScopeChangesTamperingAndUnsealedValues(t *testin
 
 func TestReasoningCarrierSurvivesSameCredentialRenewalAndReload(t *testing.T) {
 	t.Parallel()
-	storage := authStorage{GitHubAccessToken: "credential-a"}
+	keyring, err := newContinuityKeyring(4242, "credential-a")
+	if err != nil {
+		t.Fatalf("make continuity keyring: %v", err)
+	}
+	storage := authStorage{GitHubAccessToken: "credential-a", GitHubUserID: 4242, ContinuityKeyring: keyring}
 	issuedToken := copilotTokenEntry{Token: "ephemeral-before-renewal", APIBaseURL: "https://api.example", ConfigGeneration: 3}
-	issuedScope := reasoningCarrierScopeFor("auth-a", storage, "test-chat", translate.EndpointChatCompletions, issuedToken)
+	issuedKeys, err := continuityKeyMaterialsFor(storage, "auth-a", "test-chat", translate.EndpointChatCompletions, issuedToken.APIBaseURL)
+	if err != nil {
+		t.Fatalf("make issued carrier keys: %v", err)
+	}
+	issuedScope := reasoningCarrierScopeFor("auth-a", "test-chat", translate.EndpointChatCompletions, issuedToken.APIBaseURL, issuedKeys)
 	sealed, err := sealReasoningCarrier(testInnerReasoningCarrier(), issuedScope)
 	if err != nil {
 		t.Fatalf("seal carrier: %v", err)
 	}
 	reloadedToken := copilotTokenEntry{Token: "ephemeral-after-renewal", APIBaseURL: "https://api.example", ConfigGeneration: 81}
-	reloadedScope := reasoningCarrierScopeFor("auth-a", storage, "test-chat", translate.EndpointChatCompletions, reloadedToken)
+	reloadedKeys, err := continuityKeyMaterialsFor(storage, "auth-a", "test-chat", translate.EndpointChatCompletions, reloadedToken.APIBaseURL)
+	if err != nil {
+		t.Fatalf("make reloaded carrier keys: %v", err)
+	}
+	reloadedScope := reasoningCarrierScopeFor("auth-a", "test-chat", translate.EndpointChatCompletions, reloadedToken.APIBaseURL, reloadedKeys)
 	inner, err := unsealReasoningCarrier(sealed, reloadedScope)
 	if err != nil || inner != testInnerReasoningCarrier() {
 		t.Fatalf("carrier did not survive same-auth reload/token renewal: inner=%q err=%v", inner, err)
@@ -207,7 +226,7 @@ func TestExecuteRejectsCrossAuthReasoningBeforeModelPost(t *testing.T) {
 	t.Parallel()
 	host := &reasoningCarrierHost{}
 	service, storage := newReasoningCarrierService(host, "auth-b", "credential-b")
-	issuedScope := reasoningCarrierScope{AuthID: "auth-a", Credential: "credential-a", Model: "test-chat", Endpoint: translate.EndpointChatCompletions, APIBaseURL: "https://api.example"}
+	issuedScope := testReasoningCarrierScope()
 	sealed, err := sealReasoningCarrier(testInnerReasoningCarrier(), issuedScope)
 	if err != nil {
 		t.Fatalf("seal cross-auth fixture: %v", err)
@@ -246,6 +265,146 @@ func TestRequestCarrierLeavesNativeSignaturesAndOrdinaryTextUntouched(t *testing
 	}
 }
 
+func TestChatReasoningPreflightRejectsForeignOpaqueHistory(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name    string
+		format  string
+		payload string
+		wantErr string
+	}{
+		{
+			name:    "Claude signature",
+			format:  "claude",
+			payload: `{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"prior","signature":"foreign-signature-sentinel"}]}]}`,
+			wantErr: "foreign Claude thinking signatures cannot be replayed to Copilot Chat",
+		},
+		{
+			name:    "Claude redacted thinking",
+			format:  "claude",
+			payload: `{"messages":[{"role":"assistant","content":[{"type":"redacted_thinking","data":"foreign-redacted-sentinel"}]}]}`,
+			wantErr: "Claude redacted thinking cannot be replayed to Copilot Chat",
+		},
+		{
+			name:    "Responses encrypted content",
+			format:  "openai-response",
+			payload: `{"input":[{"type":"reasoning","encrypted_content":"foreign-encrypted-sentinel"}]}`,
+			wantErr: "foreign Responses reasoning cannot be replayed to Copilot Chat",
+		},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			scope := testReasoningCarrierScope()
+			unwrapped, err := unwrapRequestReasoningCarriers(test.format, []byte(test.payload), scope)
+			if err != nil {
+				t.Fatalf("unwrap foreign opaque history: %v", err)
+			}
+			err = validateReasoningRequestForEndpoint(test.format, unwrapped, translate.EndpointChatCompletions)
+			if err == nil || err.Error() != test.wantErr {
+				t.Fatalf("Chat preflight error = %v, want %q", err, test.wantErr)
+			}
+			if strings.Contains(err.Error(), "sentinel") {
+				t.Fatalf("Chat preflight exposed request content: %v", err)
+			}
+		})
+	}
+}
+
+func TestChatReasoningPreflightAcceptsAuthenticatedCarriersOnly(t *testing.T) {
+	t.Parallel()
+	scope := testReasoningCarrierScope()
+	sealed := sealCarrierForTest(t, scope)
+	for _, test := range []struct {
+		name    string
+		format  string
+		payload string
+	}{
+		{
+			name:    "Claude signature",
+			format:  "claude",
+			payload: `{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"prior","signature":"SEALED"}]}]}`,
+		},
+		{
+			name:    "Responses encrypted content",
+			format:  "openai-response",
+			payload: `{"input":[{"type":"reasoning","encrypted_content":"SEALED"}]}`,
+		},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			payload := []byte(strings.ReplaceAll(test.payload, "SEALED", sealed))
+			unwrapped, err := unwrapRequestReasoningCarriers(test.format, payload, scope)
+			if err != nil {
+				t.Fatalf("unwrap authenticated carrier: %v", err)
+			}
+			if err := validateReasoningRequestForEndpoint(test.format, unwrapped, translate.EndpointChatCompletions); err != nil {
+				t.Fatalf("Chat preflight rejected authenticated carrier: %v", err)
+			}
+		})
+	}
+}
+
+func TestChatReasoningPreflightIgnoresOrdinaryTextAndToolData(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name    string
+		format  string
+		payload string
+	}{
+		{
+			name:    "Claude text and tool input",
+			format:  "claude",
+			payload: `{"messages":[{"role":"user","content":[{"type":"text","text":"` + testInnerReasoningCarrier() + `"},{"type":"tool_use","id":"call_1","name":"tool","input":{"value":"` + testInnerReasoningCarrier() + `"}}]}]}`,
+		},
+		{
+			name:    "Responses message and function arguments",
+			format:  "openai-response",
+			payload: `{"input":[{"type":"message","role":"user","content":"` + testInnerReasoningCarrier() + `"},{"type":"function_call","arguments":"{\"value\":\"` + testInnerReasoningCarrier() + `\"}"}]}`,
+		},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if err := validateReasoningRequestForEndpoint(test.format, []byte(test.payload), translate.EndpointChatCompletions); err != nil {
+				t.Fatalf("Chat preflight inspected ordinary content: %v", err)
+			}
+		})
+	}
+}
+
+func TestReasoningPreflightKeepsNativeOpaqueHistory(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name     string
+		format   string
+		endpoint string
+		payload  string
+	}{
+		{
+			name:     "Claude Messages signature and redacted data",
+			format:   "claude",
+			endpoint: translate.EndpointMessages,
+			payload:  `{"messages":[{"role":"assistant","content":[{"type":"thinking","signature":"foreign-signature"},{"type":"redacted_thinking","data":"foreign-data"}]}]}`,
+		},
+		{
+			name:     "Responses encrypted content",
+			format:   "openai-response",
+			endpoint: translate.EndpointResponses,
+			payload:  `{"input":[{"type":"reasoning","encrypted_content":"foreign-encrypted"}]}`,
+		},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if err := validateReasoningRequestForEndpoint(test.format, []byte(test.payload), test.endpoint); err != nil {
+				t.Fatalf("native endpoint rejected opaque history: %v", err)
+			}
+		})
+	}
+}
+
 func TestRequestCarrierRejectsWrongScopeInNonAssistantThinkingSlot(t *testing.T) {
 	t.Parallel()
 	issued := testReasoningCarrierScope()
@@ -255,6 +414,7 @@ func TestRequestCarrierRejectsWrongScopeInNonAssistantThinkingSlot(t *testing.T)
 	}
 	receiver := issued
 	receiver.AuthID = "auth-b"
+	receiver.Keys = testCarrierKeys(receiver.AuthID, receiver.Model, receiver.Endpoint, receiver.APIBaseURL)
 	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"thinking","thinking":"synthetic","signature":"` + sealed + `"}]}]}`)
 	if _, err := unwrapRequestReasoningCarriers("claude", payload, receiver); err == nil {
 		t.Fatal("wrong-scope carrier in a non-assistant thinking slot was accepted")
@@ -262,7 +422,30 @@ func TestRequestCarrierRejectsWrongScopeInNonAssistantThinkingSlot(t *testing.T)
 }
 
 func testReasoningCarrierScope() reasoningCarrierScope {
-	return reasoningCarrierScope{AuthID: "auth-a", Credential: "credential-a", Model: "test-chat", Endpoint: translate.EndpointChatCompletions, APIBaseURL: "https://api.example"}
+	return reasoningCarrierScopeFor("auth-a", "test-chat", translate.EndpointChatCompletions, "https://api.example", testCarrierKeys("auth-a", "test-chat", translate.EndpointChatCompletions, "https://api.example"))
+}
+
+func testCarrierKeys(authID, model, endpoint, apiBaseURL string) artifactKeyMaterials {
+	return testCarrierKeysWithRoot(authID, model, endpoint, apiBaseURL, bytes.Repeat([]byte{0x44}, 32))
+}
+
+func testCarrierKeysWithRoot(authID, model, endpoint, apiBaseURL string, root []byte) artifactKeyMaterials {
+	storage := authStorage{
+		GitHubAccessToken: "fixture-credential",
+		GitHubUserID:      4242,
+		ContinuityKeyring: &continuityKeyring{
+			Version:               continuityKeyringVersion,
+			KeyID:                 "fixture-key-id",
+			AccountID:             4242,
+			RootKey:               base64.RawURLEncoding.EncodeToString(root),
+			CredentialFingerprint: tokenFingerprint("fixture-credential"),
+		},
+	}
+	keys, err := continuityKeyMaterialsFor(storage, authID, model, endpoint, apiBaseURL)
+	if err != nil {
+		panic(err)
+	}
+	return keys
 }
 
 func testInnerReasoningCarrier() string {
@@ -309,7 +492,11 @@ func (*reasoningCarrierHost) CloseOutput(context.Context, string, string) {}
 
 func newReasoningCarrierService(host *reasoningCarrierHost, authID, credential string) (*Service, authStorage) {
 	now := time.Now().UTC()
-	storage := authStorage{Type: providerID, GitHubAccessToken: credential}
+	keyring, err := newContinuityKeyring(4242, credential)
+	if err != nil {
+		panic(err)
+	}
+	storage := authStorage{Type: providerID, GitHubAccessToken: credential, GitHubUserID: 4242, ContinuityKeyring: keyring}
 	fingerprint := tokenFingerprint(credential)
 	service := New(host)
 	service.now = func() time.Time { return now }
@@ -351,10 +538,10 @@ func extractReasoningCarrierSSEData(t *testing.T, frame []byte) string {
 	return ""
 }
 
-func TestReasoningCarrierRejectsEmptyCredential(t *testing.T) {
+func TestReasoningCarrierRejectsMissingContinuityKey(t *testing.T) {
 	t.Parallel()
 	scope := testReasoningCarrierScope()
-	scope.Credential = ""
+	scope.Keys.Active = compact.KeyMaterial{}
 	if _, err := sealReasoningCarrier(testInnerReasoningCarrier(), scope); err == nil {
 		t.Fatal("carrier was sealed without a credential-derived key")
 	}
@@ -373,12 +560,42 @@ func TestReasoningCarrierPayloadEncodingIsCanonical(t *testing.T) {
 	t.Parallel()
 	scope := testReasoningCarrierScope()
 	sealed := sealCarrierForTest(t, scope)
-	encoded, _, ok := strings.Cut(strings.TrimPrefix(sealed, sealedReasoningCarrierPrefix), ".")
+	encoded, _, ok := strings.Cut(strings.TrimPrefix(sealed, sealedReasoningCarrierV2Prefix), ".")
 	if !ok {
 		t.Fatal("sealed format has no payload separator")
 	}
 	inner, err := base64.RawURLEncoding.DecodeString(encoded)
 	if err != nil || string(inner) != testInnerReasoningCarrier() {
 		t.Fatalf("sealed inner payload = %q, err=%v", inner, err)
+	}
+}
+
+func TestLegacyReasoningCarrierMigratesToStableV2(t *testing.T) {
+	t.Parallel()
+	storage := continuityTestStorage("credential-after-oauth-refresh")
+	storage.ContinuityKeyring.LegacyV1 = &legacyContinuityKey{
+		AccountID:             storage.GitHubUserID,
+		AuthID:                "auth-a",
+		CredentialFingerprint: tokenFingerprint("credential-before-oauth-refresh"),
+		APIBaseURL:            "https://api.example",
+	}
+	keys, err := continuityKeyMaterialsFor(storage, "auth-a", "test-chat", translate.EndpointChatCompletions, "https://api.example")
+	if err != nil || len(keys.Legacy) != 1 {
+		t.Fatalf("legacy carrier materials = %#v, err=%v", keys, err)
+	}
+	legacyKey := keys.Legacy[0]
+	inner := []byte(testInnerReasoningCarrier())
+	mac := reasoningCarrierMAC(legacyKey.Secret, legacyKey.Scope, inner, reasoningCarrierMACDomainV1)
+	sealed := sealedReasoningCarrierV1Prefix + base64.RawURLEncoding.EncodeToString(inner) + "." + base64.RawURLEncoding.EncodeToString(mac)
+	scope := reasoningCarrierScopeFor("auth-a", "test-chat", translate.EndpointChatCompletions, "https://api.example", keys)
+	request := []byte(`{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"prior","signature":"` + sealed + `"}]}]}`)
+	unwrapped, err := unwrapRequestReasoningCarriers("claude", request, scope)
+	if err != nil || gjson.GetBytes(unwrapped, "messages.0.content.0.signature").String() != testInnerReasoningCarrier() {
+		t.Fatalf("legacy carrier unwrap = %s, err=%v", unwrapped, err)
+	}
+	response := []byte(`{"content":[{"type":"thinking","thinking":"prior","signature":"` + testInnerReasoningCarrier() + `"}]}`)
+	migrated, err := sealResponseReasoningCarriers("claude", response, scope)
+	if err != nil || !strings.HasPrefix(gjson.GetBytes(migrated, "content.0.signature").String(), sealedReasoningCarrierV2Prefix) {
+		t.Fatalf("legacy response carrier migration = %s, err=%v", migrated, err)
 	}
 }

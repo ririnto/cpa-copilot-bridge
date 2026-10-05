@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"regexp"
 	"sort"
@@ -179,11 +180,28 @@ func boundedProtocolIdentity(value string) string {
 	return value
 }
 
-func protocolScopeKey(authID, credential, model, apiBaseURL, endpoint, sessionID, agentID string, generation uint64) string {
+func protocolScopeKey(authID string, storage authStorage, model, apiBaseURL, endpoint, sessionID, agentID string, generation uint64) string {
 	if sessionID == "" {
 		return ""
 	}
-	values := []string{"cpa-copilot-bridge", strings.TrimSpace(authID), tokenFingerprint(credential), strings.ToLower(strings.TrimSpace(model)), strings.TrimRight(strings.TrimSpace(apiBaseURL), "/"), endpoint, sessionID, agentID, strconv.FormatUint(generation, 10)}
+	root, err := validateContinuityKeyring(storage, authID)
+	if err != nil {
+		return ""
+	}
+	rootFingerprint := sha256.Sum256(root)
+	values := []string{
+		"cpa-copilot-bridge/continuity/replay/v1",
+		strings.TrimSpace(authID),
+		fmt.Sprint(storage.GitHubUserID),
+		storage.ContinuityKeyring.KeyID,
+		hex.EncodeToString(rootFingerprint[:]),
+		strings.ToLower(strings.TrimSpace(model)),
+		normalizeContinuityAPIBase(apiBaseURL),
+		endpoint,
+		sessionID,
+		agentID,
+		strconv.FormatUint(generation, 10),
+	}
 	sum := sha256.Sum256([]byte(strings.Join(values, "\x00")))
 	return strconv.FormatUint(generation, 10) + ":" + hex.EncodeToString(sum[:])
 }

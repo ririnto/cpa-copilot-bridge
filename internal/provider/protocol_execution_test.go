@@ -102,21 +102,24 @@ func TestProtocolSessionIdentityAndPromptCacheScope(t *testing.T) {
 	if session != "codex-session-7" || agent != "main" {
 		t.Fatalf("session/agent = %q/%q", session, agent)
 	}
-	scope := protocolScopeKey("auth-a", "github-token-a", "model-a", "https://api.githubcopilot.com", translate.EndpointResponses, session, agent, 0)
-	if got := derivedPromptCacheKey(scope); got == "" || got != derivedPromptCacheKey(protocolScopeKey("auth-a", "github-token-a", "model-a", "https://api.githubcopilot.com", translate.EndpointResponses, session, agent, 0)) {
+	scope := protocolScopeKey("auth-a", continuityTestStorage("github-token-a"), "model-a", "https://api.githubcopilot.com", translate.EndpointResponses, session, agent, 0)
+	if got := derivedPromptCacheKey(scope); got == "" || got != derivedPromptCacheKey(protocolScopeKey("auth-a", continuityTestStorage("github-token-a"), "model-a", "https://api.githubcopilot.com", translate.EndpointResponses, session, agent, 0)) {
 		t.Fatalf("derived cache key is not deterministic: %q", got)
 	}
 	for _, changed := range []string{
-		protocolScopeKey("auth-b", "github-token-a", "model-a", "https://api.githubcopilot.com", translate.EndpointResponses, session, agent, 0),
-		protocolScopeKey("auth-a", "github-token-b", "model-a", "https://api.githubcopilot.com", translate.EndpointResponses, session, agent, 0),
-		protocolScopeKey("auth-a", "github-token-a", "model-b", "https://api.githubcopilot.com", translate.EndpointResponses, session, agent, 0),
-		protocolScopeKey("auth-a", "github-token-a", "model-a", "https://api.githubcopilot.com", translate.EndpointChatCompletions, session, agent, 0),
+		protocolScopeKey("auth-b", continuityTestStorage("github-token-a"), "model-a", "https://api.githubcopilot.com", translate.EndpointResponses, session, agent, 0),
+		protocolScopeKey("auth-a", continuityTestStorage("github-token-a"), "model-b", "https://api.githubcopilot.com", translate.EndpointResponses, session, agent, 0),
+		protocolScopeKey("auth-a", continuityTestStorage("github-token-a"), "model-a", "https://api.githubcopilot.com", translate.EndpointChatCompletions, session, agent, 0),
 	} {
 		if derivedPromptCacheKey(changed) == derivedPromptCacheKey(scope) {
 			t.Fatal("cache key crossed credential, model, or endpoint scope")
 		}
 	}
-	if got := derivedPromptCacheKey(protocolScopeKey("auth-a", "github-token-a", "model-a", "https://api.githubcopilot.com", translate.EndpointResponses, "", agent, 0)); got != "" {
+	rotatedStorage := continuityTestStorage("github-token-b")
+	if rotated := protocolScopeKey("auth-a", rotatedStorage, "model-a", "https://api.githubcopilot.com", translate.EndpointResponses, session, agent, 0); rotated != scope {
+		t.Fatalf("credential rotation changed the continuity cache scope: %q != %q", rotated, scope)
+	}
+	if got := derivedPromptCacheKey(protocolScopeKey("auth-a", continuityTestStorage("github-token-a"), "model-a", "https://api.githubcopilot.com", translate.EndpointResponses, "", agent, 0)); got != "" {
 		t.Fatalf("cache key without session identity = %q", got)
 	}
 }
@@ -129,7 +132,7 @@ func TestCompactionCapsuleSurvivesSameCredentialReconfigure(t *testing.T) {
 	}
 	_, firstGeneration := service.configSnapshot()
 	firstScope, firstSecret := compactionKeyMaterial("auth-a", "github-credential-a", "gpt-5.6-sol", translate.EndpointResponses, "https://api.example")
-	completed, err := compact.Complete([]byte(`{"id":"resp_1","status":"completed","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Keep the active goal and decision."}]}]}`), firstScope, firstSecret)
+	completed, err := compact.Complete([]byte(`{"id":"resp_1","status":"completed","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Keep the active goal and decision."}]}]}`), compact.KeyMaterial{Scope: firstScope, Secret: firstSecret}, nil)
 	if err != nil {
 		t.Fatalf("complete summary: %v", err)
 	}
@@ -158,7 +161,7 @@ func TestCompactionCapsuleSurvivesSameCredentialReconfigure(t *testing.T) {
 	if firstScope != secondScope || string(firstSecret) != string(secondSecret) {
 		t.Fatal("stable compaction key material changed across configuration reload")
 	}
-	prepared, requested, err := compact.Prepare(replayRequest, secondScope, secondSecret)
+	prepared, requested, err := compact.Prepare(replayRequest, compact.KeyMaterial{Scope: secondScope, Secret: secondSecret}, nil)
 	if err != nil || !requested {
 		t.Fatalf("replay after reload: requested=%v error=%v", requested, err)
 	}
@@ -166,7 +169,7 @@ func TestCompactionCapsuleSurvivesSameCredentialReconfigure(t *testing.T) {
 		t.Fatalf("replay did not expand and remove the opaque capsule: %s", prepared)
 	}
 	changedScope, changedSecret := compactionKeyMaterial("auth-a", "github-credential-b", "gpt-5.6-sol", translate.EndpointResponses, "https://api.example")
-	if _, _, err := compact.Prepare(replayRequest, changedScope, changedSecret); err == nil {
+	if _, _, err := compact.Prepare(replayRequest, compact.KeyMaterial{Scope: changedScope, Secret: changedSecret}, nil); err == nil {
 		t.Fatal("capsule decrypted under a changed credential")
 	}
 }

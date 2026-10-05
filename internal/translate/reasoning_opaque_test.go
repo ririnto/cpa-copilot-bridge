@@ -284,7 +284,11 @@ func replayedChatAssistantWithTool(t *testing.T, request []byte, id string) gjso
 			continue
 		}
 		for _, call := range message.Get("tool_calls").Array() {
-			if call.Get("id").String() == id {
+			callID := call.Get("id").String()
+			if _, decodedCallID, ok := DecodeClaudeToolIDs(callID); ok {
+				callID = decodedCallID
+			}
+			if callID == id {
 				if match.Exists() {
 					t.Fatalf("multiple assistant calls match id %q: %s", id, request)
 				}
