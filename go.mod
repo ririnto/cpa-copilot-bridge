@@ -3,7 +3,7 @@ module github.com/ririnto/cpa-copilot-bridge
 go 1.26.8
 
 require (
-	github.com/router-for-me/CLIProxyAPI/v8 v8.0.13
+	github.com/router-for-me/CLIProxyAPI/v8 v8.0.15
 	github.com/tidwall/gjson v1.18.0
 	github.com/tiktoken-go/tokenizer v0.8.1
 	gopkg.in/yaml.v3 v3.0.1
