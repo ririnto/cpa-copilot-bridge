@@ -16,12 +16,12 @@ Claude Code
 official CLIProxyAPI
     |-- built-in Claude OAuth ------> Anthropic subscription
     `-- cliproxyapi-copilot plugin -> GitHub Copilot subscription
-                                      (OpenAI Responses or Chat Completions)
+                                      (OpenAI Responses, Chat Completions,
+                                       or Copilot Messages)
 ```
 
-CCR is not required. The plugin translates Claude Messages requests to the
-Copilot endpoint supported by each model and translates responses back to
-Claude Code.
+CCR is not required.
+The plugin routes Claude Messages requests through each model's supported Copilot endpoint and translates responses for Claude Code.
 
 ## Prerequisites
 
@@ -95,18 +95,8 @@ Build the plugin shared library inside the pinned Go container:
 make build
 ```
 
-Docker Hub currently publishes this CLIProxyAPI release as `v7.2.118` rather
-than the unprefixed `7.2.118` tag that Compose pins. If the pinned tag is not
-already present locally, pull the published tag and create the local
-equivalent:
-
-```bash
-docker image inspect eceasy/cli-proxy-api:7.2.118 >/dev/null 2>&1 ||
-docker pull eceasy/cli-proxy-api:7.2.118 || {
-  docker pull eceasy/cli-proxy-api:v7.2.118
-  docker tag eceasy/cli-proxy-api:v7.2.118 eceasy/cli-proxy-api:7.2.118
-}
-```
+The Compose file pins the published CLIProxyAPI image tag `v8.0.15`.
+Compose pulls that image when it is absent locally.
 
 Start the stack. The `--env-file` flag passes the management password to the
 container; the API key is only read from the mounted `.runtime/config.yaml`:
@@ -236,6 +226,21 @@ curl -fsS http://127.0.0.1:8317/v1/messages \
   -H 'Content-Type: application/json' \
   -d '{"model":"claude-sonnet-5","max_tokens":16,"messages":[{"role":"user","content":"Reply exactly: claude-ok"}]}'
 ```
+
+Claude Messages and Codex Responses requests can route to Copilot Chat Completions, Responses, or Messages endpoints.
+The plugin selects an endpoint from model metadata.
+Set `model_endpoint_overrides` when a model needs a fixed route.
+Send full caller history to Copilot Chat or Messages because the plugin does not store conversations.
+Use `previous_response_id` only with a native Copilot Responses endpoint that supports it.
+The plugin stores an authenticated replay carrier with the Copilot credential.
+It accepts the carrier only for the same account, model, and endpoint.
+The plugin rejects foreign signed or encrypted reasoning on Copilot Chat with HTTP 422.
+Send full caller history for cross-format requests because the bridge cannot reconstruct it from `previous_response_id` alone.
+The plugin derives `prompt_cache_key` for Copilot Responses requests when a stable session identity exists.
+Set `prompt_cache_key: false` in the plugin configuration to omit generated keys.
+The plugin preserves explicit caller keys.
+Copilot's implicit cache lifetime can differ from Codex's.
+Response compaction is optional and requires CLIProxyAPI host support plus the model's `compaction_models` setting.
 
 ## 8. Configure Claude Code globally
 

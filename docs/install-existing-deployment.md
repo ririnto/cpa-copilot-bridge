@@ -2,7 +2,7 @@
 
 This guide adds the GitHub Copilot plugin to an existing official CLIProxyAPI
 deployment without replacing its configuration, API keys, or existing
-providers. The plugin currently targets CLIProxyAPI `v7.2.118`, ABI version 1,
+providers. The plugin currently targets CLIProxyAPI `v8.0.15`, ABI version 1,
 on Linux `amd64`.
 
 ## 1. Build the plugin
@@ -85,6 +85,7 @@ plugins:
       oauth_timeout_seconds: 900
       model_cache_ttl_seconds: 600
       token_expiry_buffer_seconds: 300
+      prompt_cache_key: true
       excluded_model_prefixes: []
 ```
 
@@ -103,6 +104,21 @@ present under `plugins.configs`. Global `plugins.enabled` and the individual
 The existing `auth-dir` must be writable and persistent. The plugin stores its
 GitHub OAuth credential through CLIProxyAPI's normal auth storage; it does not
 need a separate credential volume.
+
+Claude Messages and Codex Responses requests can route to Copilot Chat Completions, Responses, or Messages endpoints.
+The plugin selects an endpoint from model metadata.
+Set `model_endpoint_overrides` when a model needs a fixed route.
+Send full caller history to Copilot Chat or Messages because the plugin does not store conversations.
+Use `previous_response_id` only with a native Copilot Responses endpoint that supports it.
+The plugin stores an authenticated replay carrier with the Copilot credential.
+It accepts the carrier only for the same account, model, and endpoint.
+The plugin rejects foreign signed or encrypted reasoning on Copilot Chat with HTTP 422.
+Send full caller history for cross-format requests because the bridge cannot reconstruct it from `previous_response_id` alone.
+The plugin derives `prompt_cache_key` for Copilot Responses requests when a stable session identity exists.
+Set `prompt_cache_key: false` to omit generated keys.
+The plugin preserves explicit caller keys.
+Copilot's implicit cache lifetime can differ from Codex's.
+Response compaction is optional and requires CLIProxyAPI host support plus the model's `compaction_models` setting.
 
 If the deployment also uses CLIProxyAPI's native Claude subscription provider,
 prevent duplicate Claude model IDs from being scheduled through Copilot:
