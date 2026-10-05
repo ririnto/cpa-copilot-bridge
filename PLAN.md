@@ -181,7 +181,8 @@ Keep temporary SDK workspaces and private migration evidence outside Git.
 
 ### Final Lifecycle Acceptance
 
-Use the maintained host release `v8.0.15-cpa.1` through a portable Go module replacement.
+Build the bridge against the official `v8.0.15` SDK.
+Use the maintained host release `v8.0.15-cpa.1` for native compaction lifecycle support.
 The host keeps native Codex and generic Responses compaction, including queued WebSocket turns.
 The bridge keeps Copilot HTTP execution and authenticated reasoning replay.
 OAuth continuity uses a persisted random key bound to the verified account.
@@ -200,3 +201,14 @@ The bridge acquired a new API token and retried the model request successfully.
 The current GitHub login has no OAuth refresh grant, so grant rotation uses deterministic authenticated fixtures.
 Passed buffered and SSE compaction followed by capsule replay.
 The README Mermaid source still matches the successfully rendered and inspected diagram.
+
+## Upstream Fork Delivery
+
+Keep the original author's Git history and GitHub fork relationship.
+Preserve the earlier private repository and its delivery records separately.
+Connect the completed implementation through a merge without rewriting existing commits.
+Scan the full custom history before public publication.
+Use `v0.4.0-cpa.1` to avoid colliding with upstream release tags.
+Review the current lifecycle unit against the preserved earlier delivery baseline.
+Reuse valid earlier source reviews for unchanged delivered code.
+Merge the accepted implementation into the fork's `main` and submit an upstream pull request.
