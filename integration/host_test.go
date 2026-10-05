@@ -3,13 +3,16 @@ package integration
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,10 +26,12 @@ import (
 )
 
 type fixture struct {
-	mu       sync.Mutex
-	requests []map[string]any
-	paths    []string
-	canceled chan struct{}
+	mu                sync.Mutex
+	requests          []map[string]any
+	paths             []string
+	canceled          chan struct{}
+	oauthRefreshCount int
+	githubUserAuth    []string
 }
 
 const (
@@ -39,17 +44,22 @@ const (
 	matrixOutputText       = "provider text exact"
 	matrixToolName         = "inspect"
 	matrixToolArguments    = `{"query":"provider-value"}`
-	matrixChatCallID       = "chat-call/+opaque-1"
-	matrixResponseItemID   = "fc-item/+opaque-1"
-	matrixResponseCallID   = "fc-call/+opaque-1"
-	matrixMessagesToolID   = "toolu_provider_1"
 	matrixInitialSignature = "initial-signature/+ exact\n\t "
 	matrixInitialRedacted  = "initial-redacted/+ exact\n\t "
 	matrixInputMarker      = "matrix user history exact"
 	matrixContinuation     = "matrix continuation exact"
 	matrixToolResult       = "matrix tool result exact"
-	matrixInitialItemID    = "fc-initial/+opaque-1"
-	matrixInitialCallID    = "call-initial/+opaque-1"
+)
+
+var (
+	fixtureResponsesFunctionItemID = "opaque/+" + strings.Repeat("x", 64-len("opaque/+"))
+	fixtureResponsesReasoningID    = "reasoning/+" + strings.Repeat("r", 64-len("reasoning/+"))
+	matrixChatCallID               = "chat-call/+" + strings.Repeat("h", 64-len("chat-call/+"))
+	matrixResponseItemID           = "fc-item/+" + strings.Repeat("i", 64-len("fc-item/+"))
+	matrixResponseCallID           = "fc-call/+" + strings.Repeat("c", 64-len("fc-call/+"))
+	matrixMessagesToolID           = "toolu_provider_" + strings.Repeat("p", 64-len("toolu_provider_"))
+	matrixInitialItemID            = "fc-initial/+" + strings.Repeat("j", 64-len("fc-initial/+"))
+	matrixInitialCallID            = "call-initial/+" + strings.Repeat("k", 64-len("call-initial/+"))
 )
 
 type matrixRoute struct {
@@ -80,9 +90,9 @@ func TestNativeHostProtocolRoundTrips(t *testing.T) {
 	upstream := httptest.NewServer(state)
 	t.Cleanup(upstream.Close)
 	base := startProxy(t, binary, upstream.URL)
-	longID := "opaque/+" + strings.Repeat("x", 416)
+	longID := fixtureResponsesFunctionItemID
 	items := []any{
-		map[string]any{"type": "reasoning", "id": strings.Repeat("reasoning/+", 13), "summary": []any{}, "encrypted_content": "copilot-opaque/+not-fernet"},
+		map[string]any{"type": "reasoning", "id": fixtureResponsesReasoningID, "summary": []any{}, "encrypted_content": "copilot-opaque/+not-fernet"},
 		map[string]any{"type": "function_call", "id": longID, "call_id": "call/+", "name": "inspect", "arguments": "{}"},
 		map[string]any{"type": "function_call_output", "call_id": "call/+", "output": "ok"},
 	}
@@ -275,6 +285,31 @@ func TestNativeHostProtocolRoundTrips(t *testing.T) {
 		capsule := assertSingleCompaction(t, response)
 		assertCompactionReplay(t, base, state, capsule, "Continue after the compact route.", false)
 	})
+	t.Run("ForeignOpaqueReasoningToGeminiChatFailsClosed", func(t *testing.T) {
+		cases := []struct {
+			name         string
+			clientFormat string
+			stream       bool
+		}{
+			{name: "ClaudeBuffered", clientFormat: "claude"},
+			{name: "ClaudeStream", clientFormat: "claude", stream: true},
+			{name: "ResponsesBuffered", clientFormat: "openai-response"},
+			{name: "ResponsesStream", clientFormat: "openai-response", stream: true},
+		}
+		for _, testCase := range cases {
+			testCase := testCase
+			t.Run(testCase.name, func(t *testing.T) {
+				before := upstreamRequestCount(state)
+				status, body := postProxyWithSession(t, base+matrixClientPath(testCase.clientFormat), foreignOpaqueChatRequest(testCase.clientFormat, testCase.stream), "foreign-opaque-"+testCase.name)
+				if status != http.StatusUnprocessableEntity {
+					t.Fatalf("foreign opaque %s request status = %d, want 422; body=%s", testCase.name, status, body)
+				}
+				if after := upstreamRequestCount(state); after != before {
+					t.Fatalf("foreign opaque %s request reached model endpoint: before=%d after=%d", testCase.name, before, after)
+				}
+			})
+		}
+	})
 	t.Run("SixClientProviderProtocolRoutes", func(t *testing.T) {
 		routes := []matrixRoute{
 			{name: "ClaudeToGeminiChat", clientFormat: "claude", model: matrixChatModel, upstreamPath: "/chat/completions"},
@@ -311,6 +346,26 @@ func (f *fixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/copilot_internal/v2/token":
 		_ = json.NewEncoder(w).Encode(map[string]any{"token": "fixture-copilot-token", "expires_at": time.Now().Add(time.Hour).Unix(), "endpoints": map[string]string{"api": "http://" + r.Host}})
+	case "/user":
+		f.mu.Lock()
+		f.githubUserAuth = append(f.githubUserAuth, r.Header.Get("Authorization"))
+		f.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 4242, "login": "fixture"})
+	case "/login/oauth/access_token":
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		form, err := url.ParseQuery(string(body))
+		if err != nil || form.Get("grant_type") != "refresh_token" || form.Get("refresh_token") != "fixture-refresh-token" || form.Get("client_id") != "fixture-oauth-client-id" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		f.mu.Lock()
+		f.oauthRefreshCount++
+		f.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "fixture-new-github-token", "refresh_token": "fixture-new-refresh-token", "token_type": "bearer", "scope": "read:user user:email", "expires_in": 86400, "refresh_token_expires_in": 2592000})
 	case "/models":
 		_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{
 			map[string]any{"id": "bridge-responses", "supported_endpoints": []string{"/responses"}, "capabilities": map[string]any{"type": "chat", "supports": map[string]bool{"streaming": true, "tool_calls": true}}},
@@ -354,8 +409,8 @@ func (f *fixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		output := []any{
-			map[string]any{"type": "reasoning", "id": strings.Repeat("reasoning/+", 13), "summary": []any{}, "encrypted_content": "copilot-opaque/+not-fernet"},
-			map[string]any{"type": "function_call", "id": "opaque/+" + strings.Repeat("x", 416), "call_id": "call/+", "name": "inspect", "arguments": "{}", "status": "completed"},
+			map[string]any{"type": "reasoning", "id": fixtureResponsesReasoningID, "summary": []any{}, "encrypted_content": "copilot-opaque/+not-fernet"},
+			map[string]any{"type": "function_call", "id": fixtureResponsesFunctionItemID, "call_id": "call/+", "name": "inspect", "arguments": "{}", "status": "completed"},
 		}
 		if request["tool_choice"] == "none" {
 			output = []any{map[string]any{"type": "message", "id": "msg_summary", "status": "completed", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "The active goal is to finish the native host bridge. The next step is integration."}}}}
@@ -495,8 +550,15 @@ func writeEvent(w http.ResponseWriter, event any) {
 }
 
 func startProxy(t *testing.T, binary, upstream string) string {
+	base, _ := startProxyInRoot(t, binary, upstream, t.TempDir(), nil, "")
+	return base
+}
+
+func startProxyInRoot(t *testing.T, binary, upstream, root string, authJSON []byte, managementSecret string) (string, func()) {
 	t.Helper()
-	root := t.TempDir()
+	if err := os.MkdirAll(root, 0700); err != nil {
+		t.Fatal(err)
+	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -525,10 +587,18 @@ func startProxy(t *testing.T, binary, upstream string) string {
 	if err := os.MkdirAll(authDir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(authDir, "fixture.json"), []byte(`{"type":"copilot-bridge","github_access_token":"fixture-github-token","github_login":"fixture","prefix":""}`), 0600); err != nil {
+	authPath := filepath.Join(authDir, "fixture.json")
+	if _, err := os.Stat(authPath); os.IsNotExist(err) {
+		if authJSON == nil {
+			authJSON = nativeAuthFixtureJSON(t)
+		}
+		if err := os.WriteFile(authPath, authJSON, 0600); err != nil {
+			t.Fatal(err)
+		}
+	} else if err != nil {
 		t.Fatal(err)
 	}
-	config := fmt.Sprintf("config-version: 8\nserver:\n  host: 127.0.0.1\n  port: %d\nmanagement:\n  disable-control-panel: true\naccess:\n  api-keys: [fixture-client-key]\noauth:\n  auth-dir: %q\nplugins:\n  enabled: true\n  dir: %q\n  configs:\n    cpa-copilot-bridge:\n      enabled: true\n      allow_insecure_base_urls: true\n      compaction_models: [bridge-responses]\n      reasoning_replay: true\n      github_base_url: %q\n      github_api_url: %q\n      copilot_api_url: %q\n", port, authDir, filepath.Join(root, "plugins"), upstream, upstream, upstream)
+	config := fmt.Sprintf("config-version: 8\nserver:\n  host: 127.0.0.1\n  port: %d\nmanagement:\n  disable-control-panel: true\n  secret-key: %q\naccess:\n  api-keys: [fixture-client-key]\noauth:\n  auth-dir: %q\nplugins:\n  enabled: true\n  dir: %q\n  configs:\n    cpa-copilot-bridge:\n      enabled: true\n      allow_insecure_base_urls: true\n      compaction_models: [bridge-responses]\n      reasoning_replay: true\n      github_base_url: %q\n      github_api_url: %q\n      copilot_api_url: %q\n", port, managementSecret, authDir, filepath.Join(root, "plugins"), upstream, upstream, upstream)
 	configPath := filepath.Join(root, "config.yaml")
 	if err := os.WriteFile(configPath, []byte(config), 0600); err != nil {
 		t.Fatal(err)
@@ -548,7 +618,9 @@ func startProxy(t *testing.T, binary, upstream string) string {
 		_ = logFile.Close()
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { cancel(); _ = command.Wait(); _ = logFile.Close() })
+	var stopOnce sync.Once
+	stop := func() { stopOnce.Do(func() { cancel(); _ = command.Wait(); _ = logFile.Close() }) }
+	t.Cleanup(stop)
 	base := fmt.Sprintf("http://127.0.0.1:%d", port)
 	deadline := time.NewTimer(15 * time.Second)
 	defer deadline.Stop()
@@ -567,11 +639,36 @@ func startProxy(t *testing.T, binary, upstream string) string {
 				body, _ := io.ReadAll(response.Body)
 				_ = response.Body.Close()
 				if response.StatusCode == 200 && bytes.Contains(body, []byte("bridge-responses")) {
-					return base
+					return base, stop
 				}
 			}
 		}
 	}
+}
+
+func nativeAuthFixtureJSON(t *testing.T) []byte {
+	t.Helper()
+	token := "fixture-github-token"
+	fingerprint := sha256.Sum256([]byte(token))
+	storage := map[string]any{
+		"type":                "copilot-bridge",
+		"github_access_token": token,
+		"github_login":        "fixture",
+		"github_user_id":      4242,
+		"expires_at":          int64(4102444800),
+		"continuity_keyring": map[string]any{
+			"version":                1,
+			"key_id":                 "00112233445566778899aabbccddeeff",
+			"account_id":             4242,
+			"root_key":               base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x5a}, 32)),
+			"credential_fingerprint": hex.EncodeToString(fingerprint[:]),
+		},
+	}
+	data, err := json.Marshal(storage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
 }
 
 func callProxy(t *testing.T, url string, payload any) []byte {
@@ -579,6 +676,15 @@ func callProxy(t *testing.T, url string, payload any) []byte {
 }
 
 func callProxyWithSession(t *testing.T, url string, payload any, session string) []byte {
+	t.Helper()
+	status, out := postProxyWithSession(t, url, payload, session)
+	if status != http.StatusOK {
+		t.Fatalf("native request failed: status=%d body=%s", status, out)
+	}
+	return out
+}
+
+func postProxyWithSession(t *testing.T, url string, payload any, session string) (int, []byte) {
 	t.Helper()
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -599,10 +705,45 @@ func callProxyWithSession(t *testing.T, url string, payload any, session string)
 	}
 	defer response.Body.Close()
 	out, err := io.ReadAll(response.Body)
-	if err != nil || response.StatusCode != 200 {
-		t.Fatalf("native request failed: status=%d body=%s err=%v", response.StatusCode, out, err)
+	if err != nil {
+		t.Fatalf("read native response body: %v", err)
 	}
-	return out
+	return response.StatusCode, out
+}
+
+func foreignOpaqueChatRequest(clientFormat string, stream bool) map[string]any {
+	if clientFormat == "claude" {
+		return map[string]any{
+			"model":      matrixChatModel,
+			"stream":     stream,
+			"max_tokens": 256,
+			"messages": []any{
+				map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "foreign opaque context"}}},
+				map[string]any{"role": "assistant", "content": []any{
+					map[string]any{"type": "thinking", "thinking": "foreign reasoning", "signature": matrixInitialSignature},
+					map[string]any{"type": "redacted_thinking", "data": matrixInitialRedacted},
+				}},
+				map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "continue with foreign context"}}},
+			},
+		}
+	}
+	return map[string]any{
+		"model":  matrixChatModel,
+		"stream": stream,
+		"store":  false,
+		"input": []any{
+			map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "foreign opaque context"}}},
+			map[string]any{"type": "reasoning", "id": "foreign-reasoning", "summary": []any{map[string]any{"type": "summary_text", "text": "foreign reasoning"}}, "encrypted_content": matrixInitialSignature},
+			map[string]any{"type": "reasoning", "id": "foreign-redacted", "summary": []any{}, "encrypted_content": "claude-redacted-thinking:" + matrixInitialRedacted},
+			map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "continue with foreign context"}}},
+		},
+	}
+}
+
+func upstreamRequestCount(state *fixture) int {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return len(state.requests)
 }
 
 func lastUpstreamRequest(t *testing.T, state *fixture) (map[string]any, string) {
@@ -702,11 +843,35 @@ func assertMatrixInitialRequest(t *testing.T, route matrixRoute, request map[str
 		if containsJSONScalar(request, matrixInitialSignature) || containsJSONScalar(request, matrixInitialRedacted) {
 			t.Fatalf("Chat request lost tool identity or accepted unsupported opaque history: %+v", request)
 		}
-		callID := matrixInitialCallID
-		if route.clientFormat == "claude" {
-			callID = "toolu_initial_1"
-		}
 		messages := jsonObjects(request["messages"])
+		callID := ""
+		if route.clientFormat == "openai-response" {
+			for _, message := range messages {
+				for _, call := range jsonObjects(message["tool_calls"]) {
+					candidate := stringValue(call["id"])
+					itemID, decodedCallID, ok := translate.DecodeClaudeToolIDs(candidate)
+					if ok && itemID == matrixInitialItemID && decodedCallID == matrixInitialCallID {
+						callID = candidate
+					}
+				}
+			}
+		} else {
+			for _, message := range messages {
+				for _, call := range jsonObjects(message["tool_calls"]) {
+					candidate := stringValue(call["id"])
+					_, decodedCallID, ok := translate.DecodeClaudeToolIDs(candidate)
+					if candidate == "toolu_initial_1" || ok && decodedCallID == "toolu_initial_1" {
+						callID = candidate
+					}
+				}
+			}
+		}
+		if callID == "" {
+			if route.clientFormat == "openai-response" {
+				t.Fatalf("Chat request did not encode the distinct long Responses tool IDs: %+v", request["messages"])
+			}
+			t.Fatalf("Chat request dropped the Claude tool-use ID: %+v", request["messages"])
+		}
 		var callFound, resultFound bool
 		for _, message := range messages {
 			for _, call := range jsonObjects(message["tool_calls"]) {
@@ -879,7 +1044,7 @@ func assertMatrixClientOutput(t *testing.T, route matrixRoute, body []byte, stre
 			case "reasoning":
 				encrypted := stringValue(item["encrypted_content"])
 				switch {
-				case strings.HasPrefix(encrypted, "cpa-copilot-reasoning-auth:v1:"):
+				case strings.HasPrefix(encrypted, "cpa-copilot-reasoning-auth:v2:"):
 					output.Signature = encrypted
 				case strings.HasPrefix(encrypted, "claude-redacted-thinking:"):
 					output.Redacted = strings.TrimPrefix(encrypted, "claude-redacted-thinking:")
@@ -1035,7 +1200,7 @@ func assertMatrixOutputSemantics(t *testing.T, route matrixRoute, output matrixO
 
 func assertChatReasoningCarrier(t *testing.T, carrier, model string) string {
 	t.Helper()
-	const authPrefix = "cpa-copilot-reasoning-auth:v1:"
+	const authPrefix = "cpa-copilot-reasoning-auth:v2:"
 	if !strings.HasPrefix(carrier, authPrefix) {
 		t.Fatalf("Chat reasoning carrier missing or malformed: %q", carrier)
 	}
@@ -1154,16 +1319,23 @@ func assertMatrixFollowupRequest(t *testing.T, route matrixRoute, request map[st
 	case "/chat/completions":
 		messages := jsonObjects(request["messages"])
 		var opaqueFound, callFound, resultFound bool
+		var expectedToolCallID string
 		for _, message := range messages {
 			if message["role"] == "assistant" && message["reasoning_opaque"] == matrixSignature {
 				opaqueFound = true
 			}
 			for _, call := range jsonObjects(message["tool_calls"]) {
-				if call["id"] == matrixChatCallID {
+				candidate := stringValue(call["id"])
+				itemID, callID, ok := translate.DecodeClaudeToolIDs(candidate)
+				if ok && itemID == output.ItemID && callID == output.CallID {
 					callFound = true
+					expectedToolCallID = candidate
+				} else if !ok && candidate == output.CallID && (output.ItemID == "" || output.ItemID == output.CallID) {
+					callFound = true
+					expectedToolCallID = candidate
 				}
 			}
-			if message["role"] == "tool" && message["tool_call_id"] == matrixChatCallID && containsJSONScalar(message["content"], matrixToolResult) {
+			if message["role"] == "tool" && message["tool_call_id"] == expectedToolCallID && expectedToolCallID != "" && containsJSONScalar(message["content"], matrixToolResult) {
 				resultFound = true
 			}
 		}
