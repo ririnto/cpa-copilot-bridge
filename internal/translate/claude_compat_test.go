@@ -3,6 +3,7 @@ package translate
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -115,6 +116,127 @@ func TestClaudeResponsesRequestIncludesStatelessEncryptedReasoning(t *testing.T)
 	}
 	if gjson.GetBytes(responsesRequest, "tool_choice.type").String() != "function" || gjson.GetBytes(responsesRequest, "tool_choice.name").String() != "lookup" {
 		t.Fatalf("Claude tool choice changed: %s", responsesRequest)
+	}
+}
+
+func TestClaudeResponsesToolSchemaAliasesPreserveCallerTools(t *testing.T) {
+	schema := map[string]any{
+		"$schema":              "urn:synthetic-schema",
+		"type":                 "object",
+		"properties":           map[string]any{"key": map[string]any{"type": "string"}},
+		"required":             []any{"key"},
+		"additionalProperties": false,
+		"anyOf": []any{
+			map[string]any{"type": "object"},
+			map[string]any{"type": "array"},
+		},
+	}
+	for _, test := range []struct {
+		name      string
+		toolExtra map[string]any
+		want      map[string]any
+	}{
+		{
+			name:      "input_schema",
+			toolExtra: map[string]any{"input_schema": schema},
+			want:      schema,
+		},
+		{
+			name:      "flat_parameters",
+			toolExtra: map[string]any{"type": "function", "parameters": schema},
+			want:      schema,
+		},
+		{
+			name:      "matching_both",
+			toolExtra: map[string]any{"input_schema": schema, "parameters": schema},
+			want:      schema,
+		},
+		{
+			name:      "missing_schema_keeps_empty_object",
+			toolExtra: map[string]any{},
+			want:      map[string]any{},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			tool := map[string]any{
+				"name":          "lookup",
+				"description":   "Look up a value.",
+				"cache_control": map[string]any{"type": "ephemeral"},
+			}
+			for key, value := range test.toolExtra {
+				tool[key] = value
+			}
+			callerTool := map[string]any{"name": "inspect", "input_schema": map[string]any{"type": "object"}}
+			requestBody, err := json.Marshal(map[string]any{"tools": []any{tool, callerTool}})
+			if err != nil {
+				t.Fatalf("encode Claude tools: %v", err)
+			}
+			responsesRequest, err := claudeRequestToResponses("gpt-6-luna", requestBody, false)
+			if err != nil {
+				t.Fatalf("translate Claude tools: %v", err)
+			}
+			tools := gjson.GetBytes(responsesRequest, "tools").Array()
+			if len(tools) != 2 || tools[0].Get("name").String() != "lookup" || tools[1].Get("name").String() != "inspect" {
+				t.Fatalf("caller tool set changed: %s", responsesRequest)
+			}
+			if tools[0].Get("type").String() != "function" || tools[0].Get("description").String() != "Look up a value." {
+				t.Fatalf("tool type or description changed: %s", responsesRequest)
+			}
+			if tools[0].Get("cache_control.type").String() != "ephemeral" {
+				t.Fatalf("tool cache_control changed: %s", responsesRequest)
+			}
+			var got map[string]any
+			if err := json.Unmarshal([]byte(tools[0].Get("parameters").Raw), &got); err != nil {
+				t.Fatalf("decode converted parameters: %v", err)
+			}
+			if !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("converted schema = %#v, want %#v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestClaudeResponsesToolSchemaAliasesRejectMalformedOrConflictingValues(t *testing.T) {
+	validSchema := map[string]any{"type": "object", "properties": map[string]any{"key": map[string]any{"type": "string"}}}
+	for _, test := range []struct {
+		name      string
+		toolExtra map[string]any
+		wantError string
+	}{
+		{
+			name:      "conflict",
+			toolExtra: map[string]any{"input_schema": validSchema, "parameters": map[string]any{"type": "array"}},
+			wantError: "input_schema and parameters conflict",
+		},
+		{
+			name:      "invalid_input_schema",
+			toolExtra: map[string]any{"input_schema": "not-an-object"},
+			wantError: "input_schema must be an object",
+		},
+		{
+			name:      "invalid_parameters",
+			toolExtra: map[string]any{"parameters": []any{validSchema}},
+			wantError: "parameters must be an object",
+		},
+		{
+			name:      "valid_input_schema_with_invalid_parameters",
+			toolExtra: map[string]any{"input_schema": validSchema, "parameters": nil},
+			wantError: "parameters must be an object",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			tool := map[string]any{"name": "lookup"}
+			for key, value := range test.toolExtra {
+				tool[key] = value
+			}
+			requestBody, err := json.Marshal(map[string]any{"tools": []any{tool}})
+			if err != nil {
+				t.Fatalf("encode Claude tool: %v", err)
+			}
+			if _, err := claudeRequestToResponses("gpt-6-luna", requestBody, false); err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("schema error = %v, want %q", err, test.wantError)
+			}
+		})
 	}
 }
 

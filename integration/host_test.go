@@ -398,6 +398,39 @@ func TestNativeHostProtocolRoundTrips(t *testing.T) {
 				})
 			}
 		}
+		t.Run("ClaudeCodeFlatParametersToLunaResponses", func(t *testing.T) {
+			route := matrixRoute{name: "ClaudeCodeFlatParametersToLunaResponses", clientFormat: "claude", model: matrixResponsesModel, upstreamPath: "/responses"}
+			for _, stream := range []bool{false, true} {
+				stream := stream
+				t.Run(fmt.Sprintf("Stream%v", stream), func(t *testing.T) {
+					parameters := map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"file_path": map[string]any{"type": "string", "description": "Fixture-relative path."},
+							"max_bytes": map[string]any{"type": "integer", "minimum": 1},
+						},
+						"required":             []any{"file_path"},
+						"additionalProperties": false,
+					}
+					tool := map[string]any{"type": "function", "name": "Read", "description": "Read a synthetic fixture file.", "parameters": parameters}
+					request := nativeClaudeCodeRequest(route.model, stream)
+					request["tools"] = []any{tool}
+					request["tool_choice"] = map[string]any{"type": "tool", "name": "Read"}
+					response := callProxyWithSession(t, base+"/v1/messages", request, fmt.Sprintf("claude-code-flat-%t", stream))
+					if stream && !bytes.Contains(response, []byte("message_stop")) {
+						t.Fatalf("Claude stream omitted message_stop: %s", response)
+					}
+					captured, path := lastUpstreamRequest(t, state)
+					assertMatrixRoute(t, route, captured, path, stream)
+					tools := jsonObjects(captured["tools"])
+					if len(tools) != 1 {
+						t.Fatalf("Responses request changed the caller tool set: %+v", captured["tools"])
+					}
+					assertEqualJSON(t, tools[0], tool)
+					assertEqualJSON(t, captured["tool_choice"], map[string]any{"type": "function", "name": "Read"})
+				})
+			}
+		})
 	})
 }
 

@@ -191,6 +191,7 @@ The example requires a Codex build with provider capability support.
 ```toml
 model = "gpt-6-luna"
 model_provider = "cliproxyapi"
+review_model = "gpt-6-luna"
 
 [model_providers.cliproxyapi]
 name = "CLIProxyAPI"
@@ -201,6 +202,13 @@ wire_api = "responses"
 
 [model_providers.cliproxyapi.capabilities]
 remote_compaction = "v2"
+
+[memories]
+extract_model = "gpt-6-luna"
+consolidation_model = "gpt-6-luna"
+
+[agents]
+default_subagent_model = "gpt-6-luna"
 ```
 
 Replace `cliproxyapi` with the provider name in your Codex configuration.

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 )
 
@@ -48,10 +49,14 @@ func claudeRequestToResponses(model string, body []byte, stream bool) ([]byte, e
 			if !okTool || stringValue(tool["name"]) == "" {
 				continue
 			}
+			parameters, errParameters := claudeToolParameters(tool)
+			if errParameters != nil {
+				return nil, errParameters
+			}
 			item := map[string]any{
 				"type":       "function",
 				"name":       stringValue(tool["name"]),
-				"parameters": objectValue(tool["input_schema"]),
+				"parameters": parameters,
 			}
 			if description := stringValue(tool["description"]); description != "" {
 				item["description"] = description
@@ -259,6 +264,36 @@ func claudeRequestToResponses(model string, body []byte, stream bool) ([]byte, e
 	}
 	out["input"] = input
 	return json.Marshal(out)
+}
+
+func claudeToolParameters(tool map[string]any) (map[string]any, error) {
+	inputSchema, hasInputSchema := tool["input_schema"]
+	parameters, hasParameters := tool["parameters"]
+	var inputObject, parametersObject map[string]any
+	if hasInputSchema {
+		var ok bool
+		inputObject, ok = inputSchema.(map[string]any)
+		if !ok || inputObject == nil {
+			return nil, fmt.Errorf("Claude tool input_schema must be an object")
+		}
+	}
+	if hasParameters {
+		var ok bool
+		parametersObject, ok = parameters.(map[string]any)
+		if !ok || parametersObject == nil {
+			return nil, fmt.Errorf("Claude tool parameters must be an object")
+		}
+	}
+	if hasInputSchema && hasParameters && !reflect.DeepEqual(inputObject, parametersObject) {
+		return nil, fmt.Errorf("Claude tool input_schema and parameters conflict")
+	}
+	if hasInputSchema {
+		return inputObject, nil
+	}
+	if hasParameters {
+		return parametersObject, nil
+	}
+	return map[string]any{}, nil
 }
 
 func responsesResponseToClaude(model string, body []byte) ([]byte, error) {
