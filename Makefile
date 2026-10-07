@@ -12,7 +12,7 @@ test:
 
 build:
 	mkdir -p $(PLUGIN_DIR) $(CACHE_DIR)/go-build $(CACHE_DIR)/go-mod $(CACHE_DIR)/home
-	docker run --rm \
+	docker run --rm --platform=linux/amd64 \
 		--user "$$(id -u):$$(id -g)" \
 		-e HOME=/src/$(CACHE_DIR)/home \
 		-e GOCACHE=/src/$(CACHE_DIR)/go-build \
