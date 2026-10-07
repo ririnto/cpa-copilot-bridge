@@ -23,7 +23,7 @@ It does not map ports 3458 or 54545 on the host.
 
 ## Architecture
 
-`cmd/cliproxyapi-copilot` implements ABI version 1 and registration schema 2 using
+`cmd/cliproxyapi-copilot` implements ABI version 1 and registration schema 6 using
 the official `sdk/pluginabi` and `sdk/pluginapi` contracts. It registers:
 
 - `AuthProvider`: GitHub device-code OAuth and host-owned credential storage
