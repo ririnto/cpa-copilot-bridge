@@ -12,13 +12,14 @@ import (
 const nativeWebSearchBufferLimit = 8 << 20
 
 type nativeResponsesWebSearchState struct {
-	Frames  [][]byte
-	Bytes   int
-	DoneIDs map[int]string
+	Frames        [][]byte
+	Bytes         int
+	DoneIDs       map[int]string
+	FinalStatuses map[int]string
 }
 
 // Copilot's hosted search IDs carry opaque replay state and change between phases.
-// Delay the ordered stream barrier until its completed snapshot provides the
+// Delay the ordered stream barrier until its terminal snapshot provides the
 // final native identity; leave that authoritative snapshot unchanged.
 func nativeResponsesStream(frame []byte, state *any) ([][]byte, error) {
 	event, data, done, err := parseSSEFrame(frame)
@@ -40,10 +41,10 @@ func nativeResponsesStream(frame []byte, state *any) ([][]byte, error) {
 		return nil, fmt.Errorf("native Responses web search stream requires state")
 	}
 	if pending == nil {
-		pending = &nativeResponsesWebSearchState{DoneIDs: make(map[int]string)}
+		pending = &nativeResponsesWebSearchState{DoneIDs: make(map[int]string), FinalStatuses: make(map[int]string)}
 		*state = pending
 	}
-	if done || event == "response.failed" || event == "response.incomplete" || event == "error" {
+	if done || event == "response.failed" || event == "error" {
 		return nil, fmt.Errorf("native Responses web search stream ended without successful completion")
 	}
 	if isSearchItem || strings.HasPrefix(event, "response.web_search_call.") {
@@ -55,12 +56,29 @@ func nativeResponsesStream(frame []byte, state *any) ([][]byte, error) {
 		if _, exists := pending.DoneIDs[index]; !exists {
 			pending.DoneIDs[index] = ""
 		}
+		if event == "response.web_search_call.completed" || event == "response.web_search_call.failed" {
+			status := strings.TrimPrefix(event, "response.web_search_call.")
+			if finalStatus := pending.FinalStatuses[index]; finalStatus != "" && finalStatus != status {
+				return nil, fmt.Errorf("native Responses web search event conflicts with its terminal lifecycle")
+			}
+			pending.FinalStatuses[index] = status
+		}
 		if event == "response.output_item.done" {
 			id := gjson.GetBytes(data, "item.id")
-			if id.Type != gjson.String || id.String() == "" || gjson.GetBytes(data, "item.status").String() != "completed" {
+			status := gjson.GetBytes(data, "item.status").String()
+			if id.Type != gjson.String || id.String() == "" {
 				return nil, fmt.Errorf("native Responses web search done item is incomplete")
 			}
+			switch status {
+			case "completed", "in_progress", "searching", "failed":
+			default:
+				return nil, fmt.Errorf("native Responses web search done item has an invalid status")
+			}
+			if finalStatus := pending.FinalStatuses[index]; finalStatus != "" && finalStatus != status {
+				return nil, fmt.Errorf("native Responses web search done item conflicts with its terminal lifecycle")
+			}
 			pending.DoneIDs[index] = id.String()
+			pending.FinalStatuses[index] = status
 		}
 	}
 	if len(frame) > nativeWebSearchBufferLimit-pending.Bytes {
@@ -68,18 +86,41 @@ func nativeResponsesStream(frame []byte, state *any) ([][]byte, error) {
 	}
 	pending.Frames = append(pending.Frames, append([]byte(nil), frame...))
 	pending.Bytes += len(frame)
-	if event != "response.completed" {
+	if event != "response.completed" && event != "response.incomplete" {
 		return nil, nil
 	}
-	if gjson.GetBytes(data, "response.status").String() != "completed" {
-		return nil, fmt.Errorf("native Responses web search completion is not successful")
+	incomplete := event == "response.incomplete"
+	responseStatus := gjson.GetBytes(data, "response.status").String()
+	if (!incomplete && responseStatus != "completed") || (incomplete && responseStatus != "incomplete") {
+		return nil, fmt.Errorf("native Responses web search terminal status does not match its event")
+	}
+	if incomplete {
+		if reason := gjson.GetBytes(data, "response.incomplete_details.reason"); reason.Type != gjson.String || strings.TrimSpace(reason.String()) == "" {
+			return nil, fmt.Errorf("native Responses web search incomplete snapshot has no termination reason")
+		}
+		for _, path := range []string{"error", "response.error"} {
+			if value := gjson.GetBytes(data, path); value.Exists() && value.Type != gjson.Null {
+				return nil, fmt.Errorf("native Responses web search incomplete snapshot contains an error")
+			}
+		}
 	}
 	finalIDs := make(map[int]string, len(pending.DoneIDs))
 	for index, doneID := range pending.DoneIDs {
 		item := gjson.GetBytes(data, fmt.Sprintf("response.output.%d", index))
 		id := item.Get("id")
-		if doneID == "" || item.Get("type").String() != "web_search_call" || item.Get("status").String() != "completed" || id.Type != gjson.String || id.String() == "" {
+		status := item.Get("status").String()
+		if item.Get("type").String() != "web_search_call" || id.Type != gjson.String || id.String() == "" || (!incomplete && (doneID == "" || status != "completed")) {
 			return nil, fmt.Errorf("native Responses completed without the completed web search item at output index %d", index)
+		}
+		if finalStatus := pending.FinalStatuses[index]; finalStatus != "" && finalStatus != status {
+			return nil, fmt.Errorf("native Responses web search item conflicts with its terminal lifecycle at output index %d", index)
+		}
+		if incomplete {
+			switch status {
+			case "completed", "in_progress", "searching", "failed":
+			default:
+				return nil, fmt.Errorf("native Responses incomplete web search item has an invalid status at output index %d", index)
+			}
 		}
 		finalIDs[index] = id.String()
 	}
@@ -94,7 +135,7 @@ func nativeResponsesStream(frame []byte, state *any) ([][]byte, error) {
 			continue
 		}
 		kind := gjson.GetBytes(payload, "type").String()
-		if kind == "response.completed" {
+		if kind == "response.completed" || kind == "response.incomplete" {
 			out = append(out, buffered)
 			continue
 		}

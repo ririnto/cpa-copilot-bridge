@@ -15,7 +15,11 @@ func chatRequestToResponses(model string, body []byte, stream bool) ([]byte, err
 	if err := validateChatRequestForResponses(body); err != nil {
 		return nil, err
 	}
-	prepared, err := chatRequestToClaudeToolIDs(body)
+	prepared, err := chatRequestWithOpaqueAssistantMarkers(body)
+	if err != nil {
+		return nil, err
+	}
+	prepared, err = chatRequestToClaudeToolIDs(prepared)
 	if err != nil {
 		return nil, err
 	}
@@ -371,7 +375,10 @@ func validateChatAssistantOpaqueAnchor(messages [][]byte, messageIndex int, anch
 		matches := 0
 		matchedIndex := -1
 		for index, message := range messages {
-			if gjson.GetBytes(message, "role").String() == "assistant" && previousUserFingerprint(messages, index) == anchor.PriorUserSHA256 && gjson.GetBytes(message, "content").String() == "" && len(gjson.GetBytes(message, "tool_calls").Array()) == 0 {
+			content := gjson.GetBytes(message, "content")
+			text, textual := chatContentFingerprint(content)
+			empty := !content.Exists() || content.Type == gjson.Null || (textual && text == "")
+			if gjson.GetBytes(message, "role").String() == "assistant" && previousUserFingerprint(messages, index) == anchor.PriorUserSHA256 && empty && len(gjson.GetBytes(message, "tool_calls").Array()) == 0 {
 				matches++
 				matchedIndex = index
 			}
@@ -389,18 +396,10 @@ func restoreChatOpaqueToResponses(responses, chatRequest []byte, model string) (
 	if !messages.IsArray() || !input.IsArray() {
 		return responses, nil
 	}
-	insertions := make(map[int][][]byte)
-	cursor := 0
+	itemsByMarker := make(map[string][][]byte)
 	for messageIndex, message := range messages.Array() {
 		if message.Get("role").String() == "assistant" {
 			field := message.Get("reasoning_opaque")
-			insertIndex, matched, err := responsesInputIndexForChatAssistant(input.Array(), message, cursor)
-			if err != nil {
-				return nil, err
-			}
-			if matched {
-				cursor = insertIndex + 1
-			}
 			if field.Exists() && field.Type != gjson.Null && field.Raw != `""` {
 				var raw []byte
 				if field.Type == gjson.String && bytes.HasPrefix([]byte(field.String()), []byte(copilotOpaquePrefix)) {
@@ -408,12 +407,8 @@ func restoreChatOpaqueToResponses(responses, chatRequest []byte, model string) (
 					if err != nil {
 						return nil, err
 					}
-					anchoredIndex, _, err := findOpaqueAnchor(chatMessageBytes(messages.Array()), value.Anchor)
-					if err != nil {
+					if err := validateChatAssistantOpaqueAnchor(chatMessageBytes(messages.Array()), messageIndex, value.Anchor); err != nil {
 						return nil, err
-					}
-					if anchoredIndex != messageIndex {
-						return nil, fmt.Errorf("Copilot opaque reasoning assistant anchor does not match its message")
 					}
 					raw = value.Raw
 				} else {
@@ -423,21 +418,52 @@ func restoreChatOpaqueToResponses(responses, chatRequest []byte, model string) (
 				if err != nil {
 					return nil, err
 				}
-				if !matched {
-					return nil, fmt.Errorf("Chat reasoning_opaque assistant has no Responses history position")
-				}
-				insertions[insertIndex] = append(insertions[insertIndex], items...)
+				itemsByMarker[chatOpaqueAssistantMarker(chatRequest, messageIndex)] = items
 			}
 		}
 	}
-	if len(insertions) == 0 {
+	if len(itemsByMarker) == 0 {
 		return responses, nil
 	}
-	items := make([][]byte, 0, len(input.Array())+len(insertions))
-	for index := 0; index <= len(input.Array()); index++ {
-		items = append(items, insertions[index]...)
-		if index < len(input.Array()) {
-			items = append(items, []byte(input.Array()[index].Raw))
+	found := make(map[string]bool, len(itemsByMarker))
+	items := make([][]byte, 0, len(input.Array())+len(itemsByMarker))
+	for _, item := range input.Array() {
+		if item.Get("type").String() != "message" || item.Get("role").String() != "assistant" {
+			items = append(items, []byte(item.Raw))
+			continue
+		}
+		parts := make([][]byte, 0, len(item.Get("content").Array()))
+		for _, part := range item.Get("content").Array() {
+			marker := part.Get("text").String()
+			if reasoning, exists := itemsByMarker[marker]; exists && part.Get("type").String() == "output_text" {
+				if found[marker] {
+					return nil, fmt.Errorf("Chat opaque reasoning marker is ambiguous in Responses history")
+				}
+				if len(parts) > 0 {
+					visible, err := setRawArray([]byte(item.Raw), "content", parts)
+					if err != nil {
+						return nil, err
+					}
+					items = append(items, visible)
+					parts = nil
+				}
+				items = append(items, reasoning...)
+				found[marker] = true
+			} else {
+				parts = append(parts, []byte(part.Raw))
+			}
+		}
+		if len(parts) > 0 {
+			visible, err := setRawArray([]byte(item.Raw), "content", parts)
+			if err != nil {
+				return nil, err
+			}
+			items = append(items, visible)
+		}
+	}
+	for marker := range itemsByMarker {
+		if !found[marker] {
+			return nil, fmt.Errorf("Chat reasoning_opaque assistant has no Responses history position")
 		}
 	}
 	return setRawArray(responses, "input", items)
@@ -459,17 +485,33 @@ func responsesReasoningItemsFromChatOpaque(raw []byte) ([][]byte, error) {
 	if value.Type == gjson.String {
 		return nil, fmt.Errorf("Chat-native reasoning_opaque cannot be replayed to the Responses endpoint")
 	}
+	sourceItems := value.Array()
 	if value.IsObject() && value.Get("type").String() == "reasoning" {
-		return [][]byte{raw}, nil
-	}
-	if !value.IsArray() {
+		sourceItems = []gjson.Result{value}
+	} else if !value.IsArray() {
 		return nil, fmt.Errorf("Chat reasoning_opaque cannot be represented as Responses reasoning")
 	}
-	items := make([][]byte, 0, len(value.Array()))
-	for _, item := range value.Array() {
-		if item.IsObject() && item.Get("type").String() == "reasoning" && item.Get("encrypted_content").Type == gjson.String {
+	items := make([][]byte, 0, len(sourceItems))
+	for _, item := range sourceItems {
+		if id := item.Get("id"); id.Exists() && (id.Type != gjson.String || id.String() == "") {
+			return nil, fmt.Errorf("Chat reasoning_opaque item has an invalid Responses ID")
+		}
+		if item.IsObject() && item.Get("type").String() == "reasoning" && item.Get("encrypted_content").Type == gjson.String && item.Get("encrypted_content").String() != "" {
+			if summary := item.Get("summary"); summary.Exists() {
+				if !summary.IsArray() {
+					return nil, fmt.Errorf("Chat reasoning_opaque has an invalid Responses summary")
+				}
+				for _, part := range summary.Array() {
+					if !part.IsObject() || part.Get("type").String() != "summary_text" || part.Get("text").Type != gjson.String {
+						return nil, fmt.Errorf("Chat reasoning_opaque has an invalid Responses summary block")
+					}
+				}
+			}
 			items = append(items, []byte(item.Raw))
-		} else if item.IsObject() && item.Get("type").String() == "thinking" {
+		} else if item.IsObject() && item.Get("type").String() == "thinking" && item.Get("signature").Type == gjson.String && item.Get("signature").String() != "" {
+			if thinking := item.Get("thinking"); thinking.Exists() && thinking.Type != gjson.String {
+				return nil, fmt.Errorf("Chat reasoning_opaque has an invalid thinking text")
+			}
 			thinking := item.Get("thinking").String()
 			summary := []any{}
 			if thinking != "" {
@@ -481,7 +523,7 @@ func responsesReasoningItemsFromChatOpaque(raw []byte) ([][]byte, error) {
 				return nil, fmt.Errorf("translate Chat thinking block for Responses replay")
 			}
 			items = append(items, encoded)
-		} else if item.IsObject() && item.Get("type").String() == "redacted_thinking" && item.Get("data").Type == gjson.String {
+		} else if item.IsObject() && item.Get("type").String() == "redacted_thinking" && item.Get("data").Type == gjson.String && item.Get("data").String() != "" {
 			reasoning := map[string]any{"type": "reasoning", "summary": []any{}, "encrypted_content": redactedThinkingPrefix + item.Get("data").String()}
 			encoded, err := json.Marshal(reasoning)
 			if err != nil {
@@ -496,47 +538,6 @@ func responsesReasoningItemsFromChatOpaque(raw []byte) ([][]byte, error) {
 		return nil, fmt.Errorf("Chat reasoning_opaque contains no Responses items")
 	}
 	return items, nil
-}
-
-func responsesInputIndexForChatAssistant(input []gjson.Result, message gjson.Result, start int) (int, bool, error) {
-	for _, call := range message.Get("tool_calls").Array() {
-		visibleID := call.Get("id").String()
-		itemID, callID, encoded, err := parseClaudeToolID(visibleID)
-		if err != nil {
-			return 0, false, fmt.Errorf("Chat tool call ID has an invalid Responses identity")
-		}
-		if !encoded {
-			callID = visibleID
-		}
-		for index, item := range input[start:] {
-			index += start
-			if item.Get("type").String() == "function_call" && item.Get("call_id").String() == callID {
-				return index, true, nil
-			}
-		}
-		if itemID != "" {
-			for index, item := range input[start:] {
-				index += start
-				if item.Get("type").String() == "function_call" && item.Get("id").String() == itemID {
-					return index, true, nil
-				}
-			}
-		}
-	}
-	content, ok := chatContentFingerprint(message.Get("content"))
-	if ok && content != "" {
-		for index, item := range input[start:] {
-			index += start
-			if item.Get("type").String() == "message" && item.Get("role").String() == "assistant" {
-				for _, part := range item.Get("content").Array() {
-					if part.Get("text").String() == content {
-						return index, true, nil
-					}
-				}
-			}
-		}
-	}
-	return len(input), false, nil
 }
 
 func chatRequestToClaudeToolIDs(body []byte) ([]byte, error) {
@@ -599,6 +600,9 @@ func chatRequestToClaudeToolIDs(body []byte) ([]byte, error) {
 				if !encoded {
 					callID = visibleID
 				}
+				if callID == "" {
+					return nil, fmt.Errorf("Chat tool result has no call ID for Responses translation")
+				}
 				carrier = encodeClaudeToolID(itemID, callID)
 			}
 			updated, err := sjson.SetBytes(out, fmt.Sprintf("messages.%d.tool_call_id", messageIndex), carrier)
@@ -649,12 +653,15 @@ func validateChatMessageForResponses(message map[string]any) error {
 	if err := validateChatContent(message["content"], role); err != nil {
 		return err
 	}
+	if role != "assistant" && hasMeaningfulValue(message["reasoning_opaque"]) {
+		return fmt.Errorf("Chat reasoning_opaque is not attached to an assistant message")
+	}
 	if role == "tool" && rawStringValue(message["tool_call_id"]) == "" {
 		return fmt.Errorf("Chat tool result has no call ID for Responses translation")
 	}
 	for _, rawCall := range arrayValue(message["tool_calls"]) {
 		call, ok := rawCall.(map[string]any)
-		if !ok || stringValue(call["type"]) != "function" {
+		if !ok || stringValue(call["type"]) != "function" || rawStringValue(call["id"]) == "" {
 			return fmt.Errorf("Chat tool call cannot be represented by Responses translation")
 		}
 		function := objectValue(call["function"])

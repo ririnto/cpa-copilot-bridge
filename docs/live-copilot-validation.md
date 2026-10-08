@@ -66,6 +66,12 @@ CPA_BINARY=/path/to/prepared/cli-proxy-api \
   CPA_LIVE_COPILOT_DEBUG_DIR=/path/to/private-debug-directory \
   CPA_LIVE_COPILOT_CLIENTS=1 \
   go test ./integration -run '^TestLiveCLIClients$' -count=1 -v
+
+CPA_BINARY=/path/to/prepared/cli-proxy-api \
+  CPA_LIVE_COPILOT_AUTH_FILE=/path/to/copilot-auth.json \
+  CPA_LIVE_COPILOT_DEBUG_DIR=/path/to/private-debug-directory \
+  CPA_LIVE_COPILOT_INCOMPLETE=1 \
+  go test ./integration -run '^TestLiveCopilotIncompleteResponses$' -count=1 -v
 ```
 
 The matrix pins the three native routes listed above, including when discovery advertises multiple endpoints.
@@ -129,9 +135,25 @@ The temporary client home supplies the catalogue through the supported `model_ca
 The isolated Claude invocation enables WebSearch and Agent explicitly.
 
 Native Copilot hosted search changes its opaque item ID between stream phases and in the completed snapshot.
-The plugin buffers the ordered stream from the first hosted search until successful completion, bounded at 8 MiB.
+The plugin buffers the ordered stream from the first hosted search until a valid terminal snapshot, bounded at 8 MiB.
 It retains the final snapshot and replay data, and uses its native ID for earlier search lifecycle events.
-Later text and tool events wait behind this buffer; incomplete streams return an error.
+Later text and tool events wait behind this buffer.
+Valid `response.incomplete` snapshots retain their partial output, reason, usage, and actual search status.
+Missing terminal snapshots or inconsistent search lifecycle data return an error.
+
+## Review regression checks
+
+The follow-up review identified five cases covered by regression tests:
+
+- OAuth rotation followed by a failed account lookup retains the new token pair in pending storage. The host retries verification after restart; only a verified account can activate the pair, and the previous refresh preference is restored afterward.
+- Legacy replay migration retains the old credential fingerprint and account/auth binding when endpoint discovery is temporarily unavailable. Existing capsule authentication must prove the original endpoint; endpoint, account, or auth-ID changes cannot replay the artifact.
+- Native incomplete Responses streams retain the terminal event and partial output without caching a successful replay. Chat and Messages map supported token-limit/content-filter reasons through their existing finalization paths. The native host test covers all three client schemas.
+- Native tool declarations that the pinned SDK cannot represent use the existing exclusion metadata and headers. Forced excluded tools fail explicitly; supported function, custom, namespace, Claude web search, and local Chat shell declarations retain their existing mappings.
+- Reasoning-only assistant carriers and mixed text/tool turns preserve reasoning before visible output at the original conversation position, using the existing SDK conversion path and tool identifiers.
+
+The affected live token-limit probe returned `response.incomplete` with `max_output_tokens`, 24 input tokens, and 16 output tokens, all used for reasoning.
+Its four captured request/response bodies retain the original fields and five stream events in sanitized regression fixtures.
+HTTP/SSE native Responses, Chat, and Messages partial termination is covered; incomplete tool arguments that cannot be represented by the destination fail explicitly.
 
 Regression fixtures include the corresponding client request, upstream request, upstream response, and client response bodies.
 Private values use placeholders while the protocol fields and events remain intact.
@@ -144,6 +166,8 @@ The exact Codex `response.interrupt` frame is rejected by CPA before it reaches 
 Native diagnostics reproduce this for both plugin normalization and active upstream WebSocket duplex processing.
 The examined CPA v8.0.15 and v8.0.20 handlers do not implement this control message, and the plugin executor has no downstream WebSocket control hook.
 The error is therefore not resolved by this plugin change.
+The pinned host's Responses WebSocket forwarder also treats `response.incomplete` as an unfinished stream: it forwards the event, logs a completion error, and closes the connection instead of preserving continuation.
+Incomplete response support in this validation applies to HTTP/SSE; the plugin does not fabricate a `response.completed` event to satisfy the host's WebSocket completion check.
 
 The isolated Codex profile uses supported settings to select HTTP transport and disable immediate interruption:
 

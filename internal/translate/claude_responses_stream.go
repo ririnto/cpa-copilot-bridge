@@ -157,9 +157,19 @@ func responsesStreamToClaude(model string, frame []byte, state *any) ([][]byte, 
 				}
 			}
 		}
-	case "response.completed":
+	case "response.completed", "response.incomplete":
 		if errFailure := responsesFailure(responseObject); errFailure != nil {
 			return nil, errFailure
+		}
+		if event == "response.incomplete" {
+			if stringValue(responseObject["status"]) != "incomplete" || responseObject["error"] != nil || payload["error"] != nil {
+				return nil, fmt.Errorf("Copilot Responses stream ended with an invalid incomplete response")
+			}
+			switch stringValue(objectValue(responseObject["incomplete_details"])["reason"]) {
+			case "max_output_tokens", "max_tokens", "content_filter":
+			default:
+				return nil, fmt.Errorf("Copilot Responses incomplete reason cannot be represented by Messages")
+			}
 		}
 		terminalFrames, errTerminal := streamState.reconcileTerminalOutput(responseObject)
 		if errTerminal != nil {
@@ -167,8 +177,6 @@ func responsesStreamToClaude(model string, frame []byte, state *any) ([][]byte, 
 		}
 		out = append(out, terminalFrames...)
 		out = append(out, streamState.finish(responseObject)...)
-	case "response.incomplete":
-		return nil, fmt.Errorf("Copilot Responses stream ended with an incomplete response")
 	}
 	return out, nil
 }
@@ -323,6 +331,14 @@ func (s *responsesClaudeStreamState) reconcileTerminalOutput(response map[string
 			out = append(out, s.reconcileReasoning(key, item)...)
 		case "function_call", "custom_tool_call":
 			terminalToolIndexes[outputIndex] = struct{}{}
+			if stringValue(response["status"]) == "incomplete" && stringValue(item["type"]) == "function_call" && strings.TrimSpace(rawStringValue(item["arguments"])) == "" {
+				return nil, fmt.Errorf("Copilot Responses incomplete tool arguments are missing or empty")
+			}
+			if stringValue(response["status"]) == "incomplete" && stringValue(item["type"]) == "custom_tool_call" {
+				if input, ok := item["input"].(string); ok && strings.TrimSpace(input) == "" {
+					return nil, fmt.Errorf("Copilot Responses incomplete custom tool input is empty")
+				}
+			}
 			frames, errFunction := s.reconcileFunction(key, item)
 			if errFunction != nil {
 				return nil, errFunction

@@ -473,7 +473,7 @@ func (s *Service) pumpStream(ctx context.Context, outputID, endpoint, destinatio
 			return
 		}
 		for _, frame := range decoder.Feed(chunk.Payload) {
-			completed, errTerminal := terminal.observe(endpoint, frame, copilotToken, githubToken)
+			done, errTerminal := terminal.observe(endpoint, frame, copilotToken, githubToken)
 			if errTerminal != nil {
 				terminalErr = errTerminal
 				return
@@ -482,8 +482,8 @@ func (s *Service) pumpStream(ctx context.Context, outputID, endpoint, destinatio
 				terminalErr = fmt.Errorf("translate Copilot stream: %s", redact.ErrorBody([]byte(errEmit.Error()), copilotToken, githubToken))
 				return
 			}
-			if completed {
-				if endpoint == translate.EndpointResponses {
+			if done {
+				if endpoint == translate.EndpointResponses && terminal.completed {
 					s.recordReasoningReplay(scopeKey, terminal.response)
 				}
 				return
@@ -491,7 +491,7 @@ func (s *Service) pumpStream(ctx context.Context, outputID, endpoint, destinatio
 		}
 		if chunk.Done {
 			if trailing := decoder.Flush(); len(trailing) > 0 {
-				completed, errTerminal := terminal.observe(endpoint, trailing, copilotToken, githubToken)
+				done, errTerminal := terminal.observe(endpoint, trailing, copilotToken, githubToken)
 				if errTerminal != nil {
 					terminalErr = errTerminal
 					return
@@ -500,8 +500,8 @@ func (s *Service) pumpStream(ctx context.Context, outputID, endpoint, destinatio
 					terminalErr = fmt.Errorf("translate final Copilot stream frame: %s", redact.ErrorBody([]byte(errEmit.Error()), copilotToken, githubToken))
 					return
 				}
-				if completed {
-					if endpoint == translate.EndpointResponses {
+				if done {
+					if endpoint == translate.EndpointResponses && terminal.completed {
 						s.recordReasoningReplay(scopeKey, terminal.response)
 					}
 					return

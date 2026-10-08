@@ -30,6 +30,7 @@ type legacyContinuityKey struct {
 	AuthID                string `json:"auth_id"`
 	CredentialFingerprint string `json:"credential_fingerprint"`
 	APIBaseURL            string `json:"api_base_url"`
+	EndpointPending       bool   `json:"endpoint_pending,omitempty"`
 }
 
 type artifactKeyMaterials struct {
@@ -72,7 +73,8 @@ func validateContinuityKeyring(storage authStorage, authID string) ([]byte, erro
 	if legacy := keyring.LegacyV1; legacy != nil {
 		credentialKey, errCredential := hex.DecodeString(legacy.CredentialFingerprint)
 		if legacy.AccountID != keyring.AccountID || strings.TrimSpace(legacy.AuthID) == "" || strings.TrimSpace(authID) != legacy.AuthID ||
-			errCredential != nil || len(credentialKey) != sha256.Size || strings.TrimSpace(legacy.APIBaseURL) == "" {
+			errCredential != nil || len(credentialKey) != sha256.Size ||
+			(legacy.EndpointPending != (strings.TrimSpace(legacy.APIBaseURL) == "")) {
 			return nil, errContinuityKeyringUnavailable
 		}
 	}
@@ -109,14 +111,18 @@ func continuityKeyMaterialsFor(storage authStorage, authID, model, endpoint, api
 	materials := artifactKeyMaterials{Active: compact.KeyMaterial{Scope: hex.EncodeToString(scopeHash[:]), Secret: root}}
 	legacy := storage.ContinuityKeyring.LegacyV1
 	if legacy == nil || legacy.AccountID != storage.GitHubUserID || legacy.AuthID != strings.TrimSpace(authID) ||
-		!sameCopilotAPIBaseURL(legacy.APIBaseURL, apiBaseURL) {
+		(!legacy.EndpointPending && !sameCopilotAPIBaseURL(legacy.APIBaseURL, apiBaseURL)) {
 		return materials, nil
 	}
 	credentialKey, errCredential := hex.DecodeString(legacy.CredentialFingerprint)
 	if errCredential != nil || len(credentialKey) != sha256.Size {
 		return artifactKeyMaterials{}, errContinuityKeyringUnavailable
 	}
-	scope, secret := compactionKeyMaterialFromFingerprint(authID, legacy.CredentialFingerprint, model, endpoint, legacy.APIBaseURL)
+	legacyAPIBase := legacy.APIBaseURL
+	if legacy.EndpointPending {
+		legacyAPIBase = apiBaseURL
+	}
+	scope, secret := compactionKeyMaterialFromFingerprint(authID, legacy.CredentialFingerprint, model, endpoint, legacyAPIBase)
 	materials.Legacy = []compact.KeyMaterial{{Scope: scope, Secret: secret}}
 	return materials, nil
 }

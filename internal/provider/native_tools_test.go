@@ -2,6 +2,8 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -12,12 +14,222 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+var droppedResponsesNativeDeclarations = []string{
+	`{"type":"file_search","vector_store_ids":["vs_test"],"max_num_results":5}`,
+	`{"type":"code_interpreter","container":{"type":"auto"}}`,
+	`{"type":"computer_use_preview","display_width":1024,"display_height":768,"environment":"browser"}`,
+	`{"type":"mcp","server_label":"docs","server_url":"https://example.test/mcp"}`,
+	`{"type":"tool_search"}`,
+	`{"type":"apply_patch"}`,
+}
+
+func responsesNativeToolRequest(declarations, choice string, nested bool) []byte {
+	input := `"input":"Inspect the supplied material","tools":` + declarations
+	if nested {
+		input = `"input":[{"type":"message","role":"user","content":"Inspect the supplied material"},{"type":"additional_tools","tools":` + declarations + `}]`
+	}
+	if choice != "" {
+		input += `,"tool_choice":` + choice
+	}
+	return []byte(`{` + input + `}`)
+}
+
+func TestDroppedResponsesNativeToolFilter(t *testing.T) {
+	for _, declaration := range droppedResponsesNativeDeclarations {
+		typ := gjson.Get(declaration, "type").String()
+		for _, endpoint := range []string{translate.EndpointChatCompletions, translate.EndpointMessages} {
+			for _, nested := range []bool{false, true} {
+				for _, test := range []struct {
+					name, choice, retained string
+					wantError              bool
+				}{
+					{name: "optional"},
+					{name: "auto", choice: `"auto"`},
+					{name: "none", choice: `"none"`},
+					{name: "required", choice: `"required"`, wantError: true},
+					{name: "forced native", choice: `{"type":"` + typ + `"}`, wantError: true},
+					{name: "allowed native", choice: `{"type":"allowed_tools","mode":"auto","tools":[{"type":"` + typ + `"}]}`, wantError: true},
+					{name: "forced absent function", choice: `{"type":"function","name":"` + typ + `"}`, wantError: true},
+					{name: "forced absent custom", choice: `{"type":"custom","name":"` + typ + `"}`, wantError: true},
+					{name: "required with function", choice: `"required"`, retained: `{"type":"function","name":"` + typ + `","description":"ordinary function","parameters":{"type":"object"}}`},
+					{name: "forced retained function", choice: `{"type":"function","name":"` + typ + `"}`, retained: `{"type":"function","name":"` + typ + `","parameters":{"type":"object"}}`},
+					{name: "forced retained custom", choice: `{"type":"custom","name":"` + typ + `"}`, retained: `{"type":"custom","name":"` + typ + `","format":{"type":"text"}}`},
+				} {
+					t.Run(fmt.Sprintf("%s/%s/nested=%t/%s", typ, endpoint, nested, test.name), func(t *testing.T) {
+						declarations := declaration
+						if test.retained != "" {
+							declarations += "," + test.retained
+						}
+						request := responsesNativeToolRequest("["+declarations+"]", test.choice, nested)
+						filtered, exclusions, err := filterUnrepresentableNativeTools("openai-response", endpoint, request)
+						if (err != nil) != test.wantError {
+							t.Fatalf("error=%v, wantError=%t; filtered=%s", err, test.wantError, filtered)
+						}
+						if err != nil {
+							var status *StatusError
+							if !errors.As(err, &status) || status.Code != "unsupported_native_tool_choice" || status.HTTPStatus != http.StatusUnprocessableEntity {
+								t.Fatalf("incoherent forced choice error: %v", err)
+							}
+							return
+						}
+						if len(exclusions) != 1 || exclusions[0].Type != typ || exclusions[0].Reason != "unrepresentable_by_selected_endpoint" {
+							t.Fatalf("exclusions=%v; filtered=%s", exclusions, filtered)
+						}
+						path := "tools"
+						if nested {
+							path = "input.1.tools"
+						}
+						tools := gjson.GetBytes(filtered, path).Array()
+						if test.retained != "" {
+							if len(tools) != 1 || tools[0].Raw != test.retained {
+								t.Fatalf("ordinary declaration changed: %s", filtered)
+							}
+						} else if len(tools) != 0 || test.choice == `"auto"` && gjson.GetBytes(filtered, "tool_choice").Exists() {
+							t.Fatalf("unsupported declaration or empty auto choice remains: %s", filtered)
+						}
+						if got := nativeToolResponseHeaders(http.Header{}, exclusions).Get("X-Copilot-Excluded-Native-Tools"); got != typ+";reason=unrepresentable_by_selected_endpoint" {
+							t.Fatalf("exclusion header=%q", got)
+						}
+						if _, err := translate.RequestForEndpointFrom("openai-response", "gpt-test", filtered, false, endpoint); err != nil {
+							t.Fatalf("filtered request is not translatable: %v; body=%s", err, filtered)
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
+func TestDroppedResponsesNativeToolsStayNative(t *testing.T) {
+	for _, declaration := range droppedResponsesNativeDeclarations {
+		typ := gjson.Get(declaration, "type").String()
+		for _, nested := range []bool{false, true} {
+			request := responsesNativeToolRequest("["+declaration+"]", `{"type":"`+typ+`"}`, nested)
+			filtered, exclusions, err := filterUnrepresentableNativeTools("openai-response", translate.EndpointResponses, request)
+			if err != nil || len(exclusions) != 0 || string(filtered) != string(request) {
+				t.Fatalf("native request changed: body=%s exclusions=%v error=%v", filtered, exclusions, err)
+			}
+		}
+	}
+}
+
+func TestResponsesNativeShellCompatibilityFilter(t *testing.T) {
+	for _, endpoint := range []string{translate.EndpointResponses, translate.EndpointChatCompletions, translate.EndpointMessages} {
+		for _, environment := range []string{`{"type":"local"}`, `{"type":"container_auto"}`, `{"type":"container_reference","container_id":"cntr_test"}`} {
+			for _, choice := range []string{`"auto"`, `{"type":"shell"}`} {
+				for _, nested := range []bool{false, true} {
+					t.Run(fmt.Sprintf("%s/%s/%s/nested=%t", endpoint, environment, choice, nested), func(t *testing.T) {
+						request := responsesNativeToolRequest(`[{"type":"shell","environment":`+environment+`}]`, choice, nested)
+						unsupported := endpoint == translate.EndpointMessages || endpoint == translate.EndpointChatCompletions && gjson.Get(environment, "type").String() != "local"
+						filtered, exclusions, err := filterUnrepresentableNativeTools("openai-response", endpoint, request)
+						if unsupported && choice != `"auto"` {
+							if err == nil {
+								t.Fatalf("unsupported forced shell accepted: %s", filtered)
+							}
+							return
+						}
+						if err != nil {
+							t.Fatal(err)
+						}
+						if unsupported {
+							if len(exclusions) != 1 || exclusions[0].Type != "shell" || gjson.GetBytes(filtered, "tool_choice").Exists() {
+								t.Fatalf("unsupported shell not excluded: body=%s exclusions=%v", filtered, exclusions)
+							}
+						} else if len(exclusions) != 0 || string(filtered) != string(request) {
+							t.Fatalf("supported shell changed: body=%s exclusions=%v", filtered, exclusions)
+						}
+						translated, err := translate.RequestForEndpointFrom("openai-response", "gpt-test", filtered, false, endpoint)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if endpoint == translate.EndpointChatCompletions && !unsupported && (gjson.GetBytes(translated, "tools.0.function.name").String() != "__cpa_local_shell" || choice != `"auto"` && gjson.GetBytes(translated, "tool_choice.function.name").String() != "__cpa_local_shell") {
+							t.Fatalf("SDK local shell mapping lost: %s", translated)
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
+func TestResponsesNativeFilterKeepsMappedClaudeWebSearch(t *testing.T) {
+	request := []byte(`{"input":"inspect","tools":[{"type":"web_search","max_uses":2,"filters":{"allowed_domains":["docs.example.test"]}},{"type":"file_search","vector_store_ids":["vs_test"]},{"type":"namespace","name":"functions","tools":[{"type":"custom","name":"edit","format":{"type":"text"}}]}],"tool_choice":"required"}`)
+	filtered, exclusions, err := filterUnrepresentableNativeTools("openai-response", translate.EndpointMessages, request)
+	if err != nil || len(exclusions) != 1 || exclusions[0].Type != "file_search" || gjson.GetBytes(filtered, "tools.0").Raw != gjson.GetBytes(request, "tools.0").Raw || gjson.GetBytes(filtered, "tools.1").Raw != gjson.GetBytes(request, "tools.2").Raw {
+		t.Fatalf("supported declarations changed: body=%s exclusions=%v error=%v", filtered, exclusions, err)
+	}
+	translated, err := translate.RequestForEndpointFrom("openai-response", "gpt-test", filtered, false, translate.EndpointMessages)
+	if err != nil || gjson.GetBytes(translated, "tools.0.type").String() != "web_search_20250305" || gjson.GetBytes(translated, "tools.0.max_uses").Int() != 2 || gjson.GetBytes(translated, "tools.0.allowed_domains.0").String() != "docs.example.test" || gjson.GetBytes(translated, "tools.1.name").String() != "functions__edit" || gjson.GetBytes(translated, "tool_choice.type").String() != "any" {
+		t.Fatalf("SDK supported mapping changed: output=%s error=%v", translated, err)
+	}
+}
+
+func TestDroppedResponsesNativeToolExecuteMetadata(t *testing.T) {
+	for _, declaration := range droppedResponsesNativeDeclarations {
+		typ := gjson.Get(declaration, "type").String()
+		for _, endpoint := range []string{translate.EndpointChatCompletions, translate.EndpointMessages} {
+			for _, nested := range []bool{false, true} {
+				for _, stream := range []bool{false, true} {
+					t.Run(fmt.Sprintf("%s/%s/nested=%t/stream=%t", typ, endpoint, nested, stream), func(t *testing.T) {
+						responseBody := []byte(`{"id":"msg_test","type":"message","role":"assistant","model":"gpt-5.6-sol","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
+						if endpoint == translate.EndpointChatCompletions {
+							responseBody = []byte(`{"id":"chat_test","object":"chat.completion","model":"gpt-5.6-sol","choices":[{"index":0,"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+						}
+						host := &nativeToolHost{compactionStreamHost: newCompactionStreamHost(responseBody), messages: endpoint == translate.EndpointMessages, chat: endpoint == translate.EndpointChatCompletions}
+						service := newCompactionStreamService(t, host.compactionStreamHost)
+						service.host = host
+						token := service.tokenEntries["auth-id"]
+						if err := service.Configure([]byte("model_endpoint_overrides:\n  gpt-5.6-sol: " + endpoint + "\n")); err != nil {
+							t.Fatal(err)
+						}
+						_, generation := service.configSnapshot()
+						token.ConfigGeneration = generation
+						service.tokenEntries["auth-id"] = token
+						request := compactionStreamRequest(responsesNativeToolRequest("["+declaration+`,{"type":"function","name":"lookup","parameters":{"type":"object"}}]`, `"auto"`, nested), "")
+						var headers http.Header
+						if stream {
+							var err error
+							headers, err = service.ExecuteStream(context.Background(), request)
+							if err != nil {
+								t.Fatal(err)
+							}
+							if _, message := collectCompactionStreamFrames(t, host.compactionStreamHost); message != "" {
+								t.Fatalf("stream failure: %s", message)
+							}
+							host.mu.Lock()
+							closed := len(host.closedStreams)
+							host.mu.Unlock()
+							if closed != 1 {
+								t.Fatalf("closed streams=%d", closed)
+							}
+						} else {
+							response, err := service.Execute(context.Background(), request)
+							if err != nil {
+								t.Fatal(err)
+							}
+							headers = response.Headers
+							metadata, err := json.Marshal(response.Metadata["copilot_excluded_native_tools"])
+							if err != nil || gjson.GetBytes(metadata, "0.type").String() != typ || gjson.GetBytes(metadata, "0.reason").String() != "unrepresentable_by_selected_endpoint" {
+								t.Fatalf("metadata=%s error=%v", metadata, err)
+							}
+						}
+						if headers.Get("X-Copilot-Excluded-Native-Tools") != typ+";reason=unrepresentable_by_selected_endpoint" || len(host.bodies) != 1 || len(gjson.GetBytes(host.bodies[0], "tools").Array()) != 1 {
+							t.Fatalf("headers=%v dispatched=%s", headers, host.bodies)
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
 type nativeToolHost struct {
 	*compactionStreamHost
 	errors        []string
 	bodies        [][]byte
 	closedStreams []string
 	messages      bool
+	chat          bool
 }
 
 func (h *nativeToolHost) Do(ctx context.Context, callback string, request transport.Request) (transport.Response, error) {
@@ -47,6 +259,9 @@ func (h *nativeToolHost) ReadStream(_ context.Context, id string) (transport.Str
 	}
 	if index <= len(h.errors) {
 		return transport.StreamChunk{Payload: []byte(h.errors[index-1]), Done: true}, nil
+	}
+	if h.chat {
+		return transport.StreamChunk{Payload: []byte("data: {\"id\":\"chat_test\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chat_test\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"), Done: true}, nil
 	}
 	if h.messages {
 		return transport.StreamChunk{Payload: []byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{" + strings.TrimPrefix(string(h.responseBody), "{") + "}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"), Done: true}, nil

@@ -6,10 +6,10 @@ REPO_DIR=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)
 TARGET_GOOS=${NATIVE_HOST_GOOS:-}
 TARGET_GOARCH=${NATIVE_HOST_GOARCH:-}
 NATIVE_HOST_IMAGE=${NATIVE_HOST_IMAGE:-golang:1.26-bookworm}
-TEST_SELECTOR='^(TestNativeHostProtocolRoundTrips|TestNativeHostOAuth.*|TestFilteredChildEnvironment|TestNativeHostCanonicalResponsesRouting|TestNativeHostConfiguredCanonicalResponsesCompaction|TestNativeHostPluginResponsesWebsocket|TestNativeHostToolAndSystemCompatibility)$'
+TEST_SELECTOR='^(TestNativeHostProtocolRoundTrips|TestNativeHostOAuth.*|TestFilteredChildEnvironment|TestNativeHostCanonicalResponsesRouting|TestNativeHostConfiguredCanonicalResponsesCompaction|TestNativeHostPluginResponsesWebsocket|TestNativeHostToolAndSystemCompatibility|TestNativeHostPreservesIncompleteResponsesTerminal)$'
 TEST_LIST_PATTERN='^(TestNativeHost|TestFilteredChildEnvironment)'
 REQUIRED_SEEDS='manifest.json auth.json legacy-auth.json model-catalog.json responses-request.json responses-history.json responses.json responses.sse chat.json chat.sse messages.json messages.sse responses-compaction.json responses-compaction.sse'
-REQUIRED_TESTS='TestNativeHostProtocolRoundTrips TestNativeHostOAuthContinuityPersistsAcrossRestart TestNativeHostOAuthExcludedModelsFilterPluginModels TestNativeHostOAuthSettingsOverrideCopilotModelContext TestFilteredChildEnvironment TestNativeHostCanonicalResponsesRouting TestNativeHostConfiguredCanonicalResponsesCompaction TestNativeHostPluginResponsesWebsocket TestNativeHostToolAndSystemCompatibility'
+REQUIRED_TESTS='TestNativeHostProtocolRoundTrips TestNativeHostOAuthContinuityPersistsAcrossRestart TestNativeHostOAuthExcludedModelsFilterPluginModels TestNativeHostOAuthSettingsOverrideCopilotModelContext TestFilteredChildEnvironment TestNativeHostCanonicalResponsesRouting TestNativeHostConfiguredCanonicalResponsesCompaction TestNativeHostPluginResponsesWebsocket TestNativeHostToolAndSystemCompatibility TestNativeHostPreservesIncompleteResponsesTerminal'
 
 if [ -z "$TARGET_GOOS" ] || [ -z "$TARGET_GOARCH" ]; then
   case "$(uname -s)" in

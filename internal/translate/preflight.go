@@ -69,9 +69,6 @@ func validateResponsesRequestForTarget(body []byte, target sdktranslator.Format)
 		case "function_call_output", "custom_tool_call_output":
 			err = validateResponsesToolOutput(item["output"], target)
 		case "additional_tools":
-			if target == sdktranslator.FormatOpenAI && hasMeaningfulValue(item) {
-				err = fmt.Errorf("Responses additional_tools items cannot be translated to Chat Completions")
-			}
 		default:
 			if typ != "" || hasMeaningfulValue(item) {
 				err = fmt.Errorf("unsupported nonempty Responses input item type %q", typ)
@@ -100,6 +97,7 @@ func validateResponsesToolsForTarget(root map[string]any, target sdktranslator.F
 	}
 
 	webSearchNames := make(map[string]struct{})
+	localShell := false
 	for _, source := range sources {
 		if source.value == nil || !hasMeaningfulValue(source.value) {
 			continue
@@ -116,8 +114,9 @@ func validateResponsesToolsForTarget(root map[string]any, target sdktranslator.F
 				}
 				continue
 			}
-			typ := stringValue(tool["type"])
+			typ := strings.TrimSpace(stringValue(tool["type"]))
 			switch typ {
+			case "", "function", "custom", "namespace":
 			case "web_search", "web_search_preview":
 				if typ == "web_search_preview" && target == sdktranslator.FormatClaude {
 					if err := validateResponsesWebSearchToolOptions(tool, true); err != nil {
@@ -135,13 +134,18 @@ func validateResponsesToolsForTarget(root map[string]any, target sdktranslator.F
 					name = "web_search"
 				}
 				webSearchNames[name] = struct{}{}
-			case "image_generation":
+			case "shell":
+				if target != sdktranslator.FormatOpenAI || stringValue(objectValue(tool["environment"])["type"]) != "local" {
+					return fmt.Errorf("Responses native %s tool cannot be represented by %s", typ, responsesTargetName(target))
+				}
+				localShell = true
+			default:
 				return fmt.Errorf("Responses native %s tool cannot be represented by %s", typ, responsesTargetName(target))
 			}
 		}
 	}
 
-	return validateResponsesNativeToolChoice(root["tool_choice"], target, webSearchNames)
+	return validateResponsesNativeToolChoice(root["tool_choice"], target, webSearchNames, localShell)
 }
 
 func responsesTargetName(target sdktranslator.Format) string {
@@ -209,7 +213,7 @@ func validateResponsesWebSearchToolOptions(tool map[string]any, preview bool) er
 	return nil
 }
 
-func validateResponsesNativeToolChoice(choice any, target sdktranslator.Format, webSearchNames map[string]struct{}) error {
+func validateResponsesNativeToolChoice(choice any, target sdktranslator.Format, webSearchNames map[string]struct{}, localShell bool) error {
 	if choice == nil || !hasMeaningfulValue(choice) {
 		return nil
 	}
@@ -236,8 +240,10 @@ func validateResponsesNativeToolChoice(choice any, target sdktranslator.Format, 
 	}
 	choiceType := stringValue(choiceObject["type"])
 	switch choiceType {
-	case "web_search", "web_search_preview", "image_generation":
-		return fmt.Errorf("Responses native tool_choice %q cannot be represented by %s", choiceType, responsesTargetName(target))
+	case "shell":
+		if !localShell {
+			return fmt.Errorf("Responses native tool_choice %q cannot be represented by %s", choiceType, responsesTargetName(target))
+		}
 	case "function", "custom":
 		name := firstString(choiceObject, "name")
 		if choiceType == "function" {
@@ -252,9 +258,7 @@ func validateResponsesNativeToolChoice(choice any, target sdktranslator.Format, 
 	case "allowed_tools":
 		return fmt.Errorf("Responses allowed_tools tool_choice cannot be represented by %s", responsesTargetName(target))
 	default:
-		if len(webSearchNames) > 0 {
-			return fmt.Errorf("Responses tool_choice %q cannot be represented by %s", choiceType, responsesTargetName(target))
-		}
+		return fmt.Errorf("Responses native tool_choice %q cannot be represented by %s", choiceType, responsesTargetName(target))
 	}
 	return nil
 }

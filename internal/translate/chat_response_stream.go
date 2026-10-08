@@ -80,7 +80,7 @@ func responsesStreamToChat(ctx context.Context, model string, original, translat
 			streamState.Items = mergeResponsesOpaqueItems(streamState.Items, [][]byte{itemRaw})
 		}
 	}
-	if event == "response.completed" {
+	if event == "response.completed" || event == "response.incomplete" {
 		terminalItems := responsesOpaqueItems([]byte(gjson.GetBytes(data, "response").Raw))
 		streamState.Items = mergeResponsesOpaqueItems(streamState.Items, terminalItems)
 		if len(streamState.Items) > 0 {
@@ -101,6 +101,26 @@ func responsesStreamToChat(ctx context.Context, model string, original, translat
 			return nil, err
 		}
 		out = append(out, translatedFrames...)
+	}
+	if event == "response.incomplete" {
+		usage := gjson.GetBytes(data, "response.usage")
+		for index, chunk := range out {
+			if !gjson.GetBytes(chunk, "usage").IsObject() {
+				continue
+			}
+			for _, fields := range [][2]string{
+				{"input_tokens", "prompt_tokens"}, {"output_tokens", "completion_tokens"}, {"total_tokens", "total_tokens"},
+				{"input_tokens_details", "prompt_tokens_details"}, {"output_tokens_details", "completion_tokens_details"},
+			} {
+				if value := usage.Get(fields[0]); value.Exists() {
+					chunk, err = sjson.SetRawBytes(chunk, "usage."+fields[1], []byte(value.Raw))
+					if err != nil {
+						return nil, fmt.Errorf("preserve incomplete Responses usage in Chat stream: %w", err)
+					}
+				}
+			}
+			out[index] = chunk
+		}
 	}
 	return chatChunksWithReportedModel(out, streamState.ReportedModel, model, translated)
 }

@@ -54,12 +54,18 @@ func filterUnrepresentableNativeTools(source, endpoint string, body []byte) ([]b
 		}
 		declarations.kept = make([]json.RawMessage, 0, len(declarations.tools.Array()))
 		for _, tool := range declarations.tools.Array() {
-			typ := tool.Get("type").String()
+			typ := strings.TrimSpace(tool.Get("type").String())
 			unsupported := false
 			switch source {
 			case "openai-response":
-				if typ == "web_search" || typ == "web_search_preview" || typ == "image_generation" {
-					unsupported = endpoint == translate.EndpointChatCompletions || endpoint == translate.EndpointMessages && typ == "image_generation"
+				switch typ {
+				case "", "function", "custom", "namespace":
+				case "web_search", "web_search_preview":
+					unsupported = endpoint == translate.EndpointChatCompletions
+				case "shell":
+					unsupported = endpoint == translate.EndpointMessages || endpoint == translate.EndpointChatCompletions && tool.Get("environment.type").String() != "local"
+				default:
+					unsupported = endpoint == translate.EndpointChatCompletions || endpoint == translate.EndpointMessages
 				}
 			case "claude":
 				unsupported = isNativeCompatibilityTool(typ) && (endpoint == translate.EndpointResponses || endpoint == translate.EndpointChatCompletions)
@@ -81,10 +87,10 @@ func filterUnrepresentableNativeTools(source, endpoint string, body []byte) ([]b
 		choiceType = choice.Get("type").String()
 	}
 	for _, tool := range removed {
-		if choice.IsObject() && isNativeCompatibilityTool(choiceType) && (choiceType == tool.Get("type").String() || strings.HasPrefix(choiceType, "web_search") && strings.HasPrefix(tool.Get("type").String(), "web_search")) {
+		if choice.IsObject() && (choiceType == strings.TrimSpace(tool.Get("type").String()) || strings.HasPrefix(choiceType, "web_search") && strings.HasPrefix(tool.Get("type").String(), "web_search")) {
 			return nil, nil, nativeToolChoiceError("tool_choice forces an unsupported native " + tool.Get("type").String() + " tool")
 		}
-		if choice.IsObject() && (choiceType == "tool" || choiceType == "function") {
+		if choice.IsObject() && (choiceType == "tool" || choiceType == "function" || choiceType == "custom") {
 			name := choice.Get("name").String()
 			if name == "" {
 				name = choice.Get("function.name").String()

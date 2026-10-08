@@ -236,8 +236,27 @@ func (s *streamTerminal) observe(endpoint string, frame []byte, copilotToken, gi
 		}
 		kind := firstNonEmpty(event, payload.Type)
 		switch kind {
-		case "error", "response.failed", "response.incomplete":
+		case "error", "response.failed":
 			return false, fmt.Errorf("Copilot Responses stream failed: %s", redactStreamError(data, copilotToken, githubToken))
+		case "response.incomplete":
+			if len(payload.Response) == 0 || bytesFirstNonSpace(payload.Response) != '{' {
+				return false, fmt.Errorf("Copilot Responses stream ended incomplete without a response object")
+			}
+			var response struct {
+				Status            string            `json:"status"`
+				Error             json.RawMessage   `json:"error"`
+				Output            []json.RawMessage `json:"output"`
+				IncompleteDetails struct {
+					Reason string `json:"reason"`
+				} `json:"incomplete_details"`
+			}
+			if err := json.Unmarshal(payload.Response, &response); err != nil || response.Status != "incomplete" || response.Output == nil || strings.TrimSpace(response.IncompleteDetails.Reason) == "" {
+				return false, fmt.Errorf("Copilot Responses stream ended with an invalid incomplete response")
+			}
+			if (payload.Type != "" && payload.Type != kind) || (len(bytes.TrimSpace(payload.Error)) > 0 && !bytes.Equal(bytes.TrimSpace(payload.Error), []byte("null"))) || (len(bytes.TrimSpace(response.Error)) > 0 && !bytes.Equal(bytes.TrimSpace(response.Error), []byte("null"))) {
+				return false, fmt.Errorf("Copilot Responses stream incomplete event contains an error")
+			}
+			return true, nil
 		case "response.completed":
 			if len(payload.Response) == 0 || bytesFirstNonSpace(payload.Response) != '{' {
 				return false, fmt.Errorf("Copilot Responses stream completed without a response object")
