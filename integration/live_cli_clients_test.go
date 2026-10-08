@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,23 +19,25 @@ import (
 )
 
 type liveCLIResult struct {
-	exitCode      int
-	timedOut      bool
-	final         bool
-	finalText     bool
-	turnCompleted bool
-	sourceURL     bool
-	errorCode     string
-	truncated     bool
-	toolStarted   map[string]int
-	toolCompleted map[string]int
-	toolFailed    map[string]int
-	toolIDs       map[string]string
-	startedIDs    map[string]string
-	completedIDs  map[string]string
-	spawnedAgents map[string]bool
-	doneAgents    map[string]bool
-	eventTypes    map[string]int
+	exitCode             int
+	timedOut             bool
+	final                bool
+	finalText            bool
+	turnCompleted        bool
+	sourceURL            bool
+	errorCode            string
+	truncated            bool
+	toolStarted          map[string]int
+	toolCompleted        map[string]int
+	toolFailed           map[string]int
+	toolIDs              map[string]string
+	startedIDs           map[string]string
+	completedIDs         map[string]string
+	spawnedAgents        map[string]bool
+	doneAgents           map[string]bool
+	eventTypes           map[string]int
+	threadID             string
+	verifiedV2Delegation bool
 }
 
 type liveCLIBuffer struct {
@@ -67,22 +68,10 @@ func TestLiveCLIClients(t *testing.T) {
 	if binary == "" {
 		t.Fatal("CPA_BINARY is required for live CLI clients")
 	}
-	token, err := readCopilotCLIKeychainToken()
-	if err != nil {
-		t.Fatal("Copilot CLI credential is unavailable")
-	}
-	login, userID, err := liveGitHubIdentity(token)
-	if err != nil {
-		t.Fatal("could not obtain authenticated Copilot identity")
-	}
-	storage, err := liveCopilotStorage(token, login, userID)
-	if err != nil {
-		t.Fatal("could not prepare temporary auth state")
-	}
-	profile := discoverLiveProfile(t, storage)
+	profile := liveProfileFromEnvironment(t)
 	base, stop := startLiveNativeHost(t, binary, profile.StorageJSON, profile.AuthMode, liveEndpointOverrides(profile.Catalog))
 	defer stop()
-	t.Logf("live client profile=%s model_count=%d", profile.AuthMode, len(profile.Catalog))
+	t.Logf("live client profile source=%s auth_mode=%s model_count=%d", profile.Source, profile.AuthMode, len(profile.Catalog))
 	for _, client := range []string{"claude", "codex"} {
 		client := client
 		t.Run(client, func(t *testing.T) {
@@ -110,7 +99,11 @@ func testLiveCLIClient(t *testing.T, client, base string) {
 		t.Fatal("could not restrict temporary client home")
 	}
 	if client == "codex" {
-		config := fmt.Sprintf("model = \"gpt-6-luna\"\nmodel_provider = \"task_proxy\"\nweb_search = \"live\"\n[features]\nmulti_agent_v2 = true\n[agents]\nmax_concurrent_threads_per_session = 2\n[model_providers.task_proxy]\nname = \"Task proxy\"\nbase_url = %q\nmodel_catalog_url = %q\nenv_key = \"TASK_PROXY_API_KEY\"\nwire_api = \"responses\"\nrequest_max_retries = 0\nstream_max_retries = 0\n", base+"/v1", base+"/v1/models")
+		catalogPath := filepath.Join(root, "models.json")
+		if err := os.WriteFile(catalogPath, []byte(liveCodexModelCatalog), 0600); err != nil {
+			t.Fatal("could not write temporary Codex model catalog")
+		}
+		config := liveCodexConfiguration(base, catalogPath)
 		if err := os.WriteFile(filepath.Join(root, "config.toml"), []byte(config), 0600); err != nil {
 			t.Fatal("could not write temporary Codex config")
 		}
@@ -120,25 +113,40 @@ func testLiveCLIClient(t *testing.T, client, base string) {
 		model = "gpt-6-luna"
 	}
 	t.Logf("client=%s model=%s", client, model)
-	baseline := runLiveCLI(t, path, client, base, root, "Reply with the single word READY.")
-	logLiveCLIResult(t, client, "baseline", baseline)
-	baselineOK := baseline.exitCode == 0 && baseline.final && !baseline.truncated
+	baselineOK := true
+	t.Run("baseline", func(t *testing.T) {
+		baseline := runLiveCLI(t, path, client, base, root, "Reply with the single word READY.")
+		logLiveCLIResult(t, client, "baseline", baseline)
+		baselineOK = baseline.exitCode == 0 && baseline.final && !baseline.truncated
+		if !baselineOK {
+			t.Errorf("%s baseline failed", client)
+		}
+	})
 	if !baselineOK {
 		t.Log("task=web_search status=NOTRUN reason=baseline_failed")
 		t.Log("task=subagent status=NOTRUN reason=baseline_failed")
-		t.Errorf("%s baseline failed", client)
 		return
 	}
-	search := runLiveCLI(t, path, client, base, root, "Use your web search tool to find NASA's official Moon facts page. Give one fact and its source URL. Actually perform the search before answering.")
-	logLiveCLIResult(t, client, "web_search", search)
-	if search.exitCode != 0 || !search.final || search.truncated || !liveSearchCompleted(client, search) {
-		t.Errorf("%s web search did not complete", client)
+	searchPrompt := "Invoke WebSearch to find NASA's official Moon facts page. Give one fact and its source URL from the search result. Do not use Bash, curl, or a fact from memory. If the search tool is unavailable, report that failure."
+	delegationPrompt := "Invoke Agent with subagent_type general-purpose and a prompt asking it to calculate 17 multiplied by 19. Wait for Agent to return the completed subagent result, then report that answer. If Agent is unavailable, report that failure. Do not calculate the answer yourself."
+	if client == "codex" {
+		searchPrompt = "Invoke the configured native web_search tool to find NASA's official Moon facts page. Give one fact and its source URL from the search result. Do not use shell commands or a fact from memory. If the native search tool is unavailable, report that failure."
+		delegationPrompt = "Invoke collaboration.spawn_agent to delegate this bounded task: calculate 17 multiplied by 19 and return the answer. Then invoke collaboration.wait_agent to wait for that spawned agent to complete before reporting its answer. If either tool is unavailable, report that failure. Do not calculate the answer yourself or invent a subagent result."
 	}
-	delegation := runLiveCLI(t, path, client, base, root, "Delegate this bounded task to a subagent: calculate 17 multiplied by 19. Wait for the subagent to finish, then report its answer. Actually invoke the delegation tool.")
-	logLiveCLIResult(t, client, "subagent", delegation)
-	if delegation.exitCode != 0 || !delegation.final || delegation.truncated || !liveDelegationCompleted(client, delegation) {
-		t.Errorf("%s subagent did not complete", client)
-	}
+	t.Run("web_search", func(t *testing.T) {
+		search := runLiveCLI(t, path, client, base, root, searchPrompt)
+		logLiveCLIResult(t, client, "web_search", search)
+		if search.exitCode != 0 || !search.final || search.truncated || !liveSearchCompleted(client, search) {
+			t.Errorf("%s web search did not complete", client)
+		}
+	})
+	t.Run("subagent", func(t *testing.T) {
+		delegation := runLiveCLI(t, path, client, base, root, delegationPrompt)
+		logLiveCLIResult(t, client, "subagent", delegation)
+		if delegation.exitCode != 0 || !delegation.final || delegation.truncated || !liveDelegationCompleted(client, delegation) {
+			t.Errorf("%s subagent did not complete", client)
+		}
+	})
 }
 
 func runLiveCLI(t *testing.T, path, client, base, root, prompt string) liveCLIResult {
@@ -147,9 +155,9 @@ func runLiveCLI(t *testing.T, path, client, base, root, prompt string) liveCLIRe
 	defer cancel()
 	var args []string
 	if client == "claude" {
-		args = []string{"--bare", "--print", "--output-format", "stream-json", "--verbose", "--no-session-persistence", "--permission-mode", "dontAsk", "--allowedTools", "WebSearch,Agent,Task", "--model", "claude-haiku-5.5", prompt}
+		args = []string{"--safe-mode", "--print", "--output-format", "stream-json", "--verbose", "--no-session-persistence", "--permission-mode", "dontAsk", "--tools", "WebSearch,Agent", "--allowedTools", "WebSearch,Agent", "--model", "claude-haiku-5.5", prompt}
 	} else {
-		args = []string{"exec", "--json", "--ephemeral", "--ignore-rules", "--skip-git-repo-check", "--sandbox", "read-only", "--model", "gpt-6-luna", "--cd", root, prompt}
+		args = []string{"exec", "--strict-config", "--json", "--ignore-rules", "--skip-git-repo-check", "--sandbox", "read-only", "--model", "gpt-6-luna", "--cd", root, prompt}
 	}
 	command := exec.CommandContext(ctx, path, args...)
 	command.Dir = root
@@ -167,7 +175,18 @@ func runLiveCLI(t *testing.T, path, client, base, root, prompt string) liveCLIRe
 	if command.Process != nil {
 		_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
 	}
+	if captureDir := liveDebugArtifactDirectory(t, "cli-"+client); captureDir != "" {
+		for name, body := range map[string][]byte{"stdout.jsonl": stdout.bytes, "stderr.txt": stderr.bytes, "prompt.txt": []byte(prompt)} {
+			if captureErr := os.WriteFile(filepath.Join(captureDir, name), body, 0600); captureErr != nil {
+				t.Fatal("could not retain private CLI diagnostic")
+			}
+		}
+		t.Logf("retained CLI output: %s", captureDir)
+	}
 	result := parseLiveCLIEvents(client, stdout.bytes)
+	if client == "codex" && result.threadID != "" {
+		result.verifiedV2Delegation = inspectLiveCodexDelegation(t, root, result.threadID)
+	}
 	result.errorCode = safeCLIErrorCode(append(append([]byte(nil), stdout.bytes...), stderr.bytes...))
 	result.truncated = stdout.truncated || stderr.truncated
 	if command.ProcessState != nil {
@@ -261,6 +280,9 @@ func parseClaudeEvent(result *liveCLIResult, event map[string]any) {
 
 func parseCodexEvent(result *liveCLIResult, event map[string]any) {
 	typeName, _ := event["type"].(string)
+	if typeName == "thread.started" {
+		result.threadID, _ = event["thread_id"].(string)
+	}
 	if typeName == "turn.completed" {
 		result.turnCompleted = true
 	}
@@ -376,9 +398,48 @@ func TestLiveCLIEventEvidence(t *testing.T) {
 	}
 }
 
+func TestLiveCLIRecordedFailures(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		client  string
+		fixture string
+	}{
+		{name: "bare Claude has no search tool", client: "claude", fixture: "claude_bare_search_unavailable.jsonl"},
+		{name: "Claude search upstream rejects the request", client: "claude", fixture: "claude_search_upstream_error.jsonl"},
+		{name: "Codex claims uninvoked delegation", client: "codex", fixture: "codex_delegation_uninvoked.jsonl"},
+		{name: "Codex search cannot correlate mismatched IDs", client: "codex", fixture: "codex_search_different_ids.jsonl"},
+		{name: "Codex wait has no spawned child", client: "codex", fixture: "codex_wait_without_spawn.jsonl"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			output, err := os.ReadFile(filepath.Join("testdata", test.fixture))
+			if err != nil {
+				t.Fatal(err)
+			}
+			result := parseLiveCLIEvents(test.client, output)
+			if !result.final || liveSearchCompleted(test.client, result) || liveDelegationCompleted(test.client, result) {
+				t.Fatal("recorded client refusal or uninvoked delegation was counted as completed tool work")
+			}
+		})
+	}
+}
+
+func TestLiveCLIRecordedClaudeDelegation(t *testing.T) {
+	output, err := os.ReadFile(filepath.Join("testdata", "claude_agent_completed.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := parseLiveCLIEvents("claude", output)
+	if !result.final || !liveDelegationCompleted("claude", result) || liveSearchCompleted("claude", result) {
+		t.Fatal("recorded completed Claude child was not identified precisely")
+	}
+}
+
 func liveDelegationCompleted(client string, result liveCLIResult) bool {
 	if client == "claude" {
 		return (result.toolStarted["Agent"] > 0 && result.toolCompleted["Agent"] > 0) || (result.toolStarted["Task"] > 0 && result.toolCompleted["Task"] > 0)
+	}
+	if result.verifiedV2Delegation && result.toolCompleted["collab_tool_call:wait"] > 0 {
+		return true
 	}
 	if result.toolCompleted["collab_tool_call:spawn_agent"] == 0 || result.toolCompleted["collab_tool_call:wait"] == 0 {
 		return false
@@ -403,7 +464,7 @@ func logLiveCLIResult(t *testing.T, client, task string, result liveCLIResult) {
 	if task == "subagent" && !liveDelegationCompleted(client, result) {
 		status = "FAIL"
 	}
-	t.Logf("task=%s status=%s exit=%d timeout=%t final=%t truncated=%t error_code=%s events=%v tool_started=%v tool_completed=%v tool_failed=%v", task, status, result.exitCode, result.timedOut, result.final, result.truncated, result.errorCode, result.eventTypes, result.toolStarted, result.toolCompleted, result.toolFailed)
+	t.Logf("task=%s status=%s exit=%d timeout=%t final=%t truncated=%t error_code=%s events=%v tool_started=%v tool_completed=%v tool_failed=%v verified_v2_rollout=%t", task, status, result.exitCode, result.timedOut, result.final, result.truncated, result.errorCode, result.eventTypes, result.toolStarted, result.toolCompleted, result.toolFailed, result.verifiedV2Delegation)
 }
 
 func safeCLIErrorCode(output []byte) string {

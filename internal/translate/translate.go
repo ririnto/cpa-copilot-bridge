@@ -8,6 +8,7 @@ import (
 
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/translator/builtin"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -120,6 +121,9 @@ func ResponseFromEndpoint(ctx context.Context, endpoint, destination, model stri
 		if !json.Valid(body) {
 			return nil, fmt.Errorf("Copilot API returned invalid JSON")
 		}
+		if from == sdktranslator.FormatOpenAI {
+			return nativeChatResponseObject(body, "chat.completion")
+		}
 		return append([]byte(nil), body...), nil
 	}
 	return response(ctx, from, to, model, original, translated, body)
@@ -136,9 +140,38 @@ func StreamFromEndpoint(ctx context.Context, endpoint, destination, model string
 	}
 	to := sdktranslator.FromString(destination)
 	if from == to {
+		if from == sdktranslator.FormatOpenAIResponse {
+			return nativeResponsesStream(frame, state)
+		}
+		if from == sdktranslator.FormatOpenAI {
+			event, data, done, err := parseSSEFrame(frame)
+			if err != nil {
+				return nil, err
+			}
+			if !done && len(data) > 0 {
+				out, err := nativeChatResponseObject(data, "chat.completion.chunk")
+				if err != nil {
+					return nil, err
+				}
+				if !bytes.Equal(out, data) {
+					return [][]byte{responseSSEBytes(event, out)}, nil
+				}
+			}
+		}
 		return [][]byte{append([]byte(nil), frame...)}, nil
 	}
 	return stream(ctx, from, to, model, original, translated, frame, state)
+}
+
+func nativeChatResponseObject(body []byte, object string) ([]byte, error) {
+	if !gjson.GetBytes(body, "object").Exists() && gjson.GetBytes(body, "choices").IsArray() {
+		out, err := sjson.SetBytes(body, "object", object)
+		if err != nil {
+			return nil, fmt.Errorf("set Copilot Chat response object: %w", err)
+		}
+		return out, nil
+	}
+	return append([]byte(nil), body...), nil
 }
 
 func ResponsesSSEToClaude(ctx context.Context, model string, original, translated, frame []byte, state *any) ([][]byte, error) {

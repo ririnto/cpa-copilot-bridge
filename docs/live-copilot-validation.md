@@ -31,7 +31,7 @@ CPA then applies its existing model-specific cooldown while other models retain 
 
 ## Acceptance evidence
 
-A successful matrix cell requires an upstream response, the requested model identity, the client's response schema, and nonempty assistant text.
+A successful matrix cell requires the exact upstream request model, a supported response identity, the client's schema, and assistant text.
 Record HTTP failures separately from successful conversion.
 Do not substitute another model to make a cell pass.
 
@@ -41,21 +41,29 @@ Record subagent invocation and completed delegated work separately.
 A prompt requesting a tool does not establish that the tool ran.
 Synthetic tests establish translation behavior; they do not establish live provider availability or completed client tools.
 
-Remove temporary authentication files, client settings, host logs, and task processes after validation.
+Remove temporary authentication files, client settings, and task processes after validation.
+Retain requested debug evidence outside the repository, including failed requests.
 Publish only sanitized summaries.
 
 ## Run the opt-in checks
 
 Prepare the platform-specific plugin and CPA v8 host as described by the existing native-host build instructions.
-The live checks use the Copilot CLI Keychain credential on macOS.
+Set `CPA_LIVE_COPILOT_AUTH_FILE` to an existing CPA Copilot authentication file to use that credential.
+The checks copy its storage into a temporary host and leave the source file unchanged.
+File credentials use `token_exchange` by default.
+Without a file, the checks use the Copilot CLI Keychain credential on macOS with `direct_oauth`.
 They require explicit environment flags and do not run during ordinary tests or CI.
 
 ```sh
 CPA_BINARY=/path/to/prepared/cli-proxy-api \
+  CPA_LIVE_COPILOT_AUTH_FILE=/path/to/copilot-auth.json \
+  CPA_LIVE_COPILOT_DEBUG_DIR=/path/to/private-debug-directory \
   CPA_LIVE_COPILOT_MATRIX=1 \
   go test ./integration -run '^TestLiveCopilotProtocolMatrix$' -count=1 -v
 
 CPA_BINARY=/path/to/prepared/cli-proxy-api \
+  CPA_LIVE_COPILOT_AUTH_FILE=/path/to/copilot-auth.json \
+  CPA_LIVE_COPILOT_DEBUG_DIR=/path/to/private-debug-directory \
   CPA_LIVE_COPILOT_CLIENTS=1 \
   go test ./integration -run '^TestLiveCLIClients$' -count=1 -v
 ```
@@ -64,8 +72,93 @@ The matrix pins the three native routes listed above, including when discovery a
 It runs nine non-streaming cells and streams only cells whose baseline passes.
 The CLI checks allow web search and delegation, then require completed tool events rather than requested tool names.
 Each CLI's failed baseline prevents subsequent tool requests for that client.
+Debug evidence includes original client and upstream request/response bodies and CLI output.
+The checks exclude authentication material and retain evidence in private directories even when validation fails.
+Regression fixtures preserve captured JSON fields and stream events, replacing only private or changing values.
 
-## Recorded live result
+## Fresh CPA authentication result
+
+The follow-up validation on 2026-10-09 used a completed CPA Copilot OAuth file with `token_exchange`.
+Discovery returned 59 models, including all three exact target IDs and their assigned native endpoints.
+
+| Model | Chat | Responses | Messages |
+| --- | --- | --- | --- |
+| `gemini-3.8-flash` | PASS | PASS | PASS |
+| `gpt-6-luna` | PASS | PASS | PASS |
+| `claude-haiku-5.5` | PASS | PASS | PASS |
+
+Both non-streaming and streaming responses passed for these nine combinations: 18 successful requests.
+The retained CPA logs confirm all 18 exact outbound model names and native endpoint selections.
+Unknown-model rejection and disabled compaction also passed.
+
+Copilot reports native Claude replies as `claude-haiku-5-5` after receiving `claude-haiku-5.5` in the request.
+The matrix accepts this observed response spelling for that model only, while preserving the exact request ID.
+The plugin leaves the native Claude model field unchanged.
+
+The native Gemini Chat response omitted the `object` field in JSON and streaming chunks.
+The plugin now supplies the Chat protocol discriminator while preserving the remaining response fields.
+The stream validator accepts the observed final usage-only Chat chunk with empty `choices`.
+The Messages fixture uses a 512-token budget because the earlier 64-token budget truncated Gemini's answer.
+
+Claude Code 2.1.294 and Codex CLI 0.161.0 both passed their baseline and completed delegated child work through the proxy.
+Claude ran its Agent tool and returned the child answer.
+Codex's V2 delegation records its spawn in a persisted rollout, while stdout leaves the wait event's child state empty.
+The acceptance check verifies the actual parent spawn/result, linked child session, completed child turn, successful wait, and received child handback.
+It rejects assistant claims without those events.
+
+Claude invoked WebSearch, but Copilot rejected the native tool with HTTP 400:
+
+```json
+{"error":{"message":"The use of the web search tool is not supported.","code":"unsupported_value"}}
+```
+
+The plugin preserves this known rejection as a structured client error without exposing arbitrary upstream error text.
+This is an invoked but unsupported search, not a completed search.
+
+| Client | Baseline | Web search | Subagent |
+| --- | --- | --- | --- |
+| Claude Code 2.1.294 | PASS | Invoked; unsupported HTTP 400 | PASS |
+| Codex CLI 0.161.0 | PASS | PASS | PASS |
+
+The final affected search rerun passed Codex's strict started/completed ID correlation and returned a source URL.
+Both client baselines passed again with the rebuilt plugin.
+The aggregate search command exited with status 1 because Claude's unsupported native search remains a failed acceptance case.
+
+Codex's isolated profile copies its official model catalogue entry and changes only `use_responses_lite` and `tool_mode` to enable the full Responses API and direct tools.
+The temporary client home supplies the catalogue through the supported `model_catalog_json` setting.
+The isolated Claude invocation enables WebSearch and Agent explicitly.
+
+Native Copilot hosted search changes its opaque item ID between stream phases and in the completed snapshot.
+The plugin buffers the ordered stream from the first hosted search until successful completion, bounded at 8 MiB.
+It retains the final snapshot and replay data, and uses its native ID for earlier search lifecycle events.
+Later text and tool events wait behind this buffer; incomplete streams return an error.
+
+Regression fixtures include the corresponding client request, upstream request, upstream response, and client response bodies.
+Private values use placeholders while the protocol fields and events remain intact.
+CPA's formatted SSE logs required reassembly at transport chunk boundaries; one lost instruction space was restored from the paired client response.
+Fixture notices record this reconstruction. Original diagnostics remain private and unchanged.
+
+## WebSocket interrupt limitation
+
+The exact Codex `response.interrupt` frame is rejected by CPA before it reaches the plugin.
+Native diagnostics reproduce this for both plugin normalization and active upstream WebSocket duplex processing.
+The examined CPA v8.0.15 and v8.0.20 handlers do not implement this control message, and the plugin executor has no downstream WebSocket control hook.
+The error is therefore not resolved by this plugin change.
+
+The isolated Codex profile uses supported settings to select HTTP transport and disable immediate interruption:
+
+```toml
+[features]
+instant_interrupt = false
+
+[model_providers.copilot_proxy]
+supports_websockets = false
+```
+
+Use the actual custom provider name when applying the transport setting.
+No operating proxy or global client configuration was changed during validation.
+
+## Earlier Keychain result
 
 The macOS validation on 2026-10-09 used the authenticated Copilot CLI account with `direct_oauth`.
 Discovery returned eight model entries and none of the three exact target IDs.
@@ -106,7 +199,7 @@ No aliases or retries were used for these six diagnostic requests.
 
 Each CLI completed one bounded baseline run and exited with status 1.
 Neither emitted a completed assistant answer or a tool call.
-Live web-search and delegation acceptance remains outstanding.
+Web-search and delegation were not exercised under this earlier credential profile; fresh CPA authentication results are recorded above.
 The failed live suites retain their failing exit status.
 
 Ordinary Go tests and the CI-selected synthetic native-host suite passed locally.

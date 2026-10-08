@@ -3,8 +3,12 @@ package provider
 import (
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/tidwall/gjson"
 )
 
 func TestUpstreamStatusErrorOmitsResponseText(t *testing.T) {
@@ -72,6 +76,39 @@ func TestUpstreamModelSupportErrorClassification(t *testing.T) {
 				if strings.Contains(statusErr.Error(), marker) {
 					t.Fatal("model rejection exposed provider response text")
 				}
+			}
+		})
+	}
+}
+
+func TestObservedClaudeWebSearchRejectionRemainsRequestScoped(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join("..", "translate", "testdata", "live-claude-web-search-unsupported", "upstream-response.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name   string
+		status int
+		body   string
+		code   string
+	}{
+		{name: "captured unsupported hosted search", status: http.StatusBadRequest, body: string(body), code: "unsupported_value"},
+		{name: "provider extra private fields are omitted", status: http.StatusBadRequest, body: strings.ReplaceAll(string(body), `"code":"unsupported_value"`, `"code":"unsupported_value","private":"synthetic-token-marker"`), code: "unsupported_value"},
+		{name: "same code with unknown message", status: http.StatusBadRequest, body: `{"error":{"code":"unsupported_value","message":"synthetic-token-marker"}}`, code: "upstream_error"},
+		{name: "same message with unknown code", status: http.StatusBadRequest, body: strings.ReplaceAll(string(body), "unsupported_value", "unknown_code"), code: "upstream_error"},
+		{name: "credential rejection remains credential scoped", status: http.StatusUnauthorized, body: string(body), code: "upstream_error"},
+		{name: "server rejection remains retryable", status: http.StatusBadGateway, body: string(body), code: "upstream_error"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			statusErr, ok := upstreamStatusError(test.status, test.body).(*StatusError)
+			if !ok || statusErr.Code != test.code || statusErr.HTTPStatus != test.status || statusErr.Retryable != (test.status >= 500) {
+				t.Fatalf("unexpected hosted search rejection: %#v", statusErr)
+			}
+			if test.code == "unsupported_value" && (gjson.Get(statusErr.Message, "error.type").String() != "invalid_request_error" || gjson.Get(statusErr.Message, "error.message").String() != "The use of the web search tool is not supported.") {
+				t.Fatal("observed hosted search rejection lost its fixed request error classification")
+			}
+			if strings.Contains(statusErr.Message, "synthetic-token-marker") {
+				t.Fatal("provider response private content leaked")
 			}
 		})
 	}

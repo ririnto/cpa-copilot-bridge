@@ -40,6 +40,12 @@ func upstreamStatusError(status int, body string) error {
 		code = "model_not_supported"
 		message = "The requested model is not supported."
 	}
+	if status == http.StatusBadRequest && gjson.Valid(body) &&
+		gjson.Get(body, "error.code").String() == "unsupported_value" &&
+		gjson.Get(body, "error.message").String() == "The use of the web search tool is not supported." {
+		code = "unsupported_value"
+		message = `{"error":{"message":"The use of the web search tool is not supported.","code":"unsupported_value","type":"invalid_request_error"}}`
+	}
 	return &StatusError{
 		Code:       code,
 		Message:    message,

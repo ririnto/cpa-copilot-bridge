@@ -12,12 +12,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -48,6 +51,7 @@ type liveCatalogResponse struct {
 }
 
 type liveProfile struct {
+	Source      string
 	AuthMode    string
 	StorageJSON []byte
 	Catalog     map[string][]string
@@ -67,19 +71,7 @@ func TestLiveCopilotProtocolMatrix(t *testing.T) {
 	if binary == "" {
 		t.Fatal("CPA_BINARY is required for the live native host matrix")
 	}
-	token, err := readCopilotCLIKeychainToken()
-	if err != nil {
-		t.Fatal("could not read the Copilot CLI credential")
-	}
-	login, userID, err := liveGitHubIdentity(token)
-	if err != nil {
-		t.Fatal("could not resolve authenticated GitHub identity")
-	}
-	storageJSON, err := liveCopilotStorage(token, login, userID)
-	if err != nil {
-		t.Fatal("could not prepare in-memory live auth state")
-	}
-	profile := discoverLiveProfile(t, storageJSON)
+	profile := liveProfileFromEnvironment(t)
 	overrides := liveEndpointOverrides(profile.Catalog)
 	for model, endpoint := range liveCopilotRoutes {
 		advertised := profile.Catalog[model]
@@ -92,18 +84,18 @@ func TestLiveCopilotProtocolMatrix(t *testing.T) {
 	attempted := 0
 	for _, model := range []string{"gemini-3.8-flash", "gpt-6-luna", "claude-haiku-5.5"} {
 		for _, api := range []string{"Chat", "Responses", "Claude Messages"} {
-			attempted++
 			name := fmt.Sprintf("%s/%s/stream=false", model, strings.ReplaceAll(api, " ", "_"))
 			if !t.Run(name, func(t *testing.T) {
+				attempted++
 				if runLiveMatrixCell(t, base, model, api, false) {
 					valid++
 				}
 			}) {
 				continue
 			}
-			attempted++
 			streamName := fmt.Sprintf("%s/%s/stream=true", model, strings.ReplaceAll(api, " ", "_"))
 			if t.Run(streamName, func(t *testing.T) {
+				attempted++
 				if runLiveMatrixCell(t, base, model, api, true) {
 					valid++
 				}
@@ -145,6 +137,7 @@ func runLiveMatrixCell(t *testing.T, base, model, api string, stream bool) bool 
 	t.Helper()
 	path, payload := liveMatrixRequest(model, api, stream)
 	body, status, contentType, callErr := liveProxyCall(base+path, payload)
+	captureLiveMatrixBodies(t, payload, body, status, contentType)
 	if callErr != nil {
 		t.Errorf("request failed before receiving a response")
 		return false
@@ -158,8 +151,8 @@ func runLiveMatrixCell(t *testing.T, base, model, api string, stream bool) bool 
 		t.Errorf("response did not match the %s client schema", api)
 		return false
 	}
-	if returnedModel != model {
-		t.Errorf("response model=%q, want exact requested model %q", returnedModel, model)
+	if !liveMatrixResponseModelMatches(model, returnedModel) {
+		t.Errorf("response model=%q does not identify requested model %q", returnedModel, model)
 		return false
 	}
 	if !strings.Contains(strings.ToUpper(text), "LIVE_MATRIX_OK") {
@@ -170,8 +163,146 @@ func runLiveMatrixCell(t *testing.T, base, model, api string, stream bool) bool 
 		t.Errorf("stream did not include the protocol terminal event")
 		return false
 	}
-	t.Logf("validated exact model and text response; chars=%d terminal=%t", len([]rune(text)), terminalOK)
+	t.Logf("validated requested model and text response; response_model=%s observed_native_canonical=%t chars=%d terminal=%t", returnedModel, returnedModel != model, len([]rune(text)), terminalOK)
 	return true
+}
+
+func liveMatrixResponseModelMatches(requested, returned string) bool {
+	return requested == returned || requested == "claude-haiku-5.5" && returned == "claude-haiku-5-5"
+}
+
+func liveDebugArtifactDirectory(t *testing.T, prefix string) string {
+	t.Helper()
+	root := strings.TrimSpace(os.Getenv("CPA_LIVE_COPILOT_DEBUG_DIR"))
+	if root == "" {
+		return ""
+	}
+	root, err := filepath.Abs(root)
+	if err != nil {
+		t.Fatal("could not resolve private live diagnostics directory")
+	}
+	if err := os.MkdirAll(root, 0700); err != nil {
+		t.Fatal("could not create private live diagnostics directory")
+	}
+	directory, err := os.MkdirTemp(root, prefix+"-")
+	if err != nil {
+		t.Fatal("could not create retained live diagnostics directory")
+	}
+	return directory
+}
+
+var liveLogSection = regexp.MustCompile(`^=== API (REQUEST|RESPONSE) ([0-9]+) ===$`)
+var liveAuthenticationTokenField = regexp.MustCompile(`(?i)"(?:token|access_token|refresh_token|github_token|copilot_token|oauth_token)"\s*:`)
+var liveModelBodyIdentity = regexp.MustCompile(`"(?:model|choices|output)"\s*:|"type"\s*:\s*"(?:message|response[.a-z_]*|chat[.a-z_]*)"`)
+var liveCredentialHeader = regexp.MustCompile(`(?i)^\s*(authorization|proxy-authorization|x-api-key|api-key|x-auth-token|cookie|set-cookie|auth):`)
+
+func sanitizeLiveHostLog(body []byte) []byte {
+	lines := strings.SplitAfter(string(body), "\n")
+	authAttempts := make(map[string]bool)
+	attempt := ""
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if section := liveLogSection.FindStringSubmatch(trimmed); len(section) > 0 {
+			attempt = section[2]
+		} else if strings.HasPrefix(trimmed, "Upstream URL:") {
+			endpoint, err := url.Parse(strings.TrimSpace(strings.TrimPrefix(trimmed, "Upstream URL:")))
+			if err == nil && (strings.Contains(endpoint.Path, "/copilot_internal/") || strings.Contains(endpoint.Path, "/login/") || strings.HasSuffix(endpoint.Path, "/token") || strings.HasSuffix(endpoint.Path, "/user")) {
+				authAttempts[attempt] = true
+			}
+		}
+	}
+	var sanitized strings.Builder
+	inAuthAttempt, omitBody := false, false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "=== ") {
+			omitBody = false
+			inAuthAttempt = false
+			if section := liveLogSection.FindStringSubmatch(trimmed); len(section) > 0 {
+				inAuthAttempt = authAttempts[section[2]]
+			}
+		}
+		if liveCredentialHeader.MatchString(line) {
+			continue
+		}
+		if inAuthAttempt && trimmed == "Body:" {
+			sanitized.WriteString(line)
+			sanitized.WriteString("[AUTHENTICATION BODY OMITTED]\n")
+			omitBody = true
+			continue
+		}
+		if !omitBody {
+			sanitized.WriteString(line)
+		}
+	}
+	remaining := sanitized.String()
+	var protected strings.Builder
+	for {
+		bodyAt := strings.Index(remaining, "Body:\n")
+		if bodyAt < 0 {
+			break
+		}
+		protected.WriteString(remaining[:bodyAt+len("Body:\n")])
+		remaining = remaining[bodyAt+len("Body:\n"):]
+		end := strings.Index(remaining, "\n=== ")
+		if end < 0 {
+			end = len(remaining)
+		}
+		section := remaining[:end]
+		if liveAuthenticationTokenField.MatchString(section) && !liveModelBodyIdentity.MatchString(section) {
+			protected.WriteString("[AUTHENTICATION BODY OMITTED]\n")
+		} else {
+			protected.WriteString(section)
+		}
+		remaining = remaining[end:]
+	}
+	if liveAuthenticationTokenField.MatchString(remaining) && !liveModelBodyIdentity.MatchString(remaining) {
+		protected.WriteString("[AUTHENTICATION BODY OMITTED]\n")
+	} else {
+		protected.WriteString(remaining)
+	}
+	return []byte(protected.String())
+}
+
+func scrubLiveHostLogs(directory string) error {
+	return filepath.WalkDir(directory, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return os.Chmod(path, 0700)
+		}
+		body, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(path, sanitizeLiveHostLog(body), 0600); err != nil {
+			return err
+		}
+		return os.Chmod(path, 0600)
+	})
+}
+
+func captureLiveMatrixBodies(t *testing.T, payload any, response []byte, status int, contentType string) {
+	t.Helper()
+	directory := liveDebugArtifactDirectory(t, "matrix-body")
+	if directory == "" {
+		return
+	}
+	request, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal("could not encode captured matrix request")
+	}
+	metadata, err := json.Marshal(map[string]any{"test": t.Name(), "http_status": status, "content_type": contentType})
+	if err != nil {
+		t.Fatal("could not encode captured matrix metadata")
+	}
+	for name, body := range map[string][]byte{"client-request.json": request, "client-response.body": response, "metadata.json": metadata} {
+		if err := os.WriteFile(filepath.Join(directory, name), body, 0600); err != nil {
+			t.Fatal("could not retain private live matrix body")
+		}
+	}
+	t.Logf("retained client request and response bodies: %s", directory)
 }
 
 func TestLiveResponsesStreamValidation(t *testing.T) {
@@ -298,11 +429,98 @@ func TestLiveChatAndClaudeStreamValidation(t *testing.T) {
 	}
 }
 
-func discoverLiveProfile(t *testing.T, storageJSON []byte) liveProfile {
+func liveProfileFromEnvironment(t *testing.T) liveProfile {
 	t.Helper()
-	catalog, status, err := probeLiveModelCatalog(storageJSON, "direct_oauth")
+	storageJSON, source, authMode, err := liveCredentialSourceFromEnvironment()
 	if err != nil {
-		t.Fatalf("Copilot CLI direct_oauth catalog discovery failed with status %d", status)
+		t.Fatal(err)
+	}
+	return discoverLiveProfile(t, storageJSON, source, authMode)
+}
+
+func liveCredentialSourceFromEnvironment() ([]byte, string, string, error) {
+	authPath, authFileConfigured := os.LookupEnv("CPA_LIVE_COPILOT_AUTH_FILE")
+	modeOverride, modeOverrideConfigured := os.LookupEnv("CPA_LIVE_COPILOT_AUTH_MODE")
+	authMode, err := selectLiveAuthMode(authFileConfigured, modeOverride, modeOverrideConfigured)
+	if err != nil {
+		return nil, "", "", err
+	}
+	if authFileConfigured {
+		if strings.TrimSpace(authPath) == "" {
+			return nil, "", "", errors.New("CPA_LIVE_COPILOT_AUTH_FILE must name a Copilot auth file")
+		}
+		storageJSON, err := readLiveCopilotAuthFile(authPath)
+		if err != nil {
+			return nil, "", "", err
+		}
+		return storageJSON, "auth-file", authMode, nil
+	}
+	token, err := readCopilotCLIKeychainToken()
+	if err != nil {
+		return nil, "", "", errors.New("Copilot CLI credential is unavailable")
+	}
+	login, userID, err := liveGitHubIdentity(token)
+	if err != nil {
+		return nil, "", "", errors.New("could not resolve authenticated Copilot identity")
+	}
+	storageJSON, err := liveCopilotStorage(token, login, userID)
+	if err != nil {
+		return nil, "", "", errors.New("could not prepare in-memory live auth state")
+	}
+	return storageJSON, "copilot-cli-keychain", authMode, nil
+}
+
+func selectLiveAuthMode(authFileConfigured bool, override string, overrideConfigured bool) (string, error) {
+	if overrideConfigured {
+		switch strings.TrimSpace(override) {
+		case "token_exchange", "direct_oauth":
+			return strings.TrimSpace(override), nil
+		default:
+			return "", errors.New("CPA_LIVE_COPILOT_AUTH_MODE must be token_exchange or direct_oauth")
+		}
+	}
+	if authFileConfigured {
+		return "token_exchange", nil
+	}
+	return "direct_oauth", nil
+}
+
+func readLiveCopilotAuthFile(path string) ([]byte, error) {
+	storageJSON, err := os.ReadFile(path)
+	if err != nil {
+		return nil, errors.New("Copilot auth file could not be read")
+	}
+	if err := validateLiveCopilotAuthStorage(storageJSON); err != nil {
+		return nil, err
+	}
+	return storageJSON, nil
+}
+
+func validateLiveCopilotAuthStorage(storageJSON []byte) error {
+	var header struct {
+		Disabled *bool `json:"disabled"`
+	}
+	if err := json.Unmarshal(storageJSON, &header); err != nil {
+		return errors.New("Copilot auth file is invalid")
+	}
+	if header.Disabled != nil && *header.Disabled {
+		return errors.New("Copilot auth file is disabled")
+	}
+	parsed, err := provider.New(nil).ParseAuth(pluginapi.AuthParseRequest{
+		Provider: "copilot",
+		RawJSON:  storageJSON,
+	})
+	if err != nil || !parsed.Handled || parsed.Auth.Provider != "copilot" || parsed.Auth.Disabled || len(parsed.Auth.StorageJSON) == 0 {
+		return errors.New("Copilot auth file is not valid enabled Copilot auth data")
+	}
+	return nil
+}
+
+func discoverLiveProfile(t *testing.T, storageJSON []byte, source, authMode string) liveProfile {
+	t.Helper()
+	catalog, status, err := probeLiveModelCatalog(storageJSON, authMode)
+	if err != nil {
+		t.Fatalf("Copilot catalog discovery failed with status %d", status)
 	}
 	count := 0
 	for model := range liveCopilotRoutes {
@@ -310,8 +528,8 @@ func discoverLiveProfile(t *testing.T, storageJSON []byte) liveProfile {
 			count++
 		}
 	}
-	t.Logf("credential profile accepted: source=copilot-cli-keychain auth_mode=direct_oauth catalog_rows=%d exact_target_models=%d", len(catalog), count)
-	return liveProfile{AuthMode: "direct_oauth", StorageJSON: storageJSON, Catalog: catalog}
+	t.Logf("credential profile accepted: source=%s auth_mode=%s catalog_rows=%d exact_target_models=%d", source, authMode, len(catalog), count)
+	return liveProfile{Source: source, AuthMode: authMode, StorageJSON: storageJSON, Catalog: catalog}
 }
 
 func probeLiveModelCatalog(storageJSON []byte, authMode string) (map[string][]string, int, error) {
@@ -470,6 +688,97 @@ func liveCopilotStorage(token, login string, userID int64) ([]byte, error) {
 	return body, nil
 }
 
+func TestSelectLiveAuthMode(t *testing.T) {
+	tests := []struct {
+		name             string
+		authFile         bool
+		override         string
+		overrideProvided bool
+		want             string
+		wantErr          bool
+	}{
+		{name: "keychain default", want: "direct_oauth"},
+		{name: "auth file default", authFile: true, want: "token_exchange"},
+		{name: "explicit auth file mode", authFile: true, override: "direct_oauth", overrideProvided: true, want: "direct_oauth"},
+		{name: "explicit keychain mode", override: "token_exchange", overrideProvided: true, want: "token_exchange"},
+		{name: "unknown mode", override: "custom", overrideProvided: true, wantErr: true},
+		{name: "empty explicit mode", overrideProvided: true, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := selectLiveAuthMode(test.authFile, test.override, test.overrideProvided)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("selectLiveAuthMode() error = %t, want %t", err != nil, test.wantErr)
+			}
+			if got != test.want {
+				t.Errorf("selectLiveAuthMode() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestLiveCopilotAuthFileValidation(t *testing.T) {
+	const secret = "fixture-live-secret-token"
+	tests := []struct {
+		name    string
+		body    string
+		wantErr string
+	}{
+		{name: "valid auth storage", body: `{"type":"copilot","github_access_token":"` + secret + `","github_login":"fixture-user"}`},
+		{name: "invalid JSON", body: `{"type":`, wantErr: "Copilot auth file is invalid"},
+		{name: "disabled auth", body: `{"type":"copilot","github_access_token":"` + secret + `","disabled":true}`, wantErr: "Copilot auth file is disabled"},
+		{name: "wrong provider", body: `{"type":"other","github_access_token":"` + secret + `"}`, wantErr: "Copilot auth file is not valid enabled Copilot auth data"},
+		{name: "missing token", body: `{"type":"copilot","github_login":"fixture-user"}`, wantErr: "Copilot auth file is not valid enabled Copilot auth data"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			original := []byte(test.body)
+			gotErr := validateLiveCopilotAuthStorage(original)
+			if test.wantErr == "" {
+				if gotErr != nil {
+					t.Fatalf("validateLiveCopilotAuthStorage() error = %v", gotErr)
+				}
+			} else {
+				if gotErr == nil || gotErr.Error() != test.wantErr {
+					t.Fatalf("validateLiveCopilotAuthStorage() error = %v, want %q", gotErr, test.wantErr)
+				}
+				if strings.Contains(gotErr.Error(), secret) || strings.Contains(gotErr.Error(), "fixture-user") {
+					t.Fatal("auth validation error exposed credential data")
+				}
+			}
+			if !bytes.Equal(original, []byte(test.body)) {
+				t.Fatal("auth validation changed the original storage bytes")
+			}
+		})
+	}
+}
+
+func TestReadLiveCopilotAuthFilePreservesBytesAndHidesPath(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "fixture-sensitive-name.json")
+	want := []byte("{\n  \"github_access_token\": \"fixture-token\",\n  \"type\": \"copilot\"\n}\n")
+	if err := os.WriteFile(path, want, 0600); err != nil {
+		t.Fatal("could not write synthetic Copilot auth fixture")
+	}
+	t.Setenv("CPA_LIVE_COPILOT_AUTH_FILE", path)
+	t.Setenv("CPA_LIVE_COPILOT_AUTH_MODE", "token_exchange")
+	got, source, authMode, err := liveCredentialSourceFromEnvironment()
+	if err != nil {
+		t.Fatalf("liveCredentialSourceFromEnvironment() error = %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("auth file bytes changed while loading")
+	}
+	if source != "auth-file" || authMode != "token_exchange" {
+		t.Fatalf("live credential selection = source %q, mode %q", source, authMode)
+	}
+
+	missingPath := filepath.Join(root, "fixture-private-path.json")
+	if _, err := readLiveCopilotAuthFile(missingPath); err == nil || strings.Contains(err.Error(), missingPath) {
+		t.Fatal("auth file read error was missing or exposed its path")
+	}
+}
+
 func startLiveNativeHost(t *testing.T, binary string, storageJSON []byte, authMode string, endpointOverrides map[string]string) (string, func()) {
 	t.Helper()
 	root := t.TempDir()
@@ -510,6 +819,18 @@ func startLiveNativeHost(t *testing.T, binary string, storageJSON []byte, authMo
 		t.Fatal("could not write task-owned auth state")
 	}
 	config := nativeTemplateConfig(t)
+	debugDirectory := liveDebugArtifactDirectory(t, "native-host")
+	if debugDirectory != "" {
+		logs := nativeMap(t, nativeMap(t, config["observability"])["logs"])
+		logs["debug"] = true
+		logs["logging-to-file"] = true
+		logs["request-log"] = true
+		logs["logs-max-total-size-mb"] = 0
+		logs["error-logs-max-files"] = 0
+		if err := os.MkdirAll(filepath.Join(debugDirectory, "logs"), 0700); err != nil {
+			t.Fatal("could not create retained private host logs")
+		}
+	}
 	server := nativeMap(t, config["server"])
 	server["host"] = "127.0.0.1"
 	server["port"] = port
@@ -538,14 +859,21 @@ func startLiveNativeHost(t *testing.T, binary string, storageJSON []byte, authMo
 	if err := os.WriteFile(configPath, configBody, 0600); err != nil {
 		t.Fatal("could not write live host config")
 	}
-	logFile, err := os.OpenFile(filepath.Join(root, "host.log"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	logDirectory := root
+	if debugDirectory != "" {
+		logDirectory = debugDirectory
+	}
+	logFile, err := os.OpenFile(filepath.Join(logDirectory, "host.log"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
 		t.Fatal("could not create private host log")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	command := exec.CommandContext(ctx, binary, "--config", configPath, "--local-model")
 	command.Env = liveChildEnvironment(root)
-	command.Dir = root
+	if debugDirectory != "" {
+		command.Env = append(command.Env, "WRITABLE_PATH="+debugDirectory)
+	}
+	command.Dir = logDirectory
 	command.Stdout = logFile
 	command.Stderr = logFile
 	if err := command.Start(); err != nil {
@@ -556,9 +884,28 @@ func startLiveNativeHost(t *testing.T, binary string, storageJSON []byte, authMo
 	var stopOnce sync.Once
 	stop := func() {
 		stopOnce.Do(func() {
+			if err := command.Process.Signal(os.Interrupt); err != nil {
+				cancel()
+			}
+			exited := make(chan error, 1)
+			go func() { exited <- command.Wait() }()
+			timer := time.NewTimer(5 * time.Second)
+			select {
+			case <-exited:
+			case <-timer.C:
+				cancel()
+				<-exited
+			}
+			timer.Stop()
 			cancel()
-			_ = command.Wait()
 			_ = logFile.Close()
+			if debugDirectory != "" {
+				if err := scrubLiveHostLogs(debugDirectory); err != nil {
+					t.Error("could not finalize sanitized private host logs")
+				} else {
+					t.Logf("retained sanitized host debug and request logs: %s", debugDirectory)
+				}
+			}
 		})
 	}
 	t.Cleanup(stop)
@@ -636,7 +983,7 @@ func liveMatrixRequest(model, api string, stream bool) (string, map[string]any) 
 		}
 	default:
 		return "/v1/messages", map[string]any{
-			"model": model, "stream": stream, "max_tokens": 64, "messages": []any{map[string]any{"role": "user", "content": prompt}},
+			"model": model, "stream": stream, "max_tokens": 512, "messages": []any{map[string]any{"role": "user", "content": prompt}},
 		}
 	}
 }
@@ -662,7 +1009,7 @@ func liveProxyCall(endpoint string, payload any) ([]byte, int, string, error) {
 	defer response.Body.Close()
 	result, err := io.ReadAll(io.LimitReader(response.Body, 2<<20))
 	if err != nil {
-		return nil, response.StatusCode, response.Header.Get("Content-Type"), errors.New("native host response could not be read")
+		return result, response.StatusCode, response.Header.Get("Content-Type"), errors.New("native host response could not be read")
 	}
 	return result, response.StatusCode, response.Header.Get("Content-Type"), nil
 }
@@ -823,14 +1170,28 @@ func liveChatStreamValid(events []map[string]any) bool {
 	if len(events) == 0 {
 		return false
 	}
-	for _, event := range events {
+	hasFinish := false
+	for index, event := range events {
 		if event["object"] != "chat.completion.chunk" {
 			return false
 		}
 		model, modelOK := event["model"].(string)
 		choices, choicesOK := event["choices"].([]any)
-		if !modelOK || model == "" || !choicesOK || len(choices) == 0 {
+		if !modelOK || model == "" || !choicesOK {
 			return false
+		}
+		if len(choices) == 0 {
+			usage, ok := event["usage"].(map[string]any)
+			if !ok || !hasFinish || index != len(events)-1 {
+				return false
+			}
+			for _, field := range []string{"prompt_tokens", "completion_tokens", "total_tokens"} {
+				tokens, ok := usage[field].(float64)
+				if !ok || tokens < 0 || tokens != math.Trunc(tokens) {
+					return false
+				}
+			}
+			continue
 		}
 		for _, value := range choices {
 			choice, ok := value.(map[string]any)
@@ -841,9 +1202,10 @@ func liveChatStreamValid(events []map[string]any) bool {
 				return false
 			}
 			if finish, exists := choice["finish_reason"]; exists && finish != nil {
-				if _, ok := finish.(string); !ok {
+				if reason, ok := finish.(string); !ok || reason == "" {
 					return false
 				}
+				hasFinish = true
 			}
 		}
 	}
@@ -1031,4 +1393,272 @@ func safeLiveErrorClass(body []byte, status int) string {
 		return "public_" + errorType
 	}
 	return "unknown"
+}
+
+func TestLiveChatStreamUsageValidation(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join("..", "internal", "translate", "testdata", "live-matrix-gpt-chat-stream", "client-response.sse"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	frames := strings.Split(strings.TrimSpace(string(body)), "\n\n")
+	if len(frames) < 4 {
+		t.Fatal("captured Chat usage stream has too few frames")
+	}
+	content := strings.Join(frames[:len(frames)-3], "\n\n") + "\n\n"
+	finished := frames[len(frames)-3] + "\n\n"
+	usage := frames[len(frames)-2] + "\n\n"
+	done := frames[len(frames)-1] + "\n\n"
+	mutateUsage := func(change func(map[string]any)) string {
+		var event map[string]any
+		if json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(usage, "data:"))), &event) != nil {
+			t.Fatal("captured usage chunk is invalid JSON")
+		}
+		change(event)
+		body, err := json.Marshal(event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return "data: " + string(body) + "\n\n"
+	}
+	tests := []struct {
+		name  string
+		body  string
+		valid bool
+	}{
+		{name: "terminal usage-only chunk", body: content + finished + usage + done, valid: true},
+		{name: "empty choices without usage", body: content + finished + mutateUsage(func(event map[string]any) { delete(event, "usage") }) + done},
+		{name: "missing token field", body: content + finished + mutateUsage(func(event map[string]any) { delete(event["usage"].(map[string]any), "total_tokens") }) + done},
+		{name: "negative token count", body: content + finished + mutateUsage(func(event map[string]any) { event["usage"].(map[string]any)["completion_tokens"] = -7 }) + done},
+		{name: "fractional token count", body: content + finished + mutateUsage(func(event map[string]any) { event["usage"].(map[string]any)["completion_tokens"] = 0.7 }) + done},
+		{name: "string token count", body: content + finished + mutateUsage(func(event map[string]any) { event["usage"].(map[string]any)["completion_tokens"] = "7" }) + done},
+		{name: "usage before completion", body: content + usage + finished + done},
+		{name: "usage without finish reason", body: content + usage + done},
+		{name: "usage without assistant chunks", body: usage + done},
+		{name: "usage without done marker", body: content + finished + usage},
+		{name: "usage changes reported model", body: content + finished + strings.ReplaceAll(usage, "gpt-6-luna", "other-model") + done},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, _, valid, _ := validateLiveResponse("Chat", true, "text/event-stream", []byte(test.body))
+			if valid != test.valid {
+				t.Fatalf("stream schema valid=%t, want %t", valid, test.valid)
+			}
+		})
+	}
+}
+
+func TestLiveHostLogRetentionScrubsCredentialsAndPreservesBodies(t *testing.T) {
+	const request = `{"model":"claude-haiku-5.5","stream":false,"messages":[{"role":"user","content":"LIVE_MATRIX_OK"}]}`
+	const response = `{"error":{"type":"invalid_request_error","message":"fixture failure"},"model":"claude-haiku-5-5"}`
+	original := "=== HEADERS ===\nAuthorization: Bearer fixture-client-secret\nX-Api-Key: fixture-api-secret\nContent-Type: application/json\n\n=== REQUEST BODY ===\n" + request + "\n\n" +
+		"=== API REQUEST 1 ===\nUpstream URL: https://api.github.com/copilot_internal/v2/token\nAuth: provider=copilot account=fixture-account\nHeaders:\nAuthorization: token fixture-oauth-secret\n\nBody:\n{\"login\":\"fixture-identity\"}\n\n" +
+		"=== API REQUEST 2 ===\nUpstream URL: https://api.githubcopilot.com/v1/messages\nHeaders:\nAuthorization: Bearer fixture-model-secret\n\nBody:\n" + request + "\n\n" +
+		"=== API RESPONSE 1 ===\nStatus: 200\nHeaders:\nSet-Cookie: fixture-cookie-secret\nBody:\n{\"token\":\"fixture-token-secret\",\"login\":\"fixture-identity\"}\n\n" +
+		"=== API RESPONSE 2 ===\nStatus: 400\nHeaders:\nContent-Type: application/json\nBody:\n" + response + "\n\n=== RESPONSE ===\nStatus: 400\n" + response + "\n"
+	root := t.TempDir()
+	path := filepath.Join(root, "failure.log")
+	if err := os.WriteFile(path, []byte(original), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := scrubLiveHostLogs(root); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"fixture-client-secret", "fixture-api-secret", "fixture-account", "fixture-oauth-secret", "fixture-model-secret", "fixture-cookie-secret", "fixture-token-secret", "fixture-identity", "Authorization:", "X-Api-Key:", "Set-Cookie:"} {
+		if bytes.Contains(body, []byte(secret)) {
+			t.Fatalf("retained log includes synthetic credential or identity %q", secret)
+		}
+	}
+	if bytes.Count(body, []byte(request)) != 2 || bytes.Count(body, []byte(response)) != 2 || !bytes.Contains(body, []byte("Status: 400")) {
+		t.Fatal("retained log changed original request/response shapes or lost failure status")
+	}
+	file, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if file.Mode().Perm() != 0600 {
+		t.Fatalf("retained log permissions=%o", file.Mode().Perm())
+	}
+}
+
+func TestLiveHostLogRetentionScrubsUnpairedAuthenticationSpools(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "client model request plus unpaired auth response", body: "=== REQUEST BODY ===\n{\"model\":\"gpt-6-luna\",\"input\":\"LIVE_MATRIX_OK\"}\n=== API RESPONSE 1 ===\nStatus: 200\nBody:\n{\"token\":\"fixture-token-secret\",\"login\":\"fixture-identity\"}\n"},
+		{name: "complete response without request URL", body: "=== API RESPONSE 1 ===\nStatus: 200\nBody:\n{\"token\":\"fixture-token-secret\",\"login\":\"fixture-identity\"}\n"},
+		{name: "unterminated response token prefix", body: "=== API RESPONSE 1 ===\nStatus: 200\nBody:\n{\"token\":\"fixture-token-secret"},
+		{name: "multiline response token prefix", body: "=== API RESPONSE 1 ===\nStatus: 200\nBody:\n{\n \"expires_at\": 0,\n \"token\": \"fixture-token-secret"},
+		{name: "raw auth body spool", body: `{"access_token":"fixture-token-secret","login":"fixture-identity"}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := sanitizeLiveHostLog([]byte(test.body))
+			if bytes.Contains(body, []byte("fixture-token-secret")) || bytes.Contains(body, []byte("fixture-identity")) {
+				t.Fatal("unpaired auth spool retained a synthetic token or identity")
+			}
+		})
+	}
+	const failedModel = "=== API RESPONSE 1 ===\nStatus: 400\nBody:\n{\"model\":\"gpt-6-luna\",\"error\":{\"message\":\"fixture failure\"},\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"{\\\"token\\\":\\\"example\\\"}\"}]}]}"
+	if got := string(sanitizeLiveHostLog([]byte(failedModel))); got != failedModel {
+		t.Fatal("unpaired failed model response body changed")
+	}
+	const partialModel = "=== API RESPONSE 1 ===\nStatus: 200\nBody:\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"LIVE_MATRIX_"
+	if got := string(sanitizeLiveHostLog([]byte(partialModel))); got != partialModel {
+		t.Fatal("partial model response body changed")
+	}
+}
+
+func TestLiveProxyCallRetainsInterruptedResponseBody(t *testing.T) {
+	const partial = "data: {\"object\":\"chat.completion.chunk\",\"model\":\"gpt-6-luna\",\"choices\":["
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		writer.Header().Set("Content-Length", "9999")
+		if _, err := writer.Write([]byte(partial)); err != nil {
+			t.Error("fixture response could not be written")
+		}
+	}))
+	defer server.Close()
+	body, status, contentType, err := liveProxyCall(server.URL, map[string]any{"model": "gpt-6-luna", "input": "LIVE_MATRIX_OK"})
+	if err == nil || string(body) != partial || status != http.StatusOK || contentType != "text/event-stream" {
+		t.Fatal("interrupted live request lost its partial body or response metadata")
+	}
+}
+
+func TestLiveMatrixObservedNativeCanonicalIdentity(t *testing.T) {
+	root := filepath.Join("..", "internal", "translate", "testdata", "live-matrix-claude-claude")
+	request, err := os.ReadFile(filepath.Join(root, "upstream-request.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := os.ReadFile(filepath.Join(root, "upstream-response.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var nativeRequest, nativeResponse map[string]any
+	if json.Unmarshal(request, &nativeRequest) != nil || json.Unmarshal(response, &nativeResponse) != nil {
+		t.Fatal("captured native identity fixture is invalid")
+	}
+	requested, _ := nativeRequest["model"].(string)
+	returned, _ := nativeResponse["model"].(string)
+	if requested != "claude-haiku-5.5" || returned != "claude-haiku-5-5" || liveCopilotRoutes[requested] != "/v1/messages" {
+		t.Fatal("captured canonical identity does not match the exact requested native route")
+	}
+	tests := []struct {
+		requested string
+		returned  string
+		matches   bool
+	}{
+		{requested: requested, returned: returned, matches: true},
+		{requested: requested, returned: requested, matches: true},
+		{requested: requested, returned: "claude-haiku-5", matches: false},
+		{requested: "claude-opus-5.5", returned: "claude-opus-5-5", matches: false},
+		{requested: "claude-haiku-5-5", returned: requested, matches: false},
+		{requested: "gpt-6-luna", returned: "gpt-6-luna", matches: true},
+		{requested: "gpt-6-luna", returned: requested, matches: false},
+	}
+	for _, test := range tests {
+		if got := liveMatrixResponseModelMatches(test.requested, test.returned); got != test.matches {
+			t.Fatalf("requested=%q returned=%q matches=%t, want %t", test.requested, test.returned, got, test.matches)
+		}
+	}
+}
+
+func TestLiveMatrixClaudeBudgetMatchesCapturedRequest(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join("..", "internal", "translate", "testdata", "live-matrix-gemini-claude", "client-request.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var captured map[string]any
+	if json.Unmarshal(body, &captured) != nil {
+		t.Fatal("captured Claude budget request is invalid")
+	}
+	_, payload := liveMatrixRequest("gemini-3.8-flash", "Claude Messages", false)
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var generated map[string]any
+	if json.Unmarshal(encoded, &generated) != nil {
+		t.Fatal("generated Claude budget request is invalid")
+	}
+	capturedJSON, err := json.Marshal(captured)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generatedJSON, err := json.Marshal(generated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(capturedJSON, generatedJSON) || generated["max_tokens"] != float64(512) {
+		t.Fatal("matrix request differs from the successful captured 512-token request")
+	}
+}
+
+func TestLiveMatrixCapturedNineProtocolPairs(t *testing.T) {
+	for _, native := range []struct{ name, model, api string }{
+		{"gemini", "gemini-3.8-flash", "Chat"},
+		{"gpt", "gpt-6-luna", "Responses"},
+		{"claude", "claude-haiku-5.5", "Claude Messages"},
+	} {
+		for _, client := range []struct{ name, api string }{
+			{"chat", "Chat"}, {"responses", "Responses"}, {"claude", "Claude Messages"},
+		} {
+			t.Run(native.name+"/"+client.name, func(t *testing.T) {
+				root := filepath.Join("..", "internal", "translate", "testdata", "live-matrix-"+native.name+"-"+client.name)
+				bodies := make(map[string][]byte)
+				for _, name := range []string{"client-request", "upstream-request", "upstream-response", "client-response"} {
+					body, err := os.ReadFile(filepath.Join(root, name+".json"))
+					if err != nil || !json.Valid(body) {
+						t.Fatalf("captured %s body is unavailable or invalid", name)
+					}
+					bodies[name] = body
+				}
+				_, payload := liveMatrixRequest(native.model, client.api, false)
+				generated, err := json.Marshal(payload)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var generatedRequest, capturedRequest map[string]any
+				if json.Unmarshal(generated, &generatedRequest) != nil || json.Unmarshal(bodies["client-request"], &capturedRequest) != nil {
+					t.Fatal("matrix request is invalid")
+				}
+				generated, _ = json.Marshal(generatedRequest)
+				captured, _ := json.Marshal(capturedRequest)
+				if !bytes.Equal(generated, captured) {
+					t.Fatal("matrix request differs from its captured successful original")
+				}
+				var upstreamRequest map[string]any
+				if json.Unmarshal(bodies["upstream-request"], &upstreamRequest) != nil || upstreamRequest["model"] != native.model || upstreamRequest["stream"] != false {
+					t.Fatal("upstream request substituted the requested model or mode")
+				}
+				for _, response := range []struct{ name, api string }{{"client-response", client.api}, {"upstream-response", native.api}} {
+					body := bodies[response.name]
+					// The captured native Gemini reply predates the object-field repair.
+					if response.name == "upstream-response" && native.name == "gemini" {
+						var reply map[string]any
+						if json.Unmarshal(body, &reply) != nil {
+							t.Fatal("native Gemini capture is invalid")
+						}
+						if _, exists := reply["object"]; exists {
+							t.Fatal("original missing-object provider evidence changed")
+						}
+						reply["object"] = "chat.completion"
+						body, err = json.Marshal(reply)
+						if err != nil {
+							t.Fatal(err)
+						}
+					}
+					text, model, valid, terminal := validateLiveResponse(response.api, false, "application/json", body)
+					if !valid || !terminal || !strings.Contains(text, "LIVE_MATRIX_OK") || !liveMatrixResponseModelMatches(native.model, model) {
+						t.Fatalf("captured %s failed schema, terminal, prompt, or identity validation", response.name)
+					}
+				}
+			})
+		}
+	}
 }
