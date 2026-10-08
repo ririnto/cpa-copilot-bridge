@@ -240,6 +240,38 @@ func TestClaudeResponsesToolSchemaAliasesRejectMalformedOrConflictingValues(t *t
 	}
 }
 
+func TestClaudeRequestRejectsNativeToolsThatWouldBecomeFunctions(t *testing.T) {
+	for _, typ := range []string{"web_search_20250305", "web_search_20260209", "web_search_preview", "web_search", "image_generation"} {
+		t.Run(typ, func(t *testing.T) {
+			requestBody, err := json.Marshal(map[string]any{"tools": []any{map[string]any{"type": typ, "name": typ}}})
+			if err != nil {
+				t.Fatalf("encode Claude native tool: %v", err)
+			}
+			if _, err := RequestForEndpointFrom("claude", "gpt-test", requestBody, false, EndpointResponses); err == nil || !strings.Contains(err.Error(), typ) {
+				t.Fatalf("native tool translation error = %v, want explicit %q rejection", err, typ)
+			}
+		})
+	}
+}
+
+func TestClaudeRequestKeepsOrdinaryFunctionsNamedLikeNativeTools(t *testing.T) {
+	requestBody := []byte(`{"tools":[{"name":"web_search","input_schema":{"type":"object"}},{"type":"custom","name":"web_search_preview","input_schema":{"type":"object"}},{"type":"function","name":"image_generation","input_schema":{"type":"object"}}]}`)
+	translated, err := RequestForEndpointFrom("claude", "gpt-test", requestBody, false, EndpointResponses)
+	if err != nil {
+		t.Fatalf("translate ordinary functions: %v", err)
+	}
+	tools := gjson.GetBytes(translated, "tools").Array()
+	if len(tools) != 3 {
+		t.Fatalf("translated tools = %s", gjson.GetBytes(translated, "tools"))
+	}
+	wantNames := []string{"web_search", "web_search_preview", "image_generation"}
+	for index, tool := range tools {
+		if tool.Get("type").String() != "function" || tool.Get("name").String() != wantNames[index] {
+			t.Fatalf("ordinary tool %d was not preserved as a function: %s", index, translated)
+		}
+	}
+}
+
 func TestClaudeReasoningPayloadsPreserveOpaqueWhitespace(t *testing.T) {
 	const thinking = " inspect carefully \n"
 	const signature = " sig "
@@ -339,8 +371,106 @@ func TestClaudeOutputConfigEffortMarkerIsNormalizedWithoutDroppingMessages(t *te
 		t.Fatal("unknown synthetic system marker field was silently dropped")
 	}
 	meaningfulMarker := []byte(`{"messages":[{"role":"system","content":[{"type":"text","text":"must not drop"}],"output_config":{"effort":"high"}},{"role":"user","content":"keep"}]}`)
-	if _, err := RequestForEndpointFrom("claude", model, meaningfulMarker, false, EndpointResponses); err == nil {
-		t.Fatal("meaningful synthetic system content was silently dropped")
+	translated, err := RequestForEndpointFrom("claude", model, meaningfulMarker, false, EndpointResponses)
+	if err != nil {
+		t.Fatalf("translate effort-bearing system content: %v", err)
+	}
+	if got := gjson.GetBytes(translated, "input.0.role").String(); got != "system" {
+		t.Fatalf("system content authority changed to role %q; request=%s", got, translated)
+	}
+	if got := gjson.GetBytes(translated, "input.0.content.0.text").String(); got != "must not drop" {
+		t.Fatalf("system content was lost: %s", translated)
+	}
+	if got := gjson.GetBytes(translated, "reasoning.effort").String(); got != "high" {
+		t.Fatalf("system effort = %q, want high; request=%s", got, translated)
+	}
+}
+
+func TestClaudeEmptySystemEffortMarkerAcceptsEmptyContentForms(t *testing.T) {
+	for _, content := range []string{`""`, `null`} {
+		t.Run(content, func(t *testing.T) {
+			requestBody := []byte(`{"messages":[{"role":"system","content":` + content + `,"output_config":{"effort":"high"}},{"role":"user","content":"keep"}]}`)
+			translated, err := RequestForEndpointFrom("claude", "gpt-test", requestBody, false, EndpointResponses)
+			if err != nil {
+				t.Fatalf("translate empty effort marker: %v", err)
+			}
+			if got := gjson.GetBytes(translated, "reasoning.effort").String(); got != "high" {
+				t.Fatalf("reasoning effort = %q, want high; request=%s", got, translated)
+			}
+			if got := gjson.GetBytes(translated, "input.0.role").String(); got != "user" {
+				t.Fatalf("empty effort marker reached Responses input: %s", translated)
+			}
+		})
+	}
+}
+
+func TestClaudeSystemContentWithEffortPreservesOrderAndCacheControl(t *testing.T) {
+	requestBody := []byte(`{"messages":[{"role":"user","content":"before"},{"role":"system","content":"keep this policy","cache_control":{"type":"ephemeral"},"output_config":{"effort":"low"}},{"role":"system","content":[{"type":"text","text":"second policy"},{"type":"text","text":"cached policy","cache_control":{"type":"ephemeral"}}],"output_config":{"effort":"high"}},{"role":"user","content":"after"}]}`)
+	translated, err := claudeRequestToResponses("gpt-test", requestBody, false)
+	if err != nil {
+		t.Fatalf("translate effort-bearing system messages: %v", err)
+	}
+	input := gjson.GetBytes(translated, "input").Array()
+	if len(input) != 4 || input[0].Get("role").String() != "user" || input[1].Get("role").String() != "system" || input[2].Get("role").String() != "system" || input[3].Get("role").String() != "user" {
+		t.Fatalf("message order or system authority changed: %s", translated)
+	}
+	if got := input[1].Get("content.0.text").String(); got != "keep this policy" {
+		t.Fatalf("system string content = %q; request=%s", got, translated)
+	}
+	if got := input[1].Get("content.0.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("message cache_control moved or was lost: %s", translated)
+	}
+	if got := input[2].Get("content.0.text").String() + input[2].Get("content.1.text").String(); got != "second policycached policy" {
+		t.Fatalf("system block content changed: %s", translated)
+	}
+	if got := input[2].Get("content.1.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("block cache_control was lost: %s", translated)
+	}
+	if got := gjson.GetBytes(translated, "reasoning.effort").String(); got != "high" {
+		t.Fatalf("last system effort = %q, want high; request=%s", got, translated)
+	}
+	rootEffortWins := []byte(`{"output_config":{"effort":"low"},"messages":[{"role":"system","content":"keep this policy","output_config":{"effort":"high"}}]}`)
+	translated, err = claudeRequestToResponses("gpt-test", rootEffortWins, false)
+	if err != nil {
+		t.Fatalf("translate root effort with system content: %v", err)
+	}
+	if got := gjson.GetBytes(translated, "reasoning.effort").String(); got != "low" {
+		t.Fatalf("root effort = %q, want low; request=%s", got, translated)
+	}
+}
+
+func TestClaudeSystemContentWithEffortStillRejectsUnsupportedSemantics(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "non_text_block",
+			body: `{"messages":[{"role":"system","content":[{"type":"image","source":{}}],"output_config":{"effort":"high"}}]}`,
+			want: "unsupported non-text Claude system block",
+		},
+		{
+			name: "clear_at",
+			body: `{"messages":[{"role":"system","content":"policy","clear_at":"next_user_message","output_config":{"effort":"high"}}]}`,
+			want: "clear_at",
+		},
+		{
+			name: "unknown_message_field",
+			body: `{"messages":[{"role":"system","content":"policy","unknown":"value","output_config":{"effort":"high"}}]}`,
+			want: "unsupported Claude system message field",
+		},
+		{
+			name: "unknown_output_config_option",
+			body: `{"messages":[{"role":"system","content":"policy","output_config":{"effort":"high","temperature":0.2}}]}`,
+			want: "unsupported Claude system message",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := RequestForEndpointFrom("claude", "gpt-test", []byte(test.body), false, EndpointResponses); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("unsupported system content error = %v, want %q", err, test.want)
+			}
+		})
 	}
 }
 

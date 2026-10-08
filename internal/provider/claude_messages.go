@@ -60,16 +60,21 @@ func normalizeClaudeMessagesRequest(model upstreamModel, sourceFormat string, or
 					hasMessageEffort = true
 					configHasEffort = true
 				}
+				if !configHasEffort {
+					return nil, fmt.Errorf("Claude Messages message %d has an output_config without effort", index)
+				}
 				if message.Get("role").String() == "system" {
 					content := message.Get("content")
-					if configHasEffort && content.IsArray() && len(content.Array()) == 0 {
+					if isClaudeSystemContentEmpty(content) {
 						if !isClaudeEffortMarker(message) {
 							return nil, fmt.Errorf("Claude Messages system effort marker has unsupported fields")
 						}
 						effortMarkerIndexes = append(effortMarkerIndexes, index)
 						continue
 					}
-					return nil, fmt.Errorf("Claude Messages system content with per-message output_config is unsupported")
+					if err := validateClaudeSystemMessageWithEffort(message); err != nil {
+						return nil, err
+					}
 				}
 				messageIndexes = append(messageIndexes, index)
 			}
@@ -223,6 +228,56 @@ func isClaudeEffortMarker(message gjson.Result) bool {
 		}
 	}
 	return true
+}
+
+func isClaudeSystemContentEmpty(content gjson.Result) bool {
+	if !content.Exists() {
+		return false
+	}
+	switch content.Type {
+	case gjson.Null:
+		return true
+	case gjson.String:
+		return content.String() == ""
+	default:
+		return content.IsArray() && len(content.Array()) == 0
+	}
+}
+
+func validateClaudeSystemMessageWithEffort(message gjson.Result) error {
+	for name := range message.Map() {
+		switch name {
+		case "role", "content", "cache_control", "output_config":
+		case "clear_at":
+			return fmt.Errorf("Claude Messages mid-conversation system clear_at is unsupported by the selected Copilot endpoint")
+		default:
+			return fmt.Errorf("Claude Messages system field %q is unsupported by the selected Copilot endpoint", name)
+		}
+	}
+	content := message.Get("content")
+	if content.Type == gjson.String {
+		return nil
+	}
+	if !content.IsArray() {
+		return fmt.Errorf("Claude Messages system content must be text or text blocks")
+	}
+	for _, part := range content.Array() {
+		if !part.IsObject() {
+			return fmt.Errorf("Claude Messages system content contains a non-object block")
+		}
+		if part.Get("type").String() != "text" {
+			return fmt.Errorf("Claude Messages system content contains a non-text block")
+		}
+		for name := range part.Map() {
+			if name != "type" && name != "text" && name != "cache_control" {
+				return fmt.Errorf("Claude Messages system text block field %q is unsupported by the selected Copilot endpoint", name)
+			}
+		}
+		if part.Get("text").Type != gjson.String {
+			return fmt.Errorf("Claude Messages system text block has no string text")
+		}
+	}
+	return nil
 }
 
 func adaptiveClaudeEffort(requested string, supported []string) (string, bool) {

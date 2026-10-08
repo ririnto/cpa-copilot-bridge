@@ -1,7 +1,9 @@
 package translate
 
 import (
+	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
@@ -11,6 +13,9 @@ func validateResponsesRequestForTarget(body []byte, target sdktranslator.Format)
 	root, err := decodeObject(body)
 	if err != nil {
 		return fmt.Errorf("decode Responses request for translation")
+	}
+	if err := validateResponsesToolsForTarget(root, target); err != nil {
+		return err
 	}
 	if previousResponseID, exists := root["previous_response_id"]; exists && previousResponseID != nil {
 		value, isString := previousResponseID.(string)
@@ -74,6 +79,181 @@ func validateResponsesRequestForTarget(body []byte, target sdktranslator.Format)
 		}
 		if err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+func validateResponsesToolsForTarget(root map[string]any, target sdktranslator.Format) error {
+	type toolSource struct {
+		value any
+		label string
+	}
+	sources := []toolSource{{value: root["tools"], label: "tools"}}
+	if input, ok := root["input"].([]any); ok {
+		for index, rawItem := range input {
+			item, ok := rawItem.(map[string]any)
+			if ok && stringValue(item["type"]) == "additional_tools" {
+				sources = append(sources, toolSource{value: item["tools"], label: fmt.Sprintf("input.%d.tools", index)})
+			}
+		}
+	}
+
+	webSearchNames := make(map[string]struct{})
+	for _, source := range sources {
+		if source.value == nil || !hasMeaningfulValue(source.value) {
+			continue
+		}
+		tools, ok := source.value.([]any)
+		if !ok {
+			return fmt.Errorf("Responses %s has an unsupported shape", source.label)
+		}
+		for _, rawTool := range tools {
+			tool, ok := rawTool.(map[string]any)
+			if !ok {
+				if hasMeaningfulValue(rawTool) {
+					return fmt.Errorf("Responses %s contains an unsupported tool definition", source.label)
+				}
+				continue
+			}
+			typ := stringValue(tool["type"])
+			switch typ {
+			case "web_search", "web_search_preview":
+				if typ == "web_search_preview" && target == sdktranslator.FormatClaude {
+					if err := validateResponsesWebSearchToolOptions(tool, true); err != nil {
+						return err
+					}
+				} else if typ == "web_search" && target == sdktranslator.FormatClaude {
+					if err := validateResponsesWebSearchToolOptions(tool, false); err != nil {
+						return err
+					}
+				} else {
+					return fmt.Errorf("Responses native %s tool cannot be represented by %s", typ, responsesTargetName(target))
+				}
+				name := stringValue(tool["name"])
+				if name == "" {
+					name = "web_search"
+				}
+				webSearchNames[name] = struct{}{}
+			case "image_generation":
+				return fmt.Errorf("Responses native %s tool cannot be represented by %s", typ, responsesTargetName(target))
+			}
+		}
+	}
+
+	return validateResponsesNativeToolChoice(root["tool_choice"], target, webSearchNames)
+}
+
+func responsesTargetName(target sdktranslator.Format) string {
+	if target == sdktranslator.FormatClaude {
+		return "Claude Messages"
+	}
+	return "Chat Completions"
+}
+
+func validateResponsesWebSearchToolOptions(tool map[string]any, preview bool) error {
+	for key, value := range tool {
+		switch key {
+		case "type":
+		case "name":
+			if _, ok := value.(string); !ok {
+				return fmt.Errorf("Responses web search name has an unsupported value")
+			}
+		case "user_location":
+			if _, ok := value.(map[string]any); !ok {
+				return fmt.Errorf("Responses web search user_location cannot be represented by Claude Messages")
+			}
+		case "external_web_access":
+			allowed, ok := value.(bool)
+			if !ok || !allowed {
+				return fmt.Errorf("Responses web search external_web_access=false cannot be represented by Claude Messages")
+			}
+		case "max_uses":
+			if preview {
+				return fmt.Errorf("Responses web_search_preview max_uses cannot be represented by Claude Messages")
+			}
+			count, ok := value.(json.Number)
+			if !ok {
+				return fmt.Errorf("Responses web search max_uses has an unsupported value")
+			}
+			parsed, err := strconv.ParseInt(count.String(), 10, 64)
+			if err != nil || parsed <= 0 {
+				return fmt.Errorf("Responses web search max_uses has an unsupported value")
+			}
+		case "filters":
+			if preview {
+				return fmt.Errorf("Responses web_search_preview filters cannot be represented by Claude Messages")
+			}
+			filters, ok := value.(map[string]any)
+			if !ok {
+				return fmt.Errorf("Responses web search filters has an unsupported shape")
+			}
+			for filter := range filters {
+				if filter != "allowed_domains" {
+					return fmt.Errorf("Responses web search filter %q cannot be represented by Claude Messages", filter)
+				}
+				domains, ok := filters[filter].([]any)
+				if !ok {
+					return fmt.Errorf("Responses web search allowed_domains has an unsupported shape")
+				}
+				for _, domain := range domains {
+					if _, ok := domain.(string); !ok {
+						return fmt.Errorf("Responses web search allowed_domains contains an unsupported value")
+					}
+				}
+			}
+		default:
+			return fmt.Errorf("Responses web search option %q cannot be represented by Claude Messages", key)
+		}
+	}
+	return nil
+}
+
+func validateResponsesNativeToolChoice(choice any, target sdktranslator.Format, webSearchNames map[string]struct{}) error {
+	if choice == nil || !hasMeaningfulValue(choice) {
+		return nil
+	}
+	choiceString, isString := choice.(string)
+	if isString {
+		switch choiceString {
+		case "auto", "required":
+			return nil
+		case "none":
+			if target == sdktranslator.FormatClaude && len(webSearchNames) > 0 {
+				return fmt.Errorf("Responses tool_choice none cannot be preserved for a native web search tool by Claude Messages")
+			}
+			return nil
+		default:
+			if len(webSearchNames) > 0 {
+				return fmt.Errorf("Responses tool_choice %q cannot be represented by %s", choiceString, responsesTargetName(target))
+			}
+			return nil
+		}
+	}
+	choiceObject, ok := choice.(map[string]any)
+	if !ok {
+		return fmt.Errorf("Responses tool_choice has an unsupported shape")
+	}
+	choiceType := stringValue(choiceObject["type"])
+	switch choiceType {
+	case "web_search", "web_search_preview", "image_generation":
+		return fmt.Errorf("Responses native tool_choice %q cannot be represented by %s", choiceType, responsesTargetName(target))
+	case "function", "custom":
+		name := firstString(choiceObject, "name")
+		if choiceType == "function" {
+			name = firstString(objectValue(choiceObject["function"]), "name")
+			if name == "" {
+				name = firstString(choiceObject, "name")
+			}
+		}
+		if _, exists := webSearchNames[name]; exists && name != "" {
+			return fmt.Errorf("Responses tool_choice for native web search cannot be represented by %s", responsesTargetName(target))
+		}
+	case "allowed_tools":
+		return fmt.Errorf("Responses allowed_tools tool_choice cannot be represented by %s", responsesTargetName(target))
+	default:
+		if len(webSearchNames) > 0 {
+			return fmt.Errorf("Responses tool_choice %q cannot be represented by %s", choiceType, responsesTargetName(target))
 		}
 	}
 	return nil

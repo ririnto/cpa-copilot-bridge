@@ -78,6 +78,10 @@ func (s *Service) Execute(ctx context.Context, req ExecuteRequest) (pluginapi.Ex
 	if (v1Compact || v2Compact) && endpoint != translate.EndpointResponses {
 		return pluginapi.ExecutorResponse{}, statusError("unsupported_compaction_endpoint", "Responses compaction requires the Copilot Responses endpoint", http.StatusUnprocessableEntity)
 	}
+	translationPayload, exclusions, errNativeTools := filterUnrepresentableNativeTools(sourceFormat, endpoint, translationPayload)
+	if errNativeTools != nil {
+		return pluginapi.ExecutorResponse{}, errNativeTools
+	}
 	requestBody, errTranslate := translate.RequestForEndpointFrom(sourceFormat, req.Model, translationPayload, false, endpoint)
 	if errTranslate != nil {
 		return pluginapi.ExecutorResponse{}, statusError("translation_error", errTranslate.Error(), http.StatusUnprocessableEntity)
@@ -136,7 +140,11 @@ func (s *Service) Execute(ctx context.Context, req ExecuteRequest) (pluginapi.Ex
 		if errComplete != nil {
 			return pluginapi.ExecutorResponse{}, statusError("compaction_error", redact.ErrorBody([]byte(errComplete.Error()), token.Token, storage.GitHubAccessToken), http.StatusBadGateway)
 		}
-		return pluginapi.ExecutorResponse{Payload: body, Headers: filterResponseHeaders(resp.Headers)}, nil
+		var metadata map[string]any
+		if len(exclusions) > 0 {
+			metadata = map[string]any{"copilot_excluded_native_tools": exclusions}
+		}
+		return pluginapi.ExecutorResponse{Payload: body, Headers: nativeToolResponseHeaders(filterResponseHeaders(resp.Headers), exclusions), Metadata: metadata}, nil
 	}
 	body, errResponse := translate.ResponseFromEndpoint(ctx, endpoint, sourceFormat, req.Model, req.OriginalRequest, requestBody, resp.Body)
 	if errResponse != nil {
@@ -151,14 +159,11 @@ func (s *Service) Execute(ctx context.Context, req ExecuteRequest) (pluginapi.Ex
 	if endpoint == translate.EndpointResponses {
 		s.recordReasoningReplay(scopeKey, resp.Body)
 	}
-	return pluginapi.ExecutorResponse{
-		Payload: body,
-		Headers: filterResponseHeaders(resp.Headers),
-		Metadata: map[string]any{
-			"copilot_endpoint": endpoint,
-			"token_expires_at": token.ExpiresAt.UTC().Format(http.TimeFormat),
-		},
-	}, nil
+	metadata := map[string]any{"copilot_endpoint": endpoint, "token_expires_at": token.ExpiresAt.UTC().Format(http.TimeFormat)}
+	if len(exclusions) > 0 {
+		metadata["copilot_excluded_native_tools"] = exclusions
+	}
+	return pluginapi.ExecutorResponse{Payload: body, Headers: nativeToolResponseHeaders(filterResponseHeaders(resp.Headers), exclusions), Metadata: metadata}, nil
 }
 
 func (s *Service) ExecuteStream(ctx context.Context, req ExecuteRequest) (http.Header, error) {
@@ -222,6 +227,10 @@ func (s *Service) ExecuteStream(ctx context.Context, req ExecuteRequest) (http.H
 	if errValidate := validateReasoningRequestForEndpoint(sourceFormat, translationPayload, endpoint); errValidate != nil {
 		return nil, statusError("translation_error", errValidate.Error(), http.StatusUnprocessableEntity)
 	}
+	translationPayload, exclusions, errNativeTools := filterUnrepresentableNativeTools(sourceFormat, endpoint, translationPayload)
+	if errNativeTools != nil {
+		return nil, errNativeTools
+	}
 	requestBody, errTranslate := translate.RequestForEndpointFrom(sourceFormat, req.Model, translationPayload, true, endpoint)
 	if errTranslate != nil {
 		return nil, statusError("translation_error", errTranslate.Error(), http.StatusUnprocessableEntity)
@@ -276,7 +285,7 @@ func (s *Service) ExecuteStream(ctx context.Context, req ExecuteRequest) (http.H
 		return nil, upstreamStatusError(upstream.StatusCode, redact.ErrorBody(body, token.Token, storage.GitHubAccessToken))
 	}
 	go s.pumpStream(ctx, req.StreamID, endpoint, sourceFormat, req.Model, req.OriginalRequest, requestBody, upstream, scopeKey, carrierScope, token.Token, storage.GitHubAccessToken)
-	headers := filterResponseHeaders(upstream.Headers)
+	headers := nativeToolResponseHeaders(filterResponseHeaders(upstream.Headers), exclusions)
 	headers.Set("Content-Type", "text/event-stream")
 	headers.Set("Cache-Control", "no-cache")
 	return headers, nil

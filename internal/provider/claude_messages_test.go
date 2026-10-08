@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -112,12 +113,101 @@ func TestNormalizeClaudeMessagesPerMessageOutputConfig(t *testing.T) {
 	}
 }
 
-func TestNormalizeClaudeMessagesFailsClosedOnMeaningfulSystemEffortMarker(t *testing.T) {
+func TestNormalizeClaudeMessagesPreservesMeaningfulSystemContentWithEffort(t *testing.T) {
 	t.Parallel()
-	model := adaptiveClaudeModel()
-	translated := []byte(`{"messages":[{"role":"system","content":[{"type":"text","text":"keep this policy"}],"output_config":{"effort":"medium"}}]}`)
-	if _, err := normalizeClaudeMessagesRequest(model, "claude", []byte(`{}`), translated); err == nil {
-		t.Fatal("normalizer silently removed meaningful system content")
+	for _, test := range []struct {
+		name    string
+		content string
+	}{
+		{name: "string", content: `"keep this policy"`},
+		{name: "blocks", content: `[{"type":"text","text":"keep this policy","cache_control":{"type":"ephemeral"}}]`},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			model := adaptiveClaudeModel()
+			translated := []byte(`{"messages":[{"role":"system","content":` + test.content + `,"cache_control":{"type":"ephemeral","ttl":"1h"},"output_config":{"effort":"medium"}}]}`)
+			got, err := normalizeClaudeMessagesRequest(model, "claude", []byte(`{}`), translated)
+			if err != nil {
+				t.Fatalf("normalize effort-bearing system content: %v", err)
+			}
+			if gjson.GetBytes(got, "messages.0.role").String() != "system" || gjson.GetBytes(got, "messages.0.output_config").Exists() {
+				t.Fatalf("system role or lifted output_config changed: %s", got)
+			}
+			if gjson.GetBytes(got, "messages.0.content").Raw != test.content {
+				t.Fatalf("system content changed from %s to %s", test.content, gjson.GetBytes(got, "messages.0.content"))
+			}
+			if gjson.GetBytes(got, "messages.0.cache_control.ttl").String() != "1h" {
+				t.Fatalf("message cache_control changed: %s", got)
+			}
+			if gjson.GetBytes(got, "messages.0.content.0.cache_control.type").String() != "ephemeral" && test.name == "blocks" {
+				t.Fatalf("block cache_control changed: %s", got)
+			}
+			if gjson.GetBytes(got, "output_config.effort").String() != "medium" {
+				t.Fatalf("lifted effort = %s", gjson.GetBytes(got, "output_config.effort"))
+			}
+		})
+	}
+}
+
+func TestNormalizeClaudeMessagesAcceptsEmptySystemEffortMarkerForms(t *testing.T) {
+	for _, content := range []string{`""`, `null`} {
+		t.Run(content, func(t *testing.T) {
+			model := adaptiveClaudeModel()
+			translated := []byte(`{"messages":[{"role":"system","content":` + content + `,"output_config":{"effort":"medium"}},{"role":"user","content":"keep"}]}`)
+			got, err := normalizeClaudeMessagesRequest(model, "claude", []byte(`{}`), translated)
+			if err != nil {
+				t.Fatalf("normalize empty system effort marker: %v", err)
+			}
+			if len(gjson.GetBytes(got, "messages").Array()) != 1 || gjson.GetBytes(got, "messages.0.role").String() != "user" {
+				t.Fatalf("empty effort marker reached Claude Messages: %s", got)
+			}
+			if gjson.GetBytes(got, "output_config.effort").String() != "medium" {
+				t.Fatalf("lifted effort = %s", gjson.GetBytes(got, "output_config.effort"))
+			}
+		})
+	}
+}
+
+func TestNormalizeClaudeMessagesWithSystemEffortRejectsUnsupportedSemantics(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "non_text_block",
+			body: `{"messages":[{"role":"system","content":[{"type":"image"}],"output_config":{"effort":"medium"}}]}`,
+			want: "non-text block",
+		},
+		{
+			name: "clear_at",
+			body: `{"messages":[{"role":"system","content":"policy","clear_at":"next_user_message","output_config":{"effort":"medium"}}]}`,
+			want: "clear_at",
+		},
+		{
+			name: "unknown_message_field",
+			body: `{"messages":[{"role":"system","content":"policy","unknown":"value","output_config":{"effort":"medium"}}]}`,
+			want: "system field",
+		},
+		{
+			name: "unknown_output_config_option",
+			body: `{"messages":[{"role":"system","content":"policy","output_config":{"effort":"medium","temperature":0.2}}]}`,
+			want: "unsupported output_config option",
+		},
+		{
+			name: "empty_output_config",
+			body: `{"messages":[{"role":"system","content":"policy","output_config":{}}]}`,
+			want: "without effort",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			model := adaptiveClaudeModel()
+			_, err := normalizeClaudeMessagesRequest(model, "claude", []byte(`{}`), []byte(test.body))
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("unsupported system content error = %v, want %q", err, test.want)
+			}
+		})
 	}
 }
 

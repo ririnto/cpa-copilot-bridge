@@ -46,7 +46,14 @@ func claudeRequestToResponses(model string, body []byte, stream bool) ([]byte, e
 		converted := make([]any, 0, len(tools))
 		for _, rawTool := range tools {
 			tool, okTool := rawTool.(map[string]any)
-			if !okTool || stringValue(tool["name"]) == "" {
+			if !okTool {
+				continue
+			}
+			switch toolType := stringValue(tool["type"]); toolType {
+			case "web_search_20250305", "web_search_20260209", "web_search_preview", "web_search", "image_generation":
+				return nil, fmt.Errorf("Claude native tool type %q cannot be represented by the Copilot Responses endpoint", toolType)
+			}
+			if stringValue(tool["name"]) == "" {
 				continue
 			}
 			parameters, errParameters := claudeToolParameters(tool)
@@ -118,9 +125,10 @@ func claudeRequestToResponses(model string, body []byte, stream bool) ([]byte, e
 		role := stringValue(message["role"])
 		if role == "system" {
 			if _, hasOutputConfig := message["output_config"]; hasOutputConfig {
-				if _, okMarker, errMarker := claudeOutputConfigMarker(message); errMarker != nil {
+				_, isMarker, errMarker := claudeOutputConfigMarker(message)
+				if errMarker != nil {
 					return nil, errMarker
-				} else if okMarker {
+				} else if isMarker {
 					continue
 				}
 			}
@@ -487,13 +495,11 @@ func claudeMessageEffortMarker(messages []any) (string, bool, error) {
 		message, ok := rawMessage.(map[string]any)
 		if ok && stringValue(message["role"]) == "system" {
 			if _, exists := message["output_config"]; exists {
-				markerEffort, okMarker, err := claudeOutputConfigMarker(message)
+				markerEffort, _, err := claudeOutputConfigMarker(message)
 				if err != nil {
 					return "", false, err
 				}
-				if okMarker {
-					effort, found = markerEffort, true
-				}
+				effort, found = markerEffort, true
 			}
 		}
 	}
@@ -504,34 +510,46 @@ func claudeOutputConfigMarker(message map[string]any) (string, bool, error) {
 	if stringValue(message["role"]) != "system" {
 		return "", false, nil
 	}
-	content, okContent := message["content"].([]any)
+	content, hasContent := message["content"]
 	config, okConfig := message["output_config"].(map[string]any)
-	if !okContent || len(content) != 0 || !okConfig || len(config) != 1 {
+	if !hasContent || !okConfig || len(config) != 1 {
 		return "", false, fmt.Errorf("unsupported Claude system message")
-	}
-	if len(message) != 3 {
-		return "", false, fmt.Errorf("unsupported Claude system message fields")
 	}
 	value, exists := config["effort"]
 	if !exists {
 		return "", false, fmt.Errorf("unsupported Claude system output configuration")
 	}
-	switch strings.ToLower(rawStringValue(value)) {
+	effort := strings.ToLower(rawStringValue(value))
+	switch effort {
 	case "none":
-		return "", true, nil
-	case "low", "medium", "high", "xhigh":
-		return strings.ToLower(rawStringValue(value)), true, nil
-	case "max":
-		return "max", true, nil
+		effort = ""
+	case "low", "medium", "high", "xhigh", "max":
 	default:
 		return "", false, fmt.Errorf("unsupported Claude system reasoning effort")
 	}
+	if !claudeSystemContentIsEmpty(content) {
+		return effort, false, nil
+	}
+	for field := range message {
+		switch field {
+		case "role", "content", "output_config":
+		case "clear_at":
+			return "", false, fmt.Errorf("unsupported Claude mid-conversation system clear_at")
+		default:
+			return "", false, fmt.Errorf("unsupported Claude system message fields")
+		}
+	}
+	return effort, true, nil
 }
 
 func claudeSystemMessageToResponses(message map[string]any) (map[string]any, error) {
 	for field := range message {
 		switch field {
 		case "role", "content", "cache_control":
+		case "output_config":
+			if _, _, err := claudeOutputConfigMarker(message); err != nil {
+				return nil, err
+			}
 		case "clear_at":
 			return nil, fmt.Errorf("unsupported Claude mid-conversation system clear_at")
 		default:
@@ -573,6 +591,19 @@ func claudeSystemMessageToResponses(message map[string]any) (map[string]any, err
 		}
 	}
 	return map[string]any{"type": "message", "role": "system", "content": content}, nil
+}
+
+func claudeSystemContentIsEmpty(value any) bool {
+	switch content := value.(type) {
+	case nil:
+		return true
+	case string:
+		return content == ""
+	case []any:
+		return len(content) == 0
+	default:
+		return false
+	}
 }
 
 func claudeContentParts(value any) []map[string]any {

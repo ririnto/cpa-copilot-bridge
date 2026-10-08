@@ -107,9 +107,20 @@ func responsesRequestToClaude(model string, body []byte, stream bool) ([]byte, e
 			temporary = updated
 		}
 	}
+	temporary, err := normalizeResponsesWebSearchPreviewForClaude(temporary)
+	if err != nil {
+		return nil, err
+	}
 	out := registry.TranslateRequest(sdktranslator.FormatOpenAIResponse, sdktranslator.FormatClaude, model, temporary, stream)
 	if len(out) == 0 || !json.Valid(out) {
 		return nil, fmt.Errorf("official Responses-to-Claude request translation failed")
+	}
+	toolChoice := gjson.GetBytes(body, "tool_choice")
+	if toolChoice.Type == gjson.String && toolChoice.String() == "required" {
+		translatedTools := gjson.GetBytes(out, "tools")
+		if !translatedTools.IsArray() || len(translatedTools.Array()) == 0 || gjson.GetBytes(out, "tool_choice.type").String() != "any" {
+			return nil, fmt.Errorf("Responses tool_choice required cannot be preserved by Claude Messages without translated tools")
+		}
 	}
 	if len(reasoningRestore) == 0 && len(toolRestore) == 0 {
 		return out, nil
@@ -188,6 +199,38 @@ func responsesRequestToClaude(model string, body []byte, stream bool) ([]byte, e
 		}
 	}
 	return out, nil
+}
+
+func normalizeResponsesWebSearchPreviewForClaude(body []byte) ([]byte, error) {
+	root := gjson.ParseBytes(body)
+	updated, err := normalizeResponsesWebSearchPreviewToolArray(body, root.Get("tools"), "tools")
+	if err != nil {
+		return nil, err
+	}
+	for index, item := range root.Get("input").Array() {
+		if item.Get("type").String() != "additional_tools" {
+			continue
+		}
+		updated, err = normalizeResponsesWebSearchPreviewToolArray(updated, item.Get("tools"), fmt.Sprintf("input.%d.tools", index))
+		if err != nil {
+			return nil, err
+		}
+	}
+	return updated, nil
+}
+
+func normalizeResponsesWebSearchPreviewToolArray(body []byte, tools gjson.Result, path string) ([]byte, error) {
+	for index, tool := range tools.Array() {
+		if tool.Get("type").String() != "web_search_preview" {
+			continue
+		}
+		updated, err := sjson.SetBytes(body, fmt.Sprintf("%s.%d.type", path, index), "web_search")
+		if err != nil {
+			return nil, fmt.Errorf("normalize Responses web_search_preview tool for Claude Messages")
+		}
+		body = updated
+	}
+	return body, nil
 }
 
 func temporaryResponsesMarker(body []byte, kind string, index int) string {
