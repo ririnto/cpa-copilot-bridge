@@ -71,6 +71,7 @@ type modelLimits struct {
 type modelCacheEntry struct {
 	Fingerprint      string
 	APIBaseURL       string
+	Mode             string
 	ConfigGeneration uint64
 	ExpiresAt        time.Time
 	Models           []upstreamModel
@@ -108,7 +109,7 @@ func (s *Service) models(ctx context.Context, callbackID, authID string, storage
 		s.modelMu.Lock()
 		cached, ok := s.modelEntries[key]
 		s.modelMu.Unlock()
-		if ok && cached.Fingerprint == fingerprint && cached.APIBaseURL == token.APIBaseURL && cached.ConfigGeneration == token.ConfigGeneration && cached.ExpiresAt.After(now) {
+		if ok && cached.Fingerprint == fingerprint && cached.APIBaseURL == token.APIBaseURL && effectiveAuthMode(cached.Mode) == effectiveAuthMode(token.Mode) && cached.ConfigGeneration == token.ConfigGeneration && cached.ExpiresAt.After(now) {
 			return cloneUpstreamModels(cached.Models), token, nil
 		}
 	}
@@ -116,12 +117,14 @@ func (s *Service) models(ctx context.Context, callbackID, authID string, storage
 	resp, errDo := s.host.Do(ctx, callbackID, transport.Request{
 		Method:  http.MethodGet,
 		URL:     token.APIBaseURL + "/models",
-		Headers: copilotHeaders(token.Token, false),
+		Headers: copilotRequestHeaders(token, false),
 	})
 	if errDo != nil {
 		return nil, copilotTokenEntry{}, fmt.Errorf("discover Copilot models: %w", errDo)
 	}
-	if resp.StatusCode == http.StatusUnauthorized {
+	if effectiveAuthMode(token.Mode) == authModeDirectOAuth && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+		s.invalidateAuthForCredential(authID, fingerprint)
+	} else if effectiveAuthMode(token.Mode) != authModeDirectOAuth && resp.StatusCode == http.StatusUnauthorized {
 		s.invalidateAuth(authID)
 		token, errToken = s.copilotToken(ctx, callbackID, authID, storage)
 		if errToken != nil {
@@ -130,7 +133,7 @@ func (s *Service) models(ctx context.Context, callbackID, authID string, storage
 		resp, errDo = s.host.Do(ctx, callbackID, transport.Request{
 			Method:  http.MethodGet,
 			URL:     token.APIBaseURL + "/models",
-			Headers: copilotHeaders(token.Token, false),
+			Headers: copilotRequestHeaders(token, false),
 		})
 		if errDo != nil {
 			return nil, copilotTokenEntry{}, fmt.Errorf("discover Copilot models after token refresh: %w", errDo)
@@ -158,6 +161,7 @@ func (s *Service) models(ctx context.Context, callbackID, authID string, storage
 	s.modelEntries[key] = modelCacheEntry{
 		Fingerprint:      fingerprint,
 		APIBaseURL:       token.APIBaseURL,
+		Mode:             effectiveAuthMode(token.Mode),
 		ConfigGeneration: token.ConfigGeneration,
 		ExpiresAt:        now.Add(cfg.modelCacheTTL()),
 		Models:           cloneUpstreamModels(inventory),

@@ -78,14 +78,38 @@ The device flow uses:
 
 The GitHub access/refresh material is returned through CLIProxyAPI's
 `AuthProvider` storage contract and is persisted only in the isolated auth
-volume. The short-lived token obtained from
-`https://api.github.com/copilot_internal/v2/token` is cached only in process
-memory, refreshed before expiry, and never deliberately logged.
+volume.
+The default `token_exchange` mode obtains a short-lived token from
+`https://api.github.com/copilot_internal/v2/token`.
+The plugin caches that token only in process memory, refreshes it before expiry,
+and never deliberately logs it.
 
-Copilot rejects unrecognized `Copilot-Integration-Id` values. Model discovery
-and inference therefore use the recognized VS Code Copilot integration headers
-(`vscode-chat` / `copilot-chat`) while authentication and credential storage
-remain implemented by this plugin.
+Set `auth_mode: direct_oauth` in the plugin configuration to use the stored
+GitHub OAuth access token directly.
+For example, add this field under the Copilot plugin configuration:
+
+```yaml
+auth_mode: direct_oauth
+```
+
+Direct OAuth sends a bearer token to
+`{github_api_url}/copilot_internal/user` and requires its `endpoints.api` value.
+The plugin uses that discovered API origin for catalog and inference requests.
+It does not call the v2 token endpoint or substitute `copilot_api_url` when the
+account response lacks an API endpoint.
+Direct OAuth uses the plugin's own user agent without editor or Copilot Chat
+integration headers.
+The `model_cache_ttl_seconds` setting bounds the in-memory discovery and model
+catalog caches.
+Response metadata includes `token_expires_at` only when auth storage contains a
+known `expires_at` value.
+The discovery cache lifetime does not represent credential expiry.
+Direct OAuth returns upstream HTTP 401 and 403 responses after invalidating the
+cached authentication and model context, without retrying the request.
+
+The default `token_exchange` mode uses the recognized VS Code Copilot
+integration headers because Copilot rejects unrecognized
+`Copilot-Integration-Id` values.
 
 ## Build and test
 

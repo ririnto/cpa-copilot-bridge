@@ -10,6 +10,9 @@ import (
 )
 
 const (
+	authModeTokenExchange = "token_exchange"
+	authModeDirectOAuth   = "direct_oauth"
+
 	DefaultGitHubClientID = "Iv1.b507a08c87ecfe98"
 	defaultGitHubBaseURL  = "https://github.com"
 	defaultGitHubAPIURL   = "https://api.github.com"
@@ -18,6 +21,7 @@ const (
 
 type Config struct {
 	Enabled                  bool              `yaml:"enabled"`
+	AuthMode                 string            `yaml:"auth_mode"`
 	GitHubClientID           string            `yaml:"github_client_id"`
 	GitHubScope              string            `yaml:"github_scope"`
 	GitHubBaseURL            string            `yaml:"github_base_url"`
@@ -36,6 +40,7 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		Enabled:                  true,
+		AuthMode:                 authModeTokenExchange,
 		GitHubClientID:           DefaultGitHubClientID,
 		GitHubScope:              "read:user",
 		GitHubBaseURL:            defaultGitHubBaseURL,
@@ -58,6 +63,10 @@ func ParseConfig(raw []byte) (Config, error) {
 		}
 	}
 	cfg.GitHubClientID = strings.TrimSpace(cfg.GitHubClientID)
+	cfg.AuthMode = strings.ToLower(strings.TrimSpace(cfg.AuthMode))
+	if cfg.AuthMode == "" {
+		cfg.AuthMode = authModeTokenExchange
+	}
 	cfg.GitHubScope = strings.TrimSpace(cfg.GitHubScope)
 	cfg.GitHubBaseURL = strings.TrimRight(strings.TrimSpace(cfg.GitHubBaseURL), "/")
 	cfg.GitHubAPIURL = strings.TrimRight(strings.TrimSpace(cfg.GitHubAPIURL), "/")
@@ -70,6 +79,9 @@ func ParseConfig(raw []byte) (Config, error) {
 	}
 	if cfg.GitHubClientID == "" {
 		return Config{}, fmt.Errorf("github_client_id is required")
+	}
+	if cfg.AuthMode != authModeTokenExchange && cfg.AuthMode != authModeDirectOAuth {
+		return Config{}, fmt.Errorf("auth_mode must be %q or %q", authModeTokenExchange, authModeDirectOAuth)
 	}
 	for name, value := range map[string]string{
 		"github_base_url": cfg.GitHubBaseURL,

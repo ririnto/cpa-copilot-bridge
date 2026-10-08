@@ -159,7 +159,10 @@ func (s *Service) Execute(ctx context.Context, req ExecuteRequest) (pluginapi.Ex
 	if endpoint == translate.EndpointResponses {
 		s.recordReasoningReplay(scopeKey, resp.Body)
 	}
-	metadata := map[string]any{"copilot_endpoint": endpoint, "token_expires_at": token.ExpiresAt.UTC().Format(http.TimeFormat)}
+	metadata := map[string]any{"copilot_endpoint": endpoint}
+	if !token.ExpiresAt.IsZero() {
+		metadata["token_expires_at"] = token.ExpiresAt.UTC().Format(http.TimeFormat)
+	}
 	if len(exclusions) > 0 {
 		metadata["copilot_excluded_native_tools"] = exclusions
 	}
@@ -310,14 +313,16 @@ func (s *Service) doModelRequest(ctx context.Context, callbackID, authID string,
 	request := transport.Request{
 		Method:  http.MethodPost,
 		URL:     token.APIBaseURL + endpoint,
-		Headers: copilotHeaders(token.Token, stream),
+		Headers: copilotRequestHeaders(token, stream),
 		Body:    body,
 	}
 	resp, errDo := s.host.Do(ctx, callbackID, request)
 	if errDo != nil {
 		return transport.Response{}, token, fmt.Errorf("call Copilot model endpoint: %w", errDo)
 	}
-	if resp.StatusCode == http.StatusUnauthorized {
+	if effectiveAuthMode(token.Mode) == authModeDirectOAuth && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+		s.invalidateAuthForCredential(authID, token.Fingerprint)
+	} else if effectiveAuthMode(token.Mode) != authModeDirectOAuth && resp.StatusCode == http.StatusUnauthorized {
 		s.invalidateAuth(authID)
 		refreshed, errToken := s.copilotToken(ctx, callbackID, authID, storage)
 		if errToken != nil {
@@ -328,7 +333,7 @@ func (s *Service) doModelRequest(ctx context.Context, callbackID, authID string,
 		}
 		token = refreshed
 		request.URL = token.APIBaseURL + endpoint
-		request.Headers = copilotHeaders(token.Token, stream)
+		request.Headers = copilotRequestHeaders(token, stream)
 		resp, errDo = s.host.Do(ctx, callbackID, request)
 		if errDo != nil {
 			return transport.Response{}, token, fmt.Errorf("call Copilot model endpoint after token refresh: %w", errDo)
@@ -344,14 +349,16 @@ func (s *Service) openModelStream(ctx context.Context, callbackID, authID string
 	request := transport.Request{
 		Method:  http.MethodPost,
 		URL:     token.APIBaseURL + endpoint,
-		Headers: copilotHeaders(token.Token, true),
+		Headers: copilotRequestHeaders(token, true),
 		Body:    body,
 	}
 	stream, errOpen := s.host.OpenStream(ctx, callbackID, request)
 	if errOpen != nil {
 		return transport.Stream{}, token, fmt.Errorf("open Copilot model stream: %w", errOpen)
 	}
-	if stream.StatusCode == http.StatusUnauthorized {
+	if effectiveAuthMode(token.Mode) == authModeDirectOAuth && (stream.StatusCode == http.StatusUnauthorized || stream.StatusCode == http.StatusForbidden) {
+		s.invalidateAuthForCredential(authID, token.Fingerprint)
+	} else if effectiveAuthMode(token.Mode) != authModeDirectOAuth && stream.StatusCode == http.StatusUnauthorized {
 		_ = s.host.CloseStream(ctx, stream.ID)
 		s.invalidateAuth(authID)
 		refreshed, errToken := s.copilotToken(ctx, callbackID, authID, storage)
@@ -363,7 +370,7 @@ func (s *Service) openModelStream(ctx context.Context, callbackID, authID string
 		}
 		token = refreshed
 		request.URL = token.APIBaseURL + endpoint
-		request.Headers = copilotHeaders(token.Token, true)
+		request.Headers = copilotRequestHeaders(token, true)
 		stream, errOpen = s.host.OpenStream(ctx, callbackID, request)
 		if errOpen != nil {
 			return transport.Stream{}, token, fmt.Errorf("open Copilot model stream after token refresh: %w", errOpen)
@@ -538,10 +545,7 @@ func (s *Service) HTTP(ctx context.Context, req HTTPRequest) (pluginapi.Executor
 	if !strings.EqualFold(target.Scheme, base.Scheme) || !strings.EqualFold(target.Host, base.Host) {
 		return pluginapi.ExecutorHTTPResponse{}, statusError("forbidden_url", "executor HTTP URL is outside the authenticated Copilot API origin", http.StatusForbidden)
 	}
-	headers := cloneHeader(req.Headers)
-	headers.Set("Authorization", "Bearer "+token.Token)
-	headers.Set("User-Agent", copilotUserAgent)
-	headers.Set("X-GitHub-Api-Version", copilotAPIVersion)
+	headers := executorHTTPHeaders(token, req.Headers)
 	resp, errDo := s.host.Do(ctx, req.HostCallbackID, transport.Request{
 		Method:  req.Method,
 		URL:     target.String(),
@@ -550,6 +554,9 @@ func (s *Service) HTTP(ctx context.Context, req HTTPRequest) (pluginapi.Executor
 	})
 	if errDo != nil {
 		return pluginapi.ExecutorHTTPResponse{}, errDo
+	}
+	if effectiveAuthMode(token.Mode) == authModeDirectOAuth && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+		s.invalidateAuthForCredential(req.AuthID, token.Fingerprint)
 	}
 	return pluginapi.ExecutorHTTPResponse{
 		StatusCode: resp.StatusCode,
@@ -578,6 +585,48 @@ func copilotHeaders(token string, stream bool) http.Header {
 	headers.Set("X-Initiator", "user")
 	headers.Set("X-Interaction-Type", "conversation-edits")
 	headers.Set("X-Request-Id", requestID)
+	return headers
+}
+
+func copilotRequestHeaders(token copilotTokenEntry, stream bool) http.Header {
+	if effectiveAuthMode(token.Mode) != authModeDirectOAuth {
+		return copilotHeaders(token.Token, stream)
+	}
+	accept := "application/json"
+	if stream {
+		accept = "text/event-stream"
+	}
+	headers := http.Header{}
+	headers.Set("Accept", accept)
+	headers.Set("Authorization", "Bearer "+token.Token)
+	headers.Set("Content-Type", "application/json")
+	headers.Set("User-Agent", userAgent())
+	headers.Set("X-GitHub-Api-Version", copilotAPIVersion)
+	return headers
+}
+
+func executorHTTPHeaders(token copilotTokenEntry, requestHeaders http.Header) http.Header {
+	headers := cloneHeader(requestHeaders)
+	headers.Set("Authorization", "Bearer "+token.Token)
+	if effectiveAuthMode(token.Mode) != authModeDirectOAuth {
+		headers.Set("User-Agent", copilotUserAgent)
+		headers.Set("X-GitHub-Api-Version", copilotAPIVersion)
+		return headers
+	}
+	for _, name := range []string{
+		"Copilot-Integration-Id",
+		"Editor-Plugin-Version",
+		"Editor-Version",
+		"OpenAI-Intent",
+		"X-Agent-Task-Id",
+		"X-Initiator",
+		"X-Interaction-Type",
+		"X-Request-Id",
+	} {
+		headers.Del(name)
+	}
+	headers.Set("User-Agent", userAgent())
+	headers.Set("X-GitHub-Api-Version", copilotAPIVersion)
 	return headers
 }
 
