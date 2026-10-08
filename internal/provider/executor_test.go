@@ -424,6 +424,114 @@ func TestClaudeSafeguardsFailBeforeUpstreamOnTranslatedRoutes(t *testing.T) {
 	}
 }
 
+func TestClaudeSafeguardsErrorStatusIsExactAndPreUpstream(t *testing.T) {
+	t.Parallel()
+	const opaqueContext = "OPAQUE-CLASSIFIER-CONTEXT-SECRET"
+	tests := []struct {
+		name       string
+		payload    string
+		wantStatus int
+		wantCode   string
+	}{
+		{
+			name:       "exact dangerous tool safeguard",
+			payload:    `{"safeguards":[{"type":"dangerous_tool_use","classifier_context":"` + opaqueContext + `"}],"messages":[]}`,
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "unsupported_safeguards",
+		},
+		{
+			name:       "extra field",
+			payload:    `{"safeguards":[{"type":"dangerous_tool_use","classifier_context":"` + opaqueContext + `","action":"block"}],"messages":[]}`,
+			wantStatus: http.StatusUnprocessableEntity,
+			wantCode:   "translation_error",
+		},
+		{
+			name:       "wrong type",
+			payload:    `{"safeguards":[{"type":"other","classifier_context":"` + opaqueContext + `"}],"messages":[]}`,
+			wantStatus: http.StatusUnprocessableEntity,
+			wantCode:   "translation_error",
+		},
+		{
+			name:       "multiple safeguards",
+			payload:    `{"safeguards":[{"type":"dangerous_tool_use","classifier_context":"` + opaqueContext + `"},{"type":"dangerous_tool_use","classifier_context":"other"}],"messages":[]}`,
+			wantStatus: http.StatusUnprocessableEntity,
+			wantCode:   "translation_error",
+		},
+		{
+			name:       "null classifier context",
+			payload:    `{"safeguards":[{"type":"dangerous_tool_use","classifier_context":null}],"messages":[]}`,
+			wantStatus: http.StatusUnprocessableEntity,
+			wantCode:   "translation_error",
+		},
+		{
+			name:       "missing classifier context",
+			payload:    `{"safeguards":[{"type":"dangerous_tool_use"}],"messages":[]}`,
+			wantStatus: http.StatusUnprocessableEntity,
+			wantCode:   "translation_error",
+		},
+		{
+			name:       "empty classifier context",
+			payload:    `{"safeguards":[{"type":"dangerous_tool_use","classifier_context":""}],"messages":[]}`,
+			wantStatus: http.StatusUnprocessableEntity,
+			wantCode:   "translation_error",
+		},
+		{
+			name:       "empty array classifier context",
+			payload:    `{"safeguards":[{"type":"dangerous_tool_use","classifier_context":[]}],"messages":[]}`,
+			wantStatus: http.StatusUnprocessableEntity,
+			wantCode:   "translation_error",
+		},
+		{
+			name:       "empty object classifier context",
+			payload:    `{"safeguards":[{"type":"dangerous_tool_use","classifier_context":{}}],"messages":[]}`,
+			wantStatus: http.StatusUnprocessableEntity,
+			wantCode:   "translation_error",
+		},
+		{
+			name:       "malformed payload",
+			payload:    `{"safeguards":[{"type":"dangerous_tool_use","classifier_context":"` + opaqueContext + `"}],"messages":[]`,
+			wantStatus: http.StatusUnprocessableEntity,
+			wantCode:   "translation_error",
+		},
+	}
+	for _, streaming := range []bool{false, true} {
+		streaming := streaming
+		for _, test := range tests {
+			test := test
+			t.Run(fmt.Sprintf("stream_%t/%s", streaming, test.name), func(t *testing.T) {
+				t.Parallel()
+				payload := []byte(test.payload)
+				request := ExecuteRequest{ExecutorRequest: pluginapi.ExecutorRequest{
+					SourceFormat:    "claude",
+					Model:           "claude-sonnet-5.5",
+					OriginalRequest: append([]byte(nil), payload...),
+					Payload:         append([]byte(nil), payload...),
+				}}
+				if streaming {
+					request.StreamID = "stream-id"
+				}
+				service := New(&errorStreamHost{})
+				var err error
+				if streaming {
+					_, err = service.ExecuteStream(context.Background(), request)
+				} else {
+					_, err = service.Execute(context.Background(), request)
+				}
+				var statusErr *StatusError
+				if !errors.As(err, &statusErr) || statusErr.Code != test.wantCode || statusErr.HTTPStatus != test.wantStatus {
+					t.Fatalf("request error = %#v, want %s status %d", err, test.wantCode, test.wantStatus)
+				}
+				if test.wantCode == "unsupported_safeguards" && statusErr.Message != "Claude safeguards are unsupported by the selected Copilot endpoint" {
+					t.Fatalf("safeguard error message = %q, want static unsupported message", statusErr.Message)
+				}
+				if strings.Contains(err.Error(), opaqueContext) || !bytes.Equal(request.OriginalRequest, payload) {
+					t.Fatalf("request error leaked classifier context or original history changed: %v", err)
+				}
+			})
+		}
+	}
+}
+
 func TestExecuteStreamCompactionStopsWithoutCompletedEvent(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

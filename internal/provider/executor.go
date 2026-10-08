@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -41,7 +42,7 @@ func (s *Service) Execute(ctx context.Context, req ExecuteRequest) (pluginapi.Ex
 	}
 	translationPayload, errClaudeInput := normalizeClaudeSourceRequest(sourceFormat, req.Payload)
 	if errClaudeInput != nil {
-		return pluginapi.ExecutorResponse{}, statusError("translation_error", errClaudeInput.Error(), http.StatusUnprocessableEntity)
+		return pluginapi.ExecutorResponse{}, claudeSourceNormalizationStatusError(errClaudeInput)
 	}
 	storage, errParse := parseStorage(req.StorageJSON)
 	if errParse != nil {
@@ -182,7 +183,7 @@ func (s *Service) ExecuteStream(ctx context.Context, req ExecuteRequest) (http.H
 	}
 	translationPayload, errClaudeInput := normalizeClaudeSourceRequest(sourceFormat, req.Payload)
 	if errClaudeInput != nil {
-		return nil, statusError("translation_error", errClaudeInput.Error(), http.StatusUnprocessableEntity)
+		return nil, claudeSourceNormalizationStatusError(errClaudeInput)
 	}
 	storage, errParse := parseStorage(req.StorageJSON)
 	if errParse != nil {
@@ -646,4 +647,11 @@ func cloneHeader(headers http.Header) http.Header {
 		return http.Header{}
 	}
 	return headers.Clone()
+}
+
+func claudeSourceNormalizationStatusError(err error) error {
+	if errors.Is(err, errClaudeSafeguardsUnsupported) {
+		return statusError("unsupported_safeguards", errClaudeSafeguardsUnsupported.Error(), http.StatusBadRequest)
+	}
+	return statusError("translation_error", err.Error(), http.StatusUnprocessableEntity)
 }

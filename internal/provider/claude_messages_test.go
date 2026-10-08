@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -355,6 +356,81 @@ func TestNormalizeClaudeSourceRequestRejectsSafeguards(t *testing.T) {
 	}
 	if _, err := normalizeClaudeSourceRequest("openai-response", payload); err != nil {
 		t.Fatalf("non-Claude source was modified: %v", err)
+	}
+}
+
+func TestNormalizeClaudeSourceRequestClassifiesOnlyExactDangerousToolSafeguard(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name            string
+		payload         string
+		wantUnsupported bool
+	}{
+		{
+			name:            "exact opaque classifier context",
+			payload:         `{"safeguards":[{"type":"dangerous_tool_use","classifier_context":"OPAQUE-CONTEXT"}],"messages":[]}`,
+			wantUnsupported: true,
+		},
+		{
+			name:    "extra field",
+			payload: `{"safeguards":[{"type":"dangerous_tool_use","classifier_context":"OPAQUE-CONTEXT","action":"block"}],"messages":[]}`,
+		},
+		{
+			name:    "wrong type",
+			payload: `{"safeguards":[{"type":"other","classifier_context":"OPAQUE-CONTEXT"}],"messages":[]}`,
+		},
+		{
+			name:    "multiple entries",
+			payload: `{"safeguards":[{"type":"dangerous_tool_use","classifier_context":"OPAQUE-CONTEXT"},{"type":"dangerous_tool_use","classifier_context":"other"}],"messages":[]}`,
+		},
+		{
+			name:    "null classifier context",
+			payload: `{"safeguards":[{"type":"dangerous_tool_use","classifier_context":null}],"messages":[]}`,
+		},
+		{
+			name:    "missing classifier context",
+			payload: `{"safeguards":[{"type":"dangerous_tool_use"}],"messages":[]}`,
+		},
+		{
+			name:    "empty classifier context",
+			payload: `{"safeguards":[{"type":"dangerous_tool_use","classifier_context":""}],"messages":[]}`,
+		},
+		{
+			name:    "empty array classifier context",
+			payload: `{"safeguards":[{"type":"dangerous_tool_use","classifier_context":[]}],"messages":[]}`,
+		},
+		{
+			name:    "empty object classifier context",
+			payload: `{"safeguards":[{"type":"dangerous_tool_use","classifier_context":{}}],"messages":[]}`,
+		},
+		{
+			name:    "malformed request",
+			payload: `{"safeguards":[{"type":"dangerous_tool_use","classifier_context":"OPAQUE-CONTEXT"}],"messages":[]`,
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := normalizeClaudeSourceRequest("claude", []byte(test.payload))
+			if err == nil {
+				t.Fatal("normalizer accepted nonempty safeguards")
+			}
+			if got := errors.Is(err, errClaudeSafeguardsUnsupported); got != test.wantUnsupported {
+				t.Fatalf("unsupported safeguard classification = %t, want %t: %v", got, test.wantUnsupported, err)
+			}
+		})
+	}
+	for _, sourceFormat := range []string{"openai-response", "openai"} {
+		sourceFormat := sourceFormat
+		t.Run("unchanged source "+sourceFormat, func(t *testing.T) {
+			t.Parallel()
+			payload := []byte(`{"safeguards":[{"type":"dangerous_tool_use","classifier_context":"OPAQUE-CONTEXT"}],"messages":[]}`)
+			got, err := normalizeClaudeSourceRequest(sourceFormat, payload)
+			if err != nil || string(got) != string(payload) {
+				t.Fatalf("non-Claude source normalization = %s, %v; want unchanged payload", got, err)
+			}
+		})
 	}
 }
 

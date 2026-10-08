@@ -1,6 +1,8 @@
 package provider
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -8,6 +10,8 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+var errClaudeSafeguardsUnsupported = errors.New("Claude safeguards are unsupported by the selected Copilot endpoint")
 
 func normalizeClaudeSourceRequest(sourceFormat string, payload []byte) ([]byte, error) {
 	if sourceFormat != "claude" {
@@ -206,6 +210,28 @@ func normalizeClaudeSafeguards(body []byte) ([]byte, error) {
 	}
 	if safeguards.Type == gjson.Null || safeguards.IsObject() && len(safeguards.Map()) == 0 || safeguards.IsArray() && len(safeguards.Array()) == 0 {
 		return deleteClaudeMessagesField(body, "safeguards")
+	}
+	if json.Valid(body) {
+		root := gjson.ParseBytes(body)
+		if root.IsObject() {
+			safeguards := root.Get("safeguards")
+			if safeguards.IsArray() && len(safeguards.Array()) == 1 {
+				guard := safeguards.Array()[0]
+				context := guard.Get("classifier_context")
+				hasContext := context.Exists() && context.Type != gjson.Null
+				if context.Type == gjson.String && context.String() == "" ||
+					context.IsArray() && len(context.Array()) == 0 ||
+					context.IsObject() && len(context.Map()) == 0 {
+					hasContext = false
+				}
+				if guard.IsObject() && len(guard.Map()) == 2 &&
+					guard.Get("type").Type == gjson.String &&
+					guard.Get("type").String() == "dangerous_tool_use" &&
+					hasContext {
+					return nil, errClaudeSafeguardsUnsupported
+				}
+			}
+		}
 	}
 	return nil, fmt.Errorf("Claude safeguards are unsupported by the selected Copilot endpoint")
 }

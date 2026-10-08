@@ -201,6 +201,15 @@ Configured `model_endpoint_overrides` can also register their IDs when they are 
 Known models with a non-enabled Copilot policy remain excluded; upstream availability and capabilities are unverified for override-only IDs.
 Check `/v1/models` after authentication for the current model IDs.
 
+Only a valid Claude request whose root `safeguards` is an array with one object
+containing exactly `type` and `classifier_context`, with type `dangerous_tool_use`
+and nonempty classifier context, receives a static HTTP 400 `safeguards` error
+before a Copilot request is sent. Other nonempty or malformed safeguard forms
+remain 422 translation errors.
+Claude Code releases that recognize this response retry once with the classifier
+beta header and server safeguard metadata omitted while local classification stays
+active. Other clients should fail closed for automatic tool use.
+
 The Copilot filter excludes selected older model IDs by family and exact name.
 Review [GitHub's supported Copilot models](https://github.com/github/docs/blob/main/content/copilot/reference/ai-models/supported-models.md) when updating these exclusions.
 These OAuth exclusions affect Copilot only.

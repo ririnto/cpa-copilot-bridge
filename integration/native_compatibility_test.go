@@ -52,6 +52,38 @@ func TestNativeHostToolAndSystemCompatibility(t *testing.T) {
 			t.Fatalf("degradation disclosure was not forwarded: status=%d headers=%v", response.StatusCode, response.Header)
 		}
 	})
+	t.Run("ClaudeSafeguardsClientError", func(t *testing.T) {
+		const opaqueContext = "OPAQUE-CLASSIFIER-CONTEXT-SECRET"
+		for _, test := range []struct {
+			name   string
+			stream bool
+		}{
+			{name: "JSON"},
+			{name: "SSE", stream: true},
+		} {
+			test := test
+			t.Run(test.name, func(t *testing.T) {
+				before := upstreamRequestCount(state)
+				request := map[string]any{
+					"model":      "claude-sonnet-5.5",
+					"stream":     test.stream,
+					"max_tokens": 64,
+					"messages":   []any{map[string]any{"role": "user", "content": "Say hello."}},
+					"safeguards": []any{map[string]any{"type": "dangerous_tool_use", "classifier_context": opaqueContext}},
+				}
+				status, response := postProxyWithSession(t, base+"/v1/messages", request, "claude-safeguards-client-error-"+test.name)
+				if status != http.StatusBadRequest || !strings.Contains(strings.ToLower(string(response)), "safeguards") {
+					t.Fatalf("Claude safeguard response = %d %s, want static safeguards 400", status, response)
+				}
+				if bytes.Contains(response, []byte(opaqueContext)) {
+					t.Fatalf("Claude safeguard response leaked classifier context: %s", response)
+				}
+				if after := upstreamRequestCount(state); after != before {
+					t.Fatalf("rejected Claude safeguard dispatched %d upstream inference requests", after-before)
+				}
+			})
+		}
+	})
 	for _, stream := range []bool{false, true} {
 		t.Run(fmt.Sprintf("Stream%v", stream), func(t *testing.T) {
 			for _, model := range []string{"claude-sonnet-5.5", "gemini-3.8-flash"} {
