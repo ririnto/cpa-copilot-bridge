@@ -3,6 +3,8 @@ package provider
 import (
 	"fmt"
 	"net/http"
+
+	"github.com/tidwall/gjson"
 )
 
 type StatusError struct {
@@ -27,10 +29,19 @@ func statusError(code, message string, status int) error {
 }
 
 // upstreamStatusError keeps provider response text out of client-visible errors.
-func upstreamStatusError(status int, _ string) error {
+func upstreamStatusError(status int, body string) error {
+	code := "upstream_error"
 	message := fmt.Sprintf("Copilot upstream returned HTTP %d", status)
+	if (status == http.StatusBadRequest || status == http.StatusNotFound || status == http.StatusUnprocessableEntity) &&
+		gjson.Valid(body) &&
+		gjson.Get(body, "error.code").String() == "model_not_supported" &&
+		gjson.Get(body, "error.param").String() == "model" &&
+		gjson.Get(body, "error.type").String() == "invalid_request_error" {
+		code = "model_not_supported"
+		message = "The requested model is not supported."
+	}
 	return &StatusError{
-		Code:       "upstream_error",
+		Code:       code,
 		Message:    message,
 		HTTPStatus: status,
 		Retryable:  status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500,

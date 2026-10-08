@@ -125,6 +125,9 @@ make build
 make test-native
 ```
 
+For opt-in calls against real Copilot models and isolated Claude Code/Codex client checks, see
+[`docs/live-copilot-validation.md`](docs/live-copilot-validation.md).
+
 `make test-native` prepares a CLIProxyAPI host from the SDK version selected in `go.mod` and compiles the integration test executable.
 Preparation may download dependencies.
 The runtime loads the built plugin and uses committed synthetic seeds under `integration/testdata/native/v1`.

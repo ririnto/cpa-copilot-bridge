@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -177,6 +178,35 @@ func TestNativeHostToolAndSystemCompatibility(t *testing.T) {
 		if path != "/responses" || captured["model"] != model {
 			t.Fatalf("configured exact model routed to path=%q model=%v, want /responses and %q", path, captured["model"], model)
 		}
+	})
+	t.Run("ModelSupportCooldown", func(t *testing.T) {
+		state := newNativeFixture(t)
+		var rejected atomic.Int32
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost && r.URL.Path == "/responses" {
+				rejected.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_, err := io.WriteString(w, `{"error":{"code":"model_not_supported","param":"model","type":"invalid_request_error","message":"SYNTHETIC_PROVIDER_DETAIL"}}`)
+				if err != nil {
+					t.Errorf("write synthetic rejection: %v", err)
+				}
+				return
+			}
+			state.ServeHTTP(w, r)
+		}))
+		defer upstream.Close()
+		base := startProxy(t, binary, upstream.URL)
+		request := map[string]any{"model": "bridge-responses", "input": "Reply with ok."}
+		status, response := postProxyWithSession(t, base+"/v1/responses", request, "model-support-cooldown")
+		if status != http.StatusBadRequest || !bytes.Contains(response, []byte("The requested model is not supported.")) || bytes.Contains(response, []byte("SYNTHETIC_PROVIDER_DETAIL")) {
+			t.Fatalf("model rejection lost its safe classification: status=%d response=%s", status, response)
+		}
+		status, response = postProxyWithSession(t, base+"/v1/responses", request, "model-support-cooldown")
+		if status == http.StatusOK || rejected.Load() != 1 {
+			t.Fatalf("CPA retried an unsupported model: status=%d upstream_calls=%d response=%s", status, rejected.Load(), response)
+		}
+		callProxy(t, base+"/v1/chat/completions", map[string]any{"model": "bridge-chat", "messages": []any{map[string]any{"role": "user", "content": "Reply with ok."}}})
 	})
 }
 
