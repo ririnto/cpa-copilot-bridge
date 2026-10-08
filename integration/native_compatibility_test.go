@@ -2,15 +2,21 @@ package integration
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestNativeHostToolAndSystemCompatibility(t *testing.T) {
@@ -120,5 +126,120 @@ func TestNativeHostToolAndSystemCompatibility(t *testing.T) {
 				t.Fatalf("system authority or text was lost: %+v", captured)
 			}
 		})
+	}
+	t.Run("ConfiguredAbsentOverrideRoute", func(t *testing.T) {
+		model := "fixture-configured-route"
+		state := newNativeFixture(t)
+		if bytes.Contains(state.modelCatalog, []byte(model)) {
+			t.Fatalf("synthetic Copilot catalog unexpectedly contains configured model %q", model)
+		}
+		upstream := httptest.NewServer(state)
+		defer upstream.Close()
+		base := startProxyWithConfiguredEndpointOverride(t, binary, upstream.URL, model, "/responses")
+		before := upstreamRequestCount(state)
+		callProxyWithSession(t, base+"/v1/responses", map[string]any{"model": model, "input": "Use the configured route."}, "configured-absent-override")
+		if after := upstreamRequestCount(state); after != before+1 {
+			t.Fatalf("configured absent model dispatched %d inference requests, want one", after-before)
+		}
+		captured, path := lastUpstreamRequest(t, state)
+		if path != "/responses" || captured["model"] != model {
+			t.Fatalf("configured exact model routed to path=%q model=%v, want /responses and %q", path, captured["model"], model)
+		}
+	})
+}
+
+func startProxyWithConfiguredEndpointOverride(t *testing.T, binary, upstream, model, endpoint string) string {
+	t.Helper()
+	root := t.TempDir()
+	base, stop := startProxyInRoot(t, binary, upstream, root, nil, "")
+	stop()
+	configPath := filepath.Join(root, "config.yaml")
+	configBytes, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read native test config: %v", err)
+	}
+	config := make(map[string]any)
+	if err := yaml.Unmarshal(configBytes, &config); err != nil {
+		t.Fatalf("decode native test config: %v", err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve native host port: %v", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		t.Fatalf("release native host port: %v", err)
+	}
+	server := nativeMap(t, config["server"])
+	server["port"] = port
+	base = fmt.Sprintf("http://127.0.0.1:%d", port)
+	plugins := nativeMap(t, config["plugins"])
+	pluginConfigs := nativeMap(t, plugins["configs"])
+	plugin := nativeMap(t, pluginConfigs["cliproxyapi-copilot"])
+	plugin["model_endpoint_overrides"] = map[string]any{model: endpoint}
+	configBytes, err = yaml.Marshal(config)
+	if err != nil {
+		t.Fatalf("encode native test config: %v", err)
+	}
+	if err := os.WriteFile(configPath, configBytes, 0600); err != nil {
+		t.Fatalf("write native test config: %v", err)
+	}
+	logPath := filepath.Join(root, "host.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		t.Fatalf("open native host log: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	command := exec.CommandContext(ctx, binary, "--config", configPath, "--local-model")
+	command.Env = filteredChildEnvironment(os.Environ())
+	command.Dir = root
+	command.Stdout = logFile
+	command.Stderr = logFile
+	if err := command.Start(); err != nil {
+		cancel()
+		_ = logFile.Close()
+		t.Fatalf("start configured native host: %v", err)
+	}
+	t.Cleanup(func() {
+		cancel()
+		_ = command.Wait()
+		_ = logFile.Close()
+	})
+	client := &http.Client{Timeout: 3 * time.Second}
+	deadline := time.NewTimer(15 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-deadline.C:
+			log, _ := os.ReadFile(logPath)
+			t.Fatalf("configured native host did not register %q: %s", model, log)
+		case <-ticker.C:
+			request, _ := http.NewRequest(http.MethodGet, base+"/v1/models", nil)
+			request.Header.Set("Authorization", "Bearer fixture-client-key")
+			response, err := client.Do(request)
+			if err != nil {
+				continue
+			}
+			body, _ := io.ReadAll(response.Body)
+			_ = response.Body.Close()
+			if response.StatusCode != http.StatusOK {
+				continue
+			}
+			var catalog struct {
+				Data []struct {
+					ID string `json:"id"`
+				} `json:"data"`
+			}
+			if json.Unmarshal(body, &catalog) != nil {
+				continue
+			}
+			for _, entry := range catalog.Data {
+				if entry.ID == model {
+					return base
+				}
+			}
+		}
 	}
 }

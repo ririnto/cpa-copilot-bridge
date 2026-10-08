@@ -90,8 +90,51 @@ func (s *Service) ModelsForAuth(ctx context.Context, callbackID string, req plug
 	if errModels != nil {
 		return pluginapi.ModelResponse{}, errModels
 	}
-	available := availableModels(models)
-	return pluginapi.ModelResponse{Provider: providerID, Models: modelInfos(available)}, nil
+	cfg := s.Config()
+	inventory := normalizeModels(models)
+	registered := make([]upstreamModel, 0, len(inventory))
+	knownIDs := make(map[string]struct{}, len(inventory))
+	for _, model := range inventory {
+		id := strings.ToLower(model.ID)
+		knownIDs[id] = struct{}{}
+		if !modelPolicyAllowsUse(model.Policy) || (!modelAvailable(model) && cfg.ModelEndpointOverrides[id] == "") {
+			continue
+		}
+		registered = append(registered, model)
+	}
+
+	infos := modelInfos(registered)
+	seenIDs := make(map[string]struct{}, len(infos)+len(cfg.ModelEndpointOverrides))
+	for _, info := range infos {
+		seenIDs[strings.ToLower(info.ID)] = struct{}{}
+	}
+	for modelID, endpoint := range cfg.ModelEndpointOverrides {
+		id := strings.TrimSpace(modelID)
+		key := strings.ToLower(id)
+		if id == "" {
+			continue
+		}
+		if _, exists := knownIDs[key]; exists {
+			continue
+		}
+		if _, exists := seenIDs[key]; exists {
+			continue
+		}
+		infos = append(infos, pluginapi.ModelInfo{
+			ID:          id,
+			Description: fmt.Sprintf("Configured endpoint override: %s. Copilot availability and capabilities are unverified.", endpoint),
+			UserDefined: true,
+		})
+		seenIDs[key] = struct{}{}
+	}
+	sort.SliceStable(infos, func(i, j int) bool {
+		left, right := strings.ToLower(infos[i].ID), strings.ToLower(infos[j].ID)
+		if left == right {
+			return infos[i].ID < infos[j].ID
+		}
+		return left < right
+	})
+	return pluginapi.ModelResponse{Provider: providerID, Models: infos}, nil
 }
 
 func (s *Service) models(ctx context.Context, callbackID, authID string, storage authStorage, force bool) ([]upstreamModel, copilotTokenEntry, error) {

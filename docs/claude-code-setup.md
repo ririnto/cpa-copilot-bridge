@@ -196,7 +196,9 @@ curl -fsS \
   http://127.0.0.1:8317/v1/models
 ```
 
-The catalog reflects the models available to the authenticated Copilot account.
+The default catalog reflects the models available to the authenticated Copilot account.
+Configured `model_endpoint_overrides` can also register their IDs when they are absent from the upstream catalog.
+Known models with a non-enabled Copilot policy remain excluded; upstream availability and capabilities are unverified for override-only IDs.
 Check `/v1/models` after authentication for the current model IDs.
 
 The Copilot filter excludes selected older model IDs by family and exact name.

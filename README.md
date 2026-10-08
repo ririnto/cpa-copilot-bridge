@@ -43,6 +43,9 @@ Chat Completions, Responses, and Messages requests can use Copilot Chat Completi
 The plugin supports nine routes between the three client formats and three Copilot endpoints.
 The plugin selects an endpoint from model metadata.
 Set `model_endpoint_overrides` when a model needs a fixed route.
+Configured override IDs are registered for the authenticated account even when the Copilot catalog omits them.
+The host can select the configured route, but Copilot availability and model capabilities remain unverified.
+An override does not make a catalog model with a known non-enabled policy available.
 The plugin preserves provider-native reasoning state for same-format Messages and Responses requests.
 The plugin preserves tool and reasoning correlation across cross-format turns.
 The plugin stores an authenticated replay carrier with the Copilot credential.

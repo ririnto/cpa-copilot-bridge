@@ -279,11 +279,85 @@ func TestModelsForAuthReturnsOnlyAvailableInventoryEntries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("discover available models: %v", err)
 	}
-	if len(response.Models) != 2 || response.Models[0].ID != "visible" || response.Models[1].ID != "claude-sonnet-5.5" {
+	if len(response.Models) != 2 || response.Models[0].ID != "claude-sonnet-5.5" || response.Models[1].ID != "visible" {
 		t.Fatalf("exposed models = %#v, want all eligible models", response.Models)
 	}
 	if storage.GitHubAccessToken == "" {
 		t.Fatal("test storage lost its synthetic credential")
+	}
+}
+
+func TestModelsForAuthRegistersConfiguredOverridesWithoutInventingUnknownMetadata(t *testing.T) {
+	t.Parallel()
+	models := []upstreamModel{
+		{ID: "visible", ModelPickerEnabled: boolPointer(true), Policy: &modelPolicy{State: "enabled"}, Capabilities: modelCapabilities{Type: "chat"}, SupportedEndpoints: []string{translate.EndpointResponses}},
+		{
+			ID: "Picker.Hidden", Vendor: "Anthropic", Name: "Picker label", Version: "5.5",
+			ModelPickerEnabled: boolPointer(false), Policy: &modelPolicy{State: "enabled"},
+			Capabilities: modelCapabilities{
+				Type: "chat", Limits: modelLimits{MaxPromptTokens: 128, MaxOutputTokens: 32},
+				Supports: modelSupports{AdaptiveThinking: true, ReasoningEffort: []string{"low", "high"}},
+			},
+			SupportedEndpoints: []string{translate.EndpointMessages},
+		},
+		{ID: "policy-disabled", Policy: &modelPolicy{State: "disabled"}, SupportedEndpoints: []string{translate.EndpointResponses}},
+		{ID: "policy-preview", Policy: &modelPolicy{State: "preview"}, SupportedEndpoints: []string{translate.EndpointResponses}},
+		{ID: "no-endpoint", Policy: &modelPolicy{State: "enabled"}, Capabilities: modelCapabilities{Type: "chat"}},
+	}
+	service, _, rawStorage := serviceWithCachedModels(t, models)
+	service.config.ModelEndpointOverrides = map[string]string{
+		"absent-zed":      translate.EndpointResponses,
+		"absent-alpha":    translate.EndpointMessages,
+		"visible":         translate.EndpointResponses,
+		"picker.hidden":   translate.EndpointMessages,
+		"policy-disabled": translate.EndpointResponses,
+		"policy-preview":  translate.EndpointResponses,
+		"no-endpoint":     translate.EndpointResponses,
+	}
+	cachedInventory, err := json.Marshal(service.modelEntries["auth"].Models)
+	if err != nil {
+		t.Fatalf("marshal cached inventory before registration: %v", err)
+	}
+	response, err := service.ModelsForAuth(context.Background(), "callback", pluginapi.AuthModelRequest{AuthID: "auth", StorageJSON: rawStorage})
+	if err != nil {
+		t.Fatalf("discover models with explicit overrides: %v", err)
+	}
+	if response.Provider != providerID {
+		t.Fatalf("provider = %q, want %q", response.Provider, providerID)
+	}
+	wantIDs := []string{"absent-alpha", "absent-zed", "no-endpoint", "Picker.Hidden", "visible"}
+	if len(response.Models) != len(wantIDs) {
+		t.Fatalf("registered models = %#v, want IDs %#v", response.Models, wantIDs)
+	}
+	infos := make(map[string]pluginapi.ModelInfo, len(response.Models))
+	for index, model := range response.Models {
+		if model.ID != wantIDs[index] {
+			t.Fatalf("registered model %d = %q, want %q", index, model.ID, wantIDs[index])
+		}
+		infos[model.ID] = model
+	}
+	unknown := infos["absent-alpha"]
+	if !unknown.UserDefined || unknown.Description != "Configured endpoint override: "+translate.EndpointMessages+". Copilot availability and capabilities are unverified." {
+		t.Fatalf("configured absent model info = %#v", unknown)
+	}
+	if unknown.Object != "" || unknown.Created != 0 || unknown.OwnedBy != "" || unknown.Type != "" || unknown.DisplayName != "" || unknown.Name != "" || unknown.Version != "" || unknown.InputTokenLimit != 0 || unknown.OutputTokenLimit != 0 || unknown.ContextLength != 0 || unknown.MaxCompletionTokens != 0 || unknown.SupportedGenerationMethods != nil || unknown.SupportedParameters != nil || unknown.SupportedInputModalities != nil || unknown.SupportedOutputModalities != nil || unknown.Thinking != nil {
+		t.Fatalf("configured absent model invented catalog metadata: %#v", unknown)
+	}
+	hidden := infos["Picker.Hidden"]
+	if hidden.UserDefined || hidden.Name != "Picker.Hidden" || hidden.DisplayName != "Picker label" || hidden.OwnedBy != "Anthropic" || hidden.Version != "5.5" || len(hidden.SupportedGenerationMethods) != 1 || hidden.SupportedGenerationMethods[0] != translate.EndpointMessages || hidden.Thinking == nil || !hidden.Thinking.DynamicAllowed {
+		t.Fatalf("explicit override did not preserve hidden catalog metadata: %#v", hidden)
+	}
+	for _, id := range []string{"policy-disabled", "policy-preview"} {
+		if _, exists := infos[id]; exists {
+			t.Fatalf("non-enabled model %q was registered despite its override", id)
+		}
+	}
+	updatedInventory, err := json.Marshal(service.modelEntries["auth"].Models)
+	if err != nil {
+		t.Fatalf("marshal cached inventory after registration: %v", err)
+	}
+	if string(updatedInventory) != string(cachedInventory) {
+		t.Fatalf("model registration changed the cached upstream inventory: %#v", service.modelEntries["auth"].Models)
 	}
 }
 

@@ -107,7 +107,9 @@ Review [GitHub's supported Copilot models](https://github.com/github/docs/blob/m
 The v8 OAuth filter excludes selected older Copilot model IDs by family and exact name.
 It affects Copilot only.
 Matching IDs from other provider catalogs remain available.
-Copilot model registration shows only upstream models available to the authenticated account.
+By default, Copilot model registration shows only upstream models available to the authenticated account.
+Configured `model_endpoint_overrides` can also register their IDs when they are absent from the upstream catalog.
+Known models with a non-enabled Copilot policy remain excluded; upstream availability and capabilities are unverified for override-only IDs.
 
 ```yaml
 excluded-models:
