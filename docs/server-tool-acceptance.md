@@ -148,3 +148,23 @@ Five additional request/SSE fixtures preserve these real call identities, file r
 This evidence does not establish arbitrary PDF interpretation or cross-client attachment parity.
 HTTP/1.1 no-replay gate checks passed, without establishing full HTTP/2 or TLS-framing parity.
 Actual native profiles differ from the provisional provider-header change, which remains unpublished pending reconciliation.
+
+## Cross-format server-tool guards
+
+Claude native tool declarations must not become ordinary client functions when targeting Responses or Chat.
+Only the existing untyped, `custom`, and `function` client declarations enter that conversion path.
+Other typed declarations use the existing exclusion disclosure, and forced excluded selections fail before inference.
+Native Messages declarations retain their original behavior.
+Ordinary client functions with server-tool names retain their client execution semantics.
+
+Incoming Claude `server_tool_use` history cannot use the ordinary function-call adapter.
+The current request adapter rejects that history instead of changing who executes the tool.
+CPA's existing Claude response-to-Responses web-search conversion remains available through the built-in registry.
+It preserves actual paired search results and replay tokens when present.
+The existing GPT capture lacks full result entries and cannot establish a lossless Messages search response or continuation.
+These guards do not establish cross-format server-tool support.
+
+The retained catalogue replay binds to the native CLI profile rather than the current plugin's token-exchange catalogue profile.
+An isolated-host rerun needs complete catalogue bytes and matching credential, origin, profile, and response-hash provenance.
+The existing four-call catalogue ceiling cannot supply another upstream catalogue request.
+Main owns this prerequisite, and broader client, attachment, and server-tool acceptance remains open.

@@ -16,15 +16,6 @@ type nativeToolExclusion struct {
 	Reason string `json:"reason"`
 }
 
-func isNativeCompatibilityTool(typ string) bool {
-	switch typ {
-	case "web_search", "web_search_preview", "web_search_20250305", "web_search_20260209", "image_generation":
-		return true
-	default:
-		return false
-	}
-}
-
 func filterUnrepresentableNativeTools(source, endpoint string, body []byte) ([]byte, []nativeToolExclusion, error) {
 	if !gjson.ValidBytes(body) {
 		return body, nil, nil
@@ -68,7 +59,12 @@ func filterUnrepresentableNativeTools(source, endpoint string, body []byte) ([]b
 					unsupported = endpoint == translate.EndpointChatCompletions || endpoint == translate.EndpointMessages
 				}
 			case "claude":
-				unsupported = isNativeCompatibilityTool(typ) && (endpoint == translate.EndpointResponses || endpoint == translate.EndpointChatCompletions)
+				declarationType := tool.Get("type")
+				value := declarationType.Value()
+				if declarationType.Raw == "" {
+					value = ""
+				}
+				unsupported = !translate.IsClaudeClientToolType(value) && (endpoint == translate.EndpointResponses || endpoint == translate.EndpointChatCompletions)
 			}
 			if unsupported {
 				removed = append(removed, tool)

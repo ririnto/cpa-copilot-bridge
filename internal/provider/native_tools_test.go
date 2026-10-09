@@ -23,6 +23,118 @@ var droppedResponsesNativeDeclarations = []string{
 	`{"type":"apply_patch"}`,
 }
 
+func TestClaudeNativeDeclarationFilterGuards(t *testing.T) {
+	for _, typ := range []string{"web_fetch_20250910", "code_execution_20250522", "computer_20250124", "bash_20250124", "text_editor_20250728", "new_native_20990101", " web_fetch_20250910 "} {
+		for _, endpoint := range []string{translate.EndpointResponses, translate.EndpointChatCompletions, translate.EndpointMessages} {
+			for _, choice := range []string{`{"type":"auto"}`, `{"type":"any"}`, `{"type":"tool","name":"code_execution"}`} {
+				for _, client := range []string{"", `,{"type":"function","name":"code_execution","input_schema":{"type":"object"}}`, `,{"type":"custom","name":"code_execution","input_schema":{"type":"object"}}`, `,{"name":"code_execution","input_schema":{"type":"object"}}`} {
+					t.Run(fmt.Sprintf("%s/%s/%s/client=%t", typ, endpoint, choice, client != ""), func(t *testing.T) {
+						body := []byte(fmt.Sprintf(`{"tools":[{"type":%q,"name":"code_execution","max_uses":2}%s],"tool_choice":%s}`, typ, client, choice))
+						filtered, exclusions, err := filterUnrepresentableNativeTools("claude", endpoint, body)
+						if endpoint == translate.EndpointMessages {
+							if err != nil || len(exclusions) != 0 || string(filtered) != string(body) {
+								t.Fatalf("native declaration changed: %s %v %v", filtered, exclusions, err)
+							}
+							return
+						}
+						if client == "" && choice != `{"type":"auto"}` {
+							var status *StatusError
+							if !errors.As(err, &status) || status.Code != "unsupported_native_tool_choice" || status.HTTPStatus != http.StatusUnprocessableEntity {
+								t.Fatalf("forced native declaration did not fail coherently: %v", err)
+							}
+							return
+						}
+						if err != nil || len(exclusions) != 1 || exclusions[0].Type != strings.TrimSpace(typ) || nativeToolResponseHeaders(http.Header{}, exclusions).Get("X-Copilot-Excluded-Native-Tools") != strings.TrimSpace(typ)+";reason=unrepresentable_by_selected_endpoint" {
+							t.Fatalf("missing exclusion contract: %s %v %v", filtered, exclusions, err)
+						}
+						if client != "" && (len(gjson.GetBytes(filtered, "tools").Array()) != 1 || gjson.GetBytes(filtered, "tools.0").Raw != strings.TrimPrefix(client, ",")) || client == "" && (gjson.GetBytes(filtered, "tools").Exists() || gjson.GetBytes(filtered, "tool_choice").Exists()) {
+							t.Fatalf("client collision or empty auto handling changed: %s", filtered)
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
+func TestClaudeMalformedToolTypeFilterGuards(t *testing.T) {
+	for _, typ := range []string{`null`, `false`, `7`, `{}`, `[]`} {
+		for _, endpoint := range []string{translate.EndpointResponses, translate.EndpointChatCompletions} {
+			for _, choice := range []string{`{"type":"auto"}`, `{"type":"tool","name":"lookup"}`} {
+				body := []byte(fmt.Sprintf(`{"tools":[{"type":%s,"name":"lookup","input_schema":{"type":"object"}}],"tool_choice":%s}`, typ, choice))
+				filtered, exclusions, err := filterUnrepresentableNativeTools("claude", endpoint, body)
+				if choice == `{"type":"auto"}` {
+					if err != nil || len(exclusions) != 1 || gjson.GetBytes(filtered, "tools").Exists() {
+						t.Fatalf("malformed type became a client tool: %s %v %v", filtered, exclusions, err)
+					}
+				} else if err == nil {
+					t.Fatalf("forced malformed type %s did not fail before inference", typ)
+				}
+			}
+		}
+	}
+}
+
+func TestClaudeNativeToolExecutorGuards(t *testing.T) {
+	for _, endpoint := range []string{translate.EndpointResponses, translate.EndpointChatCompletions} {
+		for _, stream := range []bool{false, true} {
+			for _, test := range []struct {
+				name, payload string
+				wantError     bool
+			}{
+				{"optional", `{"messages":[{"role":"user","content":"Inspect"}],"tools":[{"type":"web_fetch_20250910","name":"web_fetch"},{"type":"code_execution_20250522","name":"code_execution"},{"name":"lookup","input_schema":{"type":"object"}}],"tool_choice":{"type":"auto"}}`, false},
+				{"forced", `{"messages":[{"role":"user","content":"Inspect"}],"tools":[{"type":"code_execution_20250522","name":"code_execution"}],"tool_choice":{"type":"tool","name":"code_execution"}}`, true},
+				{"required", `{"messages":[{"role":"user","content":"Inspect"}],"tools":[{"type":"code_execution_20250522","name":"code_execution"}],"tool_choice":{"type":"any"}}`, true},
+				{"server history", `{"messages":[{"role":"assistant","content":[{"type":"server_tool_use","id":"srvtoolu_guard","name":"code_execution","input":{"code":"canary"}}]},{"role":"user","content":"Continue"}]}`, true},
+			} {
+				t.Run(fmt.Sprintf("%s/stream=%t/%s", endpoint, stream, test.name), func(t *testing.T) {
+					responseBody := compactionStreamResponse("completed")
+					if endpoint == translate.EndpointChatCompletions {
+						responseBody = []byte(`{"id":"chat_guard","model":"gpt-5.6-sol","choices":[{"index":0,"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}]}`)
+					}
+					host := &nativeToolHost{compactionStreamHost: newCompactionStreamHost(responseBody), chat: endpoint == translate.EndpointChatCompletions}
+					service := newCompactionStreamService(t, host.compactionStreamHost)
+					service.host = host
+					token := service.tokenEntries["auth-id"]
+					if err := service.Configure([]byte("model_endpoint_overrides:\n  gpt-5.6-sol: " + endpoint + "\n")); err != nil {
+						t.Fatal(err)
+					}
+					_, generation := service.configSnapshot()
+					token.ConfigGeneration = generation
+					service.tokenEntries["auth-id"] = token
+					request := compactionStreamRequest([]byte(test.payload), "")
+					request.SourceFormat = "claude"
+					var headers http.Header
+					var err error
+					if stream {
+						headers, err = service.ExecuteStream(context.Background(), request)
+					} else {
+						response, executeErr := service.Execute(context.Background(), request)
+						headers, err = response.Headers, executeErr
+						if !test.wantError && err == nil && response.Metadata["copilot_excluded_native_tools"] == nil {
+							t.Fatal("optional server declarations lost exclusion metadata")
+						}
+					}
+					if test.wantError {
+						if err == nil || len(host.bodies) != 0 {
+							t.Fatalf("guard allowed upstream inference: %v calls=%d", err, len(host.bodies))
+						}
+						return
+					}
+					if err != nil || len(host.bodies) != 1 || len(gjson.GetBytes(host.bodies[0], "tools").Array()) != 1 || !strings.Contains(headers.Get("X-Copilot-Excluded-Native-Tools"), "web_fetch_20250910;reason=unrepresentable_by_selected_endpoint") || !strings.Contains(headers.Get("X-Copilot-Excluded-Native-Tools"), "code_execution_20250522;reason=unrepresentable_by_selected_endpoint") {
+						t.Fatalf("optional exclusion failed: %v headers=%v bodies=%s", err, headers, host.bodies)
+					}
+					if stream {
+						if _, message := collectCompactionStreamFrames(t, host.compactionStreamHost); message != "" {
+							t.Fatal(message)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
 func responsesNativeToolRequest(declarations, choice string, nested bool) []byte {
 	input := `"input":"Inspect the supplied material","tools":` + declarations
 	if nested {

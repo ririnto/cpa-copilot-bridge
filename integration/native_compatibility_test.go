@@ -210,6 +210,151 @@ func TestNativeHostToolAndSystemCompatibility(t *testing.T) {
 	})
 }
 
+func TestNativeHostClaudeUnsupportedServerToolGuards(t *testing.T) {
+	binary := os.Getenv("CPA_BINARY")
+	if binary == "" {
+		t.Skip("set CPA_BINARY to the task-owned pinned CLIProxyAPI candidate for synthetic native-host guards")
+	}
+	state := newNativeFixture(t)
+	upstream := httptest.NewServer(state)
+	t.Cleanup(upstream.Close)
+	base := startProxy(t, binary, upstream.URL)
+	t.Log("These synthetic tests verify translation guards and exclusion disclosure, not hosted provider capability.")
+	for _, target := range []struct {
+		name, model, path string
+	}{
+		{"Responses", "gpt-6-luna", "/responses"},
+		{"Chat", "gemini-3.8-flash", "/chat/completions"},
+	} {
+		for _, tool := range []struct {
+			name, declarationType string
+			input                 map[string]any
+		}{
+			{"web_fetch", "web_fetch_20250910", map[string]any{"url": "https://example.org/synthetic-native-history"}},
+			{"code_execution", "code_execution_20250825", map[string]any{"code": "print(385)"}},
+		} {
+			for _, stream := range []bool{false, true} {
+				format := "JSON"
+				if stream {
+					format = "SSE"
+				}
+				t.Run(target.name+"/"+tool.name+"/"+format, func(t *testing.T) {
+					request := func() map[string]any {
+						return map[string]any{
+							"model":      target.model,
+							"stream":     stream,
+							"max_tokens": 64,
+							"messages":   []any{map[string]any{"role": "user", "content": "Reply with a synthetic fixture response."}},
+							"tools": []any{
+								map[string]any{"type": tool.declarationType, "name": tool.name},
+								map[string]any{"name": "inspect", "input_schema": map[string]any{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}}}},
+							},
+						}
+					}
+					t.Run("AutomaticExclusionDisclosure", func(t *testing.T) {
+						payload := request()
+						payload["tool_choice"] = map[string]any{"type": "auto"}
+						before := upstreamRequestCount(state)
+						status, headers, body := postNativeCompatibilityRequest(t, base+"/v1/messages", payload, t.Name())
+						if after := upstreamRequestCount(state); after != before+1 {
+							t.Fatalf("automatic exclusion dispatched %d synthetic inference requests, want one", after-before)
+						}
+						if status != http.StatusOK || !strings.Contains(headers.Get("X-Copilot-Excluded-Native-Tools"), tool.declarationType+";reason=unrepresentable_by_selected_endpoint") {
+							t.Fatalf("automatic exclusion disclosure: status=%d headers=%v body=%s", status, headers, body)
+						}
+						_, model, schema, terminal := validateLiveResponse("Claude Messages", stream, headers.Get("Content-Type"), body)
+						if !schema || !terminal || !liveMatrixResponseModelMatches(target.model, model) {
+							t.Fatalf("automatic exclusion lost its destination response: model=%q schema=%t terminal=%t body=%s", model, schema, terminal, body)
+						}
+						captured, path := lastUpstreamRequest(t, state)
+						tools, ok := captured["tools"].([]any)
+						if path != target.path || !ok || len(tools) != 1 {
+							t.Fatalf("automatic exclusion changed ordinary tool routing: path=%q request=%+v", path, captured)
+						}
+						ordinary := nativeMap(t, tools[0])
+						name := ordinary["name"]
+						if target.name == "Chat" {
+							name = nativeMap(t, ordinary["function"])["name"]
+						}
+						if ordinary["type"] != "function" || name != "inspect" {
+							t.Fatalf("hosted declaration became an ordinary function or displaced inspect: %+v", captured)
+						}
+					})
+					t.Run("ForcedChoiceClientError", func(t *testing.T) {
+						payload := request()
+						payload["tool_choice"] = map[string]any{"type": "tool", "name": tool.name}
+						before := upstreamRequestCount(state)
+						status, headers, body := postNativeCompatibilityRequest(t, base+"/v1/messages", payload, t.Name())
+						if after := upstreamRequestCount(state); after != before {
+							t.Fatalf("forced unsupported hosted tool dispatched %d synthetic inference requests", after-before)
+						}
+						assertNativeCompatibilityClientError(t, status, headers, body, "tool_choice", tool.declarationType)
+					})
+					t.Run("HostedHistoryTranslationError", func(t *testing.T) {
+						payload := request()
+						delete(payload, "tools")
+						payload["messages"] = []any{
+							map[string]any{"role": "user", "content": "Run the synthetic hosted tool."},
+							map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "server_tool_use", "id": "synthetic-hosted-call", "name": tool.name, "input": tool.input}}},
+							map[string]any{"role": "user", "content": "Summarize the prior hosted result."},
+						}
+						before := upstreamRequestCount(state)
+						status, headers, body := postNativeCompatibilityRequest(t, base+"/v1/messages", payload, t.Name())
+						if after := upstreamRequestCount(state); after != before {
+							t.Fatalf("unrepresentable hosted history dispatched %d synthetic inference requests", after-before)
+						}
+						assertNativeCompatibilityClientError(t, status, headers, body, "server_tool_use")
+					})
+				})
+			}
+		}
+	}
+}
+
+func postNativeCompatibilityRequest(t *testing.T, endpoint string, payload any, session string) (int, http.Header, []byte) {
+	t.Helper()
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer fixture-client-key")
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Session-Id", session)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	out, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read native compatibility response: %v", err)
+	}
+	return response.StatusCode, response.Header.Clone(), out
+}
+
+func assertNativeCompatibilityClientError(t *testing.T, status int, headers http.Header, body []byte, details ...string) {
+	t.Helper()
+	var document map[string]any
+	if status != http.StatusUnprocessableEntity || !strings.HasPrefix(headers.Get("Content-Type"), "application/json") || json.Unmarshal(body, &document) != nil {
+		t.Fatalf("unsupported hosted tool did not return a static JSON 422: status=%d headers=%v body=%s", status, headers, body)
+	}
+	message, ok := nativeMap(t, document["error"])["message"].(string)
+	if !ok || strings.TrimSpace(message) == "" {
+		t.Fatalf("unsupported hosted tool lacked an explicit client error: %s", body)
+	}
+	for _, detail := range details {
+		if !strings.Contains(message, detail) {
+			t.Fatalf("unsupported hosted tool error did not identify %q: %s", detail, body)
+		}
+	}
+}
+
 func startProxyWithConfiguredEndpointOverride(t *testing.T, binary, upstream, model, endpoint string) string {
 	t.Helper()
 	root := t.TempDir()

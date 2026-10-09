@@ -49,9 +49,15 @@ func claudeRequestToResponses(model string, body []byte, stream bool) ([]byte, e
 			if !okTool {
 				continue
 			}
-			switch toolType := stringValue(tool["type"]); toolType {
-			case "web_search_20250305", "web_search_20260209", "web_search_preview", "web_search", "image_generation":
-				return nil, fmt.Errorf("Claude native tool type %q cannot be represented by the Copilot Responses endpoint", toolType)
+			toolType, hasType := tool["type"]
+			if !hasType {
+				toolType = ""
+			}
+			if !IsClaudeClientToolType(toolType) {
+				if _, okType := toolType.(string); !okType {
+					return nil, fmt.Errorf("Claude tool type must be a string for cross-format translation")
+				}
+				return nil, fmt.Errorf("Claude native tool type %q cannot be represented by the Copilot Responses endpoint", stringValue(toolType))
 			}
 			if stringValue(tool["name"]) == "" {
 				continue
@@ -219,7 +225,9 @@ func claudeRequestToResponses(model string, body []byte, stream bool) ([]byte, e
 						"encrypted_content": redactedThinkingPrefix + data,
 					})
 				}
-			case "tool_use", "server_tool_use":
+			case "server_tool_use":
+				return nil, fmt.Errorf("Claude server_tool_use history cannot be represented by the current Copilot cross-format request adapter")
+			case "tool_use":
 				flushMessage()
 				toolInput, okInput := part["input"].(map[string]any)
 				if !okInput {
