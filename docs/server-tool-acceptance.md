@@ -9,12 +9,13 @@ Unsupported responses, excluded declarations, client-executed functions, and unr
 
 | Exact model | Destination | Existing hosted-tool evidence |
 | --- | --- | --- |
-| `gemini-3.8-flash` | Chat | Provider-executed server tools remain unproven. |
-| `gpt-6-luna` | Responses | Native hosted web search completed with correlated events and citations. |
-| `claude-haiku-5.5` | Messages | Native WebSearch returned HTTP 400 with `unsupported_value`. |
+| `gemini-3.8-flash` | Chat | Search returned HTTP 200 with an empty assistant message and `finish_reason: error`. |
+| `gpt-6-luna` | Responses | Hosted search completed with actual results, action sources and a matching assistant citation. |
+| `claude-haiku-5.5` | Messages | Code execution completed with a paired bash result; WebSearch and Web Fetch were refused. |
 
-The captured GPT search action includes `query` and `queries`, without full results or action sources.
-Citations establish cited sources, but do not establish complete result content or replay state.
+The earlier GPT search capture contains only query and citation evidence.
+A later isolated probe requested both `web_search_call.results` and `web_search_call.action.sources` and received nonempty search snippets, source URLs and a citation to the same NASA result.
+This proves that native JSON search capability for the tested request, without establishing translated streaming or continuation.
 Public API documentation describes schemas and does not prove capabilities of an assigned Copilot endpoint.
 Existing configured aliases may resolve to the assigned exact upstream model without changing that model.
 No model substitution, invented alias, hidden reroute, fabricated result, or invented provider replay token is permitted.
@@ -91,47 +92,48 @@ Forcing an inline PDF would not validate the latter clients' original paths.
 Equivalent protocol declarations must retain identical decoded bytes, MIME, reference semantics, and representable metadata.
 Native Copilot captures establish which declarations and exact models accept these inputs.
 Synthetic converter tests, sanitized captured fixtures, and real provider acceptance are reported separately.
-Uploads, remote URLs, office files, audio, and video remain unproven without applicable captures and allocated calls.
+Uploads, remote URLs, office files, audio, and video remain unproven without applicable captures and real calls.
 JSON/SSE responses and continuations must retain relevant attachment content, results, citations, and provider-owned references.
 A rejection, dropped part, or unrun case keeps the corresponding acceptance open.
-The representative allocation does not establish a complete attachment matrix.
+The representative cases do not establish a complete attachment matrix.
 
-## Recorded execution limits
+## Execution accounting
 
-The initial new execution ceiling is 44 physical inference dispatches, without automatic retries or phase budget transfers.
-Authentication and catalogue dispatches have separate ceilings of eight and four.
-A task-owned forwarding gate must reject excess requests before upstream dispatch.
-Failures count against the budget and retain private bodies and sanitized HTTP metadata.
+Physical authentication, catalogue and inference requests are counted separately for truthful evidence.
+There is no blanket numeric ceiling, phase allocation limit or one-call-per-case restriction.
+Use sufficient distinct cases and evidence-based revalidation for the required behavior.
+Reuse unchanged accepted evidence without skipping missing acceptance.
+Every dispatch needs an explicit prepared case and durable accounting before egress.
+Failures retain private bodies and sanitized HTTP metadata and remain distinct from unrun cases.
+No automatic model fallback, fabricated result or unbounded retry is permitted.
 
-| Phase | Ceiling | Scope |
-| --- | ---: | --- |
-| A | 8 | Current native Codex and Claude search baselines receive four slots each. |
-| B | 5 | Five native family capability candidates receive one slot each. |
-| C | 9 | Six native Copilot PNG/PDF representatives precede three conditional translated search or continuation calls. |
-| D | 8 | Cross-client search parity receives four slots for each destination. |
-| E | 2 | Changed-evidence verification or confirmed cross-protocol attachment checks receive at most two calls. |
-| F | 12 | Native GPT and Gemini PDF paths receive four slots each, followed by four conditional original-path cross-client attachment slots. |
+| Evidence group | Scope |
+| --- | --- |
+| A | Original Codex and Claude search and completed client delegation. |
+| B | Native-endpoint hosted search, fetch and execution capabilities. |
+| C | Native PNG/PDF representatives and evidence-supported translated tool continuation. |
+| D | Codex incoming Claude and Claude incoming GPT search parity. |
+| E | Changed-evidence verification and applicable cross-protocol attachment checks. |
+| F | Original GPT/Gemini PDF preparation, viewing, follow-up and cross-client paths. |
 
-Phase B candidates are Gemini Chat search, GPT Responses source-bearing search, Claude fetch, Claude code execution, and GPT code interpreter.
+The initial capability candidates are Gemini Chat search, GPT Responses source-bearing search, Claude fetch, Claude code execution and GPT code interpreter.
 Only genuine successful native execution permits its translated-family claims.
-Additional successful families require a recorded family matrix before cross-protocol support is claimed.
-Image generation, file search, hosted MCP, and tool search remain unknown or unrun without established capability and required real resources.
-Client-executed shell, computer, and ordinary functions are tracked separately.
+Additional supported families require recorded declarations, actual results and continuation evidence before cross-protocol support is claimed.
+Image generation, file search, hosted MCP and tool search remain unknown or unrun without applicable capabilities and real resources.
+Client-executed shell, computer and ordinary functions are tracked separately.
 
-The verified retained historical native-host logs contain 56 physical inference requests.
-They contain 24 GPT Responses calls, 22 Claude Messages calls, and 10 Gemini Chat calls.
-This is not a complete historical total and excludes authentication, catalogue, and other direct captures.
-Fresh outcomes, dispatch counts, and unresolved cells must be recorded before expanded acceptance is closed.
-
-Phase F was revised before its first dispatch to follow each original client's complete attachment path.
-The total and phase ceilings remain unchanged.
-Catalogue capacity is exhausted after four captured native catalogue requests.
-Any explicit local catalogue replay must preserve genuine captured bytes and verify credential, origin, client-profile, and response-hash bindings.
-Local replay is recorded separately and does not establish a fresh catalogue response.
+The verified retained historical native-host logs contain fifty-six physical inference requests.
+They contain twenty-four GPT Responses calls, twenty-two Claude Messages calls and ten Gemini Chat calls.
+This is not a complete historical total and excludes authentication, catalogue and other direct captures.
+Explicit local catalogue replay must preserve genuine captured bytes and verify credential, origin, client-profile and response-hash bindings.
+Replay is recorded separately and does not establish a fresh public response.
+Normal SDK discovery and known-disabled policy remain required.
+Fresh outcomes, physical counts and unresolved cases must be recorded before expanded acceptance is closed.
 
 ## Current native evidence
 
-Twelve native inference requests completed, with eight authentication dispatches and four catalogue dispatches recorded.
+Twelve native inference requests completed before the later isolated plugin startup.
+The later corrected isolated startup and five native capability probes bring observed totals to seventeen inference requests, ten authentication dispatches and six catalogue dispatches.
 The authentication count includes one accidental credential-free test request that returned HTTP 404.
 Subsequent offline tests enforce loopback-only isolation.
 Native Claude PNG and PDF content assertions passed, as did native Gemini PNG content.
@@ -163,10 +165,45 @@ Incoming Claude `server_tool_use` history cannot use the ordinary function-call 
 The current request adapter rejects that history instead of changing who executes the tool.
 CPA's existing Claude response-to-Responses web-search conversion remains available through the built-in registry.
 It preserves actual paired search results and replay tokens when present.
-The existing GPT capture lacks full result entries and cannot establish a lossless Messages search response or continuation.
+The earlier GPT capture lacks full result entries; the later full-result capture permits testing the actual response shape, but lossless Messages conversion and continuation still require their own evidence.
 These guards do not establish cross-format server-tool support.
 
 The retained catalogue replay binds to the native CLI profile rather than the current plugin's token-exchange catalogue profile.
 An isolated-host rerun needs complete catalogue bytes and matching credential, origin, profile, and response-hash provenance.
-The existing authentication and catalogue ceilings are both exhausted.
-Main owns this prerequisite, and broader client, attachment, and server-tool acceptance remains open.
+The later isolated startup completed token exchange and public catalogue discovery with HTTP 200.
+The complete catalogue advertised fifty-seven entries with all three exact targets enabled and their expected endpoints.
+The first local model lookup preceded asynchronous registration by one second and returned an empty list.
+The host subsequently registered all three targets and nine models in total.
+The runner stopped before inference, preserving the startup failure and all five capability candidates as unrun.
+TCP listener readiness alone does not establish model-registry readiness.
+This failure does not establish provider unavailability or a catalogue parser regression.
+Main owns corrected isolated readiness and the remaining client, attachment and server-tool acceptance.
+
+The corrected runner polls the local registry until the exact targets are registered, checking process health and capture failures within a bounded deadline.
+Normal SDK authentication and public catalogue discovery completed before the five native probes.
+Each probe made one observed physical inference request; this is an outcome, not a call limit.
+No gate denial or capture failure occurred, and the aggregate test failed because three capabilities did not pass.
+
+| Native JSON probe | Observed outcome |
+| --- | --- |
+| Gemini Chat search | HTTP 200, empty content and `finish_reason: error`; no call, result or successful terminal evidence. |
+| GPT Responses search | Completed provider search with eleven nonempty results, matching action sources and a NASA citation. |
+| Claude Messages Web Fetch | HTTP 400, `invalid_request_body`, with `rejected tool(s): web_fetch`. |
+| Claude Messages code execution | `server_tool_use` named `bash_code_execution`, paired `bash_code_execution_tool_result`, exit code zero, stdout `385`, and `end_turn`. |
+| GPT Responses Code Interpreter | HTTP 400, `unsupported_value`, with `tools` identifying the unsupported interpreter. |
+
+Raw public refusals and protocol-shaped local errors are retained separately.
+The two successful native probes do not establish cross-format requests, streaming, continuation or default native Copilot CLI HTTP parity.
+
+## Capability evidence checks
+
+A successful capability claim requires the exact model, protocol envelope and successful terminal status.
+Incomplete Responses, truncated Messages and unfinished Chat choices cannot pass as completed execution.
+A Gemini search requires a correlated nonempty provider result rather than an empty result envelope.
+GPT search keeps result content, action sources and assistant citations as separate evidence.
+The same completed search call and source URL must bind meaningful result content to the cited answer.
+URL-only entries, completed-call status alone and results borrowed from another call cannot establish complete search evidence.
+Claude execution recognizes the explicit native bash execution call/result variant with the same call ID, exit code zero and exact stdout.
+These offline predicates and synthetic negatives validate acceptance checks rather than supplying missing provider capabilities.
+An incomplete private capture stops further dispatch as soon as its retained-body limit is exceeded, before stream completion or capture serialization.
+The partial body and truncation marker remain available for failure diagnosis.
