@@ -10,6 +10,9 @@ import (
 )
 
 func validateResponsesRequestForTarget(body []byte, target sdktranslator.Format) error {
+	if err := validateRequestAttachments(body, sdktranslator.FormatOpenAIResponse, target); err != nil {
+		return err
+	}
 	root, err := decodeObject(body)
 	if err != nil {
 		return fmt.Errorf("decode Responses request for translation")

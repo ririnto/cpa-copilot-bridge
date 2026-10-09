@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin/internal/redact"
 )
 
 type liveCLIResult struct {
@@ -150,14 +152,24 @@ func testLiveCLIClient(t *testing.T, client, base string) {
 }
 
 func runLiveCLI(t *testing.T, path, client, base, root, prompt string) liveCLIResult {
+	return runLiveCLIWithEffort(t, path, client, base, root, prompt, "")
+}
+
+func runLiveCLIWithEffort(t *testing.T, path, client, base, root, prompt, effort string) liveCLIResult {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	var args []string
 	if client == "claude" {
 		args = []string{"--safe-mode", "--print", "--output-format", "stream-json", "--verbose", "--no-session-persistence", "--permission-mode", "dontAsk", "--tools", "WebSearch,Agent", "--allowedTools", "WebSearch,Agent", "--model", "claude-haiku-5.5", prompt}
+		if effort != "" {
+			args = append(args[:len(args)-1], append([]string{"--effort", effort}, args[len(args)-1:]...)...)
+		}
 	} else {
 		args = []string{"exec", "--strict-config", "--json", "--ignore-rules", "--skip-git-repo-check", "--sandbox", "read-only", "--model", "gpt-6-luna", "--cd", root, prompt}
+		if effort != "" {
+			args = append(args[:len(args)-1], append([]string{"--config", "model_reasoning_effort=\"" + effort + "\""}, args[len(args)-1:]...)...)
+		}
 	}
 	command := exec.CommandContext(ctx, path, args...)
 	command.Dir = root
@@ -177,6 +189,7 @@ func runLiveCLI(t *testing.T, path, client, base, root, prompt string) liveCLIRe
 	}
 	if captureDir := liveDebugArtifactDirectory(t, "cli-"+client); captureDir != "" {
 		for name, body := range map[string][]byte{"stdout.jsonl": stdout.bytes, "stderr.txt": stderr.bytes, "prompt.txt": []byte(prompt)} {
+			body = []byte(redact.Text(string(body), liveCopilotClientKey))
 			if captureErr := os.WriteFile(filepath.Join(captureDir, name), body, 0600); captureErr != nil {
 				t.Fatal("could not retain private CLI diagnostic")
 			}

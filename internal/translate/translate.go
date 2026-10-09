@@ -41,6 +41,11 @@ func RequestForEndpointFrom(source, model string, body []byte, stream bool, endp
 	if err := rejectMismatchedCopilotCarrier(from, to, model, body); err != nil {
 		return nil, err
 	}
+	if from != to && from != sdktranslator.FormatOpenAIResponse {
+		if err := validateRequestAttachments(body, from, to); err != nil {
+			return nil, err
+		}
+	}
 	if from == sdktranslator.FormatOpenAIResponse && from != to {
 		if err := validateResponsesRequestForTarget(body, to); err != nil {
 			return nil, err
@@ -73,6 +78,12 @@ func RequestForEndpointFrom(source, model string, body []byte, stream bool, endp
 	if err != nil {
 		return nil, err
 	}
+	if from != to {
+		out, err = restoreRequestAttachmentFields(body, out, from, to)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if from == sdktranslator.FormatClaude && to == sdktranslator.FormatOpenAIResponse {
 		out, err = stripCacheControlFields(out)
 		if err != nil {
@@ -100,9 +111,17 @@ func requestFromResponsesToChat(model string, body []byte, stream bool) ([]byte,
 	if err != nil {
 		return nil, err
 	}
+	carriedBody, files, err := prepareResponsesChatAttachments(carriedBody)
+	if err != nil {
+		return nil, err
+	}
 	out := registry.TranslateRequest(sdktranslator.FormatOpenAIResponse, sdktranslator.FormatOpenAI, model, carriedBody, stream)
 	if len(out) == 0 || !json.Valid(out) {
 		return nil, fmt.Errorf("official Responses-to-Chat request translation failed")
+	}
+	out, err = restoreChatAttachmentFiles(out, files)
+	if err != nil {
+		return nil, err
 	}
 	return copyResponsesPromptCacheKey(out, body)
 }

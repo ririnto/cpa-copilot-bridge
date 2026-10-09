@@ -780,6 +780,10 @@ func TestReadLiveCopilotAuthFilePreservesBytesAndHidesPath(t *testing.T) {
 }
 
 func startLiveNativeHost(t *testing.T, binary string, storageJSON []byte, authMode string, endpointOverrides map[string]string) (string, func()) {
+	return startLiveNativeHostWithGate(t, binary, storageJSON, authMode, endpointOverrides, "")
+}
+
+func startLiveNativeHostWithGate(t *testing.T, binary string, storageJSON []byte, authMode string, endpointOverrides map[string]string, gateURL string) (string, func()) {
 	t.Helper()
 	root := t.TempDir()
 	if err := os.MkdirAll(root, 0700); err != nil {
@@ -804,7 +808,11 @@ func startLiveNativeHost(t *testing.T, binary string, storageJSON []byte, authMo
 	if runtime.GOOS == "windows" {
 		ext = ".dll"
 	}
-	plugin, err := os.ReadFile(filepath.Join("..", "build", "plugins", runtime.GOOS, runtime.GOARCH, "cliproxyapi-copilot"+ext))
+	pluginPath := strings.TrimSpace(os.Getenv("CPA_LIVE_PLUGIN_PATH"))
+	if pluginPath == "" {
+		pluginPath = filepath.Join("..", "build", "plugins", runtime.GOOS, runtime.GOARCH, "cliproxyapi-copilot"+ext)
+	}
+	plugin, err := os.ReadFile(pluginPath)
 	if err != nil {
 		t.Fatal("live native plugin artifact is unavailable")
 	}
@@ -848,6 +856,11 @@ func startLiveNativeHost(t *testing.T, binary string, storageJSON []byte, authMo
 	pluginConfig := nativeMap(t, pluginConfigs["cliproxyapi-copilot"])
 	pluginConfig["auth_mode"] = authMode
 	pluginConfig["model_endpoint_overrides"] = endpointOverrides
+	if gateURL != "" {
+		pluginConfig["github_api_url"] = gateURL
+		pluginConfig["copilot_api_url"] = gateURL
+		pluginConfig["allow_insecure_base_urls"] = true
+	}
 	routing := nativeMap(t, config["routing"])
 	retry := nativeMap(t, routing["retry"])
 	retry["request-retry"] = 0
