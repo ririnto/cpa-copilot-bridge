@@ -1,6 +1,6 @@
 {
-  "provenance": "Five complete forwarded native Copilot CLI inference captures recorded on 2026-10-09 UTC; request and full SSE response bodies only.",
-  "gpt_extra_user_turn": "NOTRUN",
+  "provenance": "Six complete forwarded native Copilot CLI inference captures, including the subsequent native persisted-session GPT follow-up; request and full SSE response bodies only.",
+  "gpt_extra_user_turn": "captured_native_persisted_session_load",
   "pdf_result_sha256": "e8627ac30088e8d989b1e265018ac32bc5b7b94bb4fdb51954deaff0c3ff2d68",
   "pdf_result_length": 623,
   "cases": [
@@ -73,6 +73,24 @@
       "sse_done_marker": true,
       "terminal": "stop",
       "text": "The unique marker found in the PDF is **`Q7B9`** (`Document canary: Q7B9`)."
+    },
+    {
+      "name": "gpt-resumed-followup",
+      "source": "openai-response",
+      "endpoint": "/responses",
+      "model": "gpt-6-luna",
+      "response_model": "gpt-6-luna",
+      "reasoning_effort": "medium",
+      "continuation_kind": "native_persisted_session_load",
+      "http_status": 200,
+      "request_sha256": "ad8c26d212473e20a41dc06f9ba2ef78562b2f7aa622c711694a5693257e3aa7",
+      "response_sse_sha256": "6e979faad0e8b7cadeb5d4e7fc75d947fe38271ed475cf8389e85b11a0449865",
+      "sse_json_events": 12,
+      "sse_done_marker": false,
+      "terminal": "completed",
+      "text": "Q7B9",
+      "new_tool_calls": 0
     }
-  ]
+  ],
+  "continuation_boundary": "The retained native GPT session was loaded through ACP before the captured text-only turn; the Gemini extra user turn is same-process continuation, and source inference bodies alone do not record the session/load exchange."
 }

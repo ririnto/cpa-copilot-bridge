@@ -131,7 +131,7 @@ Local replay is recorded separately and does not establish a fresh catalogue res
 
 ## Current native evidence
 
-Eleven native inference requests completed, with seven authentication dispatches and four catalogue dispatches recorded.
+Twelve native inference requests completed, with eight authentication dispatches and four catalogue dispatches recorded.
 The authentication count includes one accidental credential-free test request that returned HTTP 404.
 Subsequent offline tests enforce loopback-only isolation.
 Native Claude PNG and PDF content assertions passed, as did native Gemini PNG content.
@@ -142,9 +142,11 @@ Two further GPT requests establish the native `view` call, paired PDF result, an
 Three further Gemini requests establish the same path and a completed same-session user-turn continuation.
 The native reader returned the original PDF file text without a custom extraction step.
 These bounded runs expose the original native `view` tool and preserve native temporary-file preparation.
-GPT's extra user turn remains unrun because the temporary inspector initially assumed an unavailable ACP tool-name field.
-Its corrected offline replay correlates the actual upstream call and result without repeating inference.
-Five additional request/SSE fixtures preserve these real call identities, file results, and histories after sanitization.
+GPT's extra user turn uses native ACP `session/load` of the retained original session.
+Its single text-only request preserves the original `view` call, paired PDF output, and prior assistant answer.
+The new user question contains no marker, and the new completed model response returns the marker without another tool call.
+The original session state remains unchanged.
+Six additional request/SSE fixtures preserve these real call identities, file results, and histories after sanitization.
 This evidence does not establish arbitrary PDF interpretation or cross-client attachment parity.
 HTTP/1.1 no-replay gate checks passed, without establishing full HTTP/2 or TLS-framing parity.
 Actual native profiles differ from the provisional provider-header change, which remains unpublished pending reconciliation.
@@ -166,5 +168,5 @@ These guards do not establish cross-format server-tool support.
 
 The retained catalogue replay binds to the native CLI profile rather than the current plugin's token-exchange catalogue profile.
 An isolated-host rerun needs complete catalogue bytes and matching credential, origin, profile, and response-hash provenance.
-The existing four-call catalogue ceiling cannot supply another upstream catalogue request.
+The existing authentication and catalogue ceilings are both exhausted.
 Main owns this prerequisite, and broader client, attachment, and server-tool acceptance remains open.

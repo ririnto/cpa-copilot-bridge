@@ -13,7 +13,10 @@ import (
 
 type nativePDFToolCapture struct {
 	nativeAttachmentCapture
-	Model string `json:"model"`
+	Model            string `json:"model"`
+	ReasoningEffort  string `json:"reasoning_effort"`
+	ContinuationKind string `json:"continuation_kind"`
+	NewToolCalls     int    `json:"new_tool_calls"`
 }
 
 func nativePDFToolCaptures(t *testing.T) map[string]nativePDFToolCapture {
@@ -27,7 +30,7 @@ func nativePDFToolCaptures(t *testing.T) map[string]nativePDFToolCapture {
 	if err := json.Unmarshal(readLiveBodyFixture(t, "native-pdf-tool-captures", "manifest.json"), &manifest); err != nil {
 		t.Fatal(err)
 	}
-	if len(manifest.Cases) != 5 || manifest.GPTExtraUserTurn != "NOTRUN" || manifest.PDFResultLength != 623 || manifest.PDFResultSHA256 != "e8627ac30088e8d989b1e265018ac32bc5b7b94bb4fdb51954deaff0c3ff2d68" {
+	if len(manifest.Cases) != 6 || manifest.GPTExtraUserTurn != "captured_native_persisted_session_load" || manifest.PDFResultLength != 623 || manifest.PDFResultSHA256 != "e8627ac30088e8d989b1e265018ac32bc5b7b94bb4fdb51954deaff0c3ff2d68" {
 		t.Fatal("the captured native PDF path evidence boundary changed")
 	}
 	captures := make(map[string]nativePDFToolCapture)
@@ -224,5 +227,59 @@ func TestCapturedNativePDFGeminiExtraUserTurnHistory(t *testing.T) {
 	answer, user := objectValue(followup[4]), objectValue(followup[5])
 	if answer["role"] != "assistant" || answer["content"] != captures["gemini-result"].Text || user["role"] != "user" || !strings.Contains(rawStringValue(user["content"]), "Without reading a new file") || !strings.Contains(captures["gemini-followup"].Text, "Q7B9") {
 		t.Fatal("the captured same-session text-only follow-up and marker answer changed")
+	}
+}
+
+func TestCapturedNativePDFGPTPersistedSessionFollowup(t *testing.T) {
+	captures := nativePDFToolCaptures(t)
+	capture := captures["gpt-resumed-followup"]
+	root := nativePDFToolRequest(t, capture.Name)
+	items := arrayValue(root["input"])
+	prior := arrayValue(nativePDFToolRequest(t, "gpt-result")["input"])
+	if capture.Model != "gpt-6-luna" || capture.ResponseModel != "gpt-6-luna" || capture.ReasoningEffort != "medium" || capture.ContinuationKind != "native_persisted_session_load" || objectValue(root["reasoning"])["effort"] != "medium" || len(items) != 6 || !reflect.DeepEqual(prior[1:4], items[1:4]) {
+		t.Fatal("the real resumed native session lost its exact model, effort, tagged_files user, view call, or paired PDF result")
+	}
+	id, arguments := nativePDFToolViewCall(t, "gpt-initial")
+	call, result := objectValue(items[2]), objectValue(items[3])
+	if call["call_id"] != id || result["call_id"] != id || call["type"] != "function_call" || call["name"] != "view" || result["type"] != "function_call_output" {
+		t.Fatal("persisted session loading changed the original native call/result identity")
+	}
+	requireLiveBodyJSONEqual(t, []byte(rawStringValue(call["arguments"])), []byte(arguments))
+	pdf := []byte(rawStringValue(result["output"]))
+	if len(pdf) != 623 || nativeAttachmentSHA256(pdf) != "e8627ac30088e8d989b1e265018ac32bc5b7b94bb4fdb51954deaff0c3ff2d68" {
+		t.Fatal("persisted session loading changed the original native PDF result bytes")
+	}
+	answer, user := objectValue(items[4]), objectValue(items[5])
+	parts := arrayValue(answer["content"])
+	userJSON, err := json.Marshal(user["content"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if answer["role"] != "assistant" || len(parts) != 1 || objectValue(parts[0])["type"] != "output_text" || objectValue(parts[0])["text"] != captures["gpt-result"].Text || user["role"] != "user" || bytes.Contains(userJSON, []byte("Q7B9")) || bytes.Contains(userJSON, []byte("tagged_files")) || !bytes.Contains(userJSON, []byte("unique marker")) {
+		t.Fatal("the captured loaded answer or text-only user prompt changed or leaked the expected marker into the new prompt")
+	}
+	events, _ := liveBodySSEEvents(t, readLiveBodyFixture(t, "native-pdf-tool-captures/"+capture.Name, "response.sse"))
+	newCalls, completed := 0, false
+	for _, raw := range events {
+		event := objectValue(raw)
+		if event["type"] == "response.output_item.done" && objectValue(event["item"])["type"] == "function_call" {
+			newCalls++
+		}
+		if event["type"] == "response.completed" {
+			response := objectValue(event["response"])
+			encoded, err := json.Marshal(response["output"])
+			if err != nil {
+				t.Fatal(err)
+			}
+			completed = response["status"] == "completed" && response["model"] == "gpt-6-luna" && bytes.Contains(encoded, []byte("Q7B9"))
+			for _, item := range arrayValue(response["output"]) {
+				if objectValue(item)["type"] == "function_call" {
+					newCalls++
+				}
+			}
+		}
+	}
+	if !completed || capture.Text != "Q7B9" || capture.NewToolCalls != 0 || newCalls != 0 {
+		t.Fatal("the real resumed text-only turn must complete with Q7B9 and zero new tool calls")
 	}
 }
