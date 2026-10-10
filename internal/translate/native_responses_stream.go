@@ -12,16 +12,17 @@ import (
 const nativeWebSearchBufferLimit = 8 << 20
 
 type nativeResponsesWebSearchState struct {
-	Frames        [][]byte
-	Bytes         int
-	DoneIDs       map[int]string
-	FinalStatuses map[int]string
+	Frames         [][]byte
+	Bytes          int
+	DoneIDs        map[int]string
+	FinalStatuses  map[int]string
+	WholeLifecycle bool
 }
 
-// Copilot's hosted search IDs carry opaque replay state and change between phases.
-// Delay the ordered stream barrier until its terminal snapshot provides the
-// final native identity; leave that authoritative snapshot unchanged.
-func nativeResponsesStream(frame []byte, state *any) ([][]byte, error) {
+// Copilot's hosted search responses change opaque response and item IDs between
+// phases. Declared search requests hold the whole lifecycle until the terminal
+// snapshot supplies authoritative identities, without changing its replay data.
+func nativeResponsesStream(frame []byte, state *any, wholeLifecycle bool) ([][]byte, error) {
 	event, data, done, err := parseSSEFrame(frame)
 	if err != nil {
 		return nil, err
@@ -34,14 +35,14 @@ func nativeResponsesStream(frame []byte, state *any) ([][]byte, error) {
 		pending, _ = (*state).(*nativeResponsesWebSearchState)
 	}
 	isSearchItem := gjson.GetBytes(data, "item.type").String() == "web_search_call"
-	if pending == nil && !isSearchItem && !strings.HasPrefix(event, "response.web_search_call.") {
+	if pending == nil && !wholeLifecycle && !isSearchItem && !strings.HasPrefix(event, "response.web_search_call.") {
 		return [][]byte{append([]byte(nil), frame...)}, nil
 	}
 	if state == nil {
 		return nil, fmt.Errorf("native Responses web search stream requires state")
 	}
 	if pending == nil {
-		pending = &nativeResponsesWebSearchState{DoneIDs: make(map[int]string), FinalStatuses: make(map[int]string)}
+		pending = &nativeResponsesWebSearchState{DoneIDs: make(map[int]string), FinalStatuses: make(map[int]string), WholeLifecycle: wholeLifecycle}
 		*state = pending
 	}
 	if done || event == "response.failed" || event == "error" {
@@ -124,6 +125,19 @@ func nativeResponsesStream(frame []byte, state *any) ([][]byte, error) {
 		}
 		finalIDs[index] = id.String()
 	}
+	responseID := gjson.GetBytes(data, "response.id")
+	if pending.WholeLifecycle {
+		if responseID.Type != gjson.String || responseID.String() == "" {
+			return nil, fmt.Errorf("native Responses hosted-tool terminal has no response identity")
+		}
+		for index, item := range gjson.GetBytes(data, "response.output").Array() {
+			id := item.Get("id")
+			if id.Type != gjson.String || id.String() == "" {
+				return nil, fmt.Errorf("native Responses hosted-tool terminal has no output identity at index %d", index)
+			}
+			finalIDs[index] = id.String()
+		}
+	}
 	out := make([][]byte, 0, len(pending.Frames))
 	for _, buffered := range pending.Frames {
 		name, payload, _, err := parseSSEFrame(buffered)
@@ -143,13 +157,29 @@ func nativeResponsesStream(frame []byte, state *any) ([][]byte, error) {
 		if err != nil {
 			return nil, err
 		}
+		changed := false
+		if pending.WholeLifecycle && gjson.GetBytes(payload, "response.id").Exists() {
+			payload, err = sjson.SetBytes(payload, "response.id", responseID.String())
+			if err != nil {
+				return nil, fmt.Errorf("retain terminal native response identity: %w", err)
+			}
+			changed = true
+		}
 		index, err := strconv.Atoi(numberKey(root["output_index"]))
+		if pending.WholeLifecycle && gjson.GetBytes(payload, "output_index").Exists() {
+			if gjson.GetBytes(payload, "output_index").Type != gjson.Number || err != nil || index < 0 || finalIDs[index] == "" {
+				return nil, fmt.Errorf("native Responses event has no terminal output index")
+			}
+			if itemType := gjson.GetBytes(payload, "item.type").String(); itemType != "" && itemType != gjson.GetBytes(data, fmt.Sprintf("response.output.%d.type", index)).String() {
+				return nil, fmt.Errorf("native Responses event conflicts with its terminal output type")
+			}
+		}
 		if err == nil {
 			if id, exists := finalIDs[index]; exists {
 				path := ""
-				if gjson.GetBytes(payload, "item.type").String() == "web_search_call" {
+				if gjson.GetBytes(payload, "item.type").String() == "web_search_call" || pending.WholeLifecycle && gjson.GetBytes(payload, "item.id").Exists() {
 					path = "item.id"
-				} else if strings.HasPrefix(kind, "response.web_search_call.") {
+				} else if strings.HasPrefix(kind, "response.web_search_call.") || pending.WholeLifecycle && gjson.GetBytes(payload, "item_id").Exists() {
 					path = "item_id"
 				}
 				if path != "" {
@@ -157,9 +187,12 @@ func nativeResponsesStream(frame []byte, state *any) ([][]byte, error) {
 					if err != nil {
 						return nil, fmt.Errorf("retain terminal native web search identity: %w", err)
 					}
-					buffered = responseSSEBytes(name, payload)
+					changed = true
 				}
 			}
+		}
+		if changed {
+			buffered = responseSSEBytes(name, payload)
 		}
 		out = append(out, buffered)
 	}

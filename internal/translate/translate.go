@@ -160,7 +160,14 @@ func StreamFromEndpoint(ctx context.Context, endpoint, destination, model string
 	to := sdktranslator.FromString(destination)
 	if from == to {
 		if from == sdktranslator.FormatOpenAIResponse {
-			return nativeResponsesStream(frame, state)
+			wholeLifecycle := false
+			for _, tool := range gjson.GetBytes(translated, "tools").Array() {
+				switch tool.Get("type").String() {
+				case "web_search", "web_search_preview":
+					wholeLifecycle = true
+				}
+			}
+			return nativeResponsesStream(frame, state, wholeLifecycle)
 		}
 		if from == sdktranslator.FormatOpenAI {
 			event, data, done, err := parseSSEFrame(frame)

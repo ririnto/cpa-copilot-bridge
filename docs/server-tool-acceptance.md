@@ -5,6 +5,68 @@ The earlier [live validation](live-copilot-validation.md) remains complete withi
 Its 18 JSON/SSE inference cells do not establish hosted tools or complete native-client request parity.
 Unsupported responses, excluded declarations, client-executed functions, and unrun cases do not satisfy this acceptance.
 
+## Current acceptance (2026-10-10)
+
+The latest matched host and dependency checks are described in [current live validation](live-copilot-validation.md#current-validation-2026-10-10).
+The corrected model-registry startup and five native JSON probes completed.
+The earlier startup race and NOTRUN snapshot below are historical.
+
+| Native follow-up | Current outcome |
+| --- | --- |
+| Claude Bash execution SSE | PASS: actual paired execution result, stdout `385`, successful terminal and clean EOF. |
+| Claude exact-history continuation | PASS: actual preceding content reaches Messages unchanged and the answer reuses `385` without another tool call. |
+| GPT search SSE before repair | FAIL: native response, reasoning and message identities change between phases. |
+| GPT search SSE after repair | Identities pass; exact result/citation URL pairing fails because the annotation adds a tracking query absent from result URLs. |
+| GPT captured-terminal continuation | PASS: one real Responses request replays the original complete terminal output and ciphertext unchanged and answers without another search. |
+
+The successful GPT continuation uses the original stream's identical public/client completed terminal.
+That terminal contains meaningful search results and an exactly matching source citation.
+Offline conversion repairs the earlier identities before validating the retained history.
+The separate eligibility record marks `native_stream_accepted: false` and `offline_identity_replay: true`.
+Neither failed stream verdict is overwritten or counted as a live streaming pass.
+The changed-identity stream's distinct citation-pairing failure remains open.
+No tracking query or result content is normalized away to make it pass.
+
+Declared native Responses search now holds the complete lifecycle behind the existing 8 MiB barrier.
+The terminal owns response and output-index identities, including reasoning and message items.
+Earlier events use those identities while terminal bytes, ciphertext, call IDs, results and citations remain unchanged.
+Other native Responses streams retain their existing streaming behavior.
+Hosted search therefore delays client output until the terminal snapshot arrives.
+
+Five complete actual request/response pairs are retained in [portable regression fixtures](../internal/translate/testdata/native-hosted-tool-stream-captures/README.md).
+Synthetic lifecycle mutations and native-host tests establish regression behavior separately from live provider capability.
+This follow-up made five inference dispatches and five authentication/catalogue startup pairs, including the continuation-only audit stopped before inference.
+The expanded ledger now records 88 inference, 34 authentication and 30 catalogue dispatches.
+These counts are observations, not limits.
+
+The latest original-client attachments pass for Codex-to-Haiku PNG/PDF and Claude-to-GPT PDF.
+Claude-to-GPT PNG remains a semantic failure despite preserved bytes and successful transport.
+Original Codex interruption and same-thread continuation pass, while the client emitted zero `response.interrupt` frames.
+Required synthetic wire tests cover active and late control handling separately.
+
+## Remaining inputs and owners
+
+Main owns the remaining acceptance in [issue #5](https://github.com/ririnto/cpa-copilot-bridge/issues/5).
+Unchanged rejected profiles are retained without another speculative provider retry.
+
+| Remaining acceptance | Owner and next required input |
+| --- | --- |
+| Cross-format hosted search and Bash SSE/history | Main needs a lossless destination representation and a ready original-client request preserving actual result ownership. |
+| Gemini search, Claude WebSearch/Web Fetch, GPT interpreter | Copilot capability owner must provide changed capability/profile evidence for the exact model and rejected declaration. |
+| Image generation, file search, hosted MCP and tool search | Main needs advertised exact-model capability and genuine files, servers or tool registry resources. |
+| Original HTTPS image references and remote uploads | Main needs an original client path that actually originates these carriers and authentic upload ownership. |
+| Audio, video and office attachments | Main needs a supported original-client preparer and exact-model capability evidence. |
+| GPT PNG semantic failure and tracked citation pairing | Copilot model behavior must produce the correct content or exactly correlated result citation under a substantively changed case. |
+| Identity-neutral native HTTP headers | Main needs ownership release for the preserved provider WIP before changing its streaming `Accept` behavior. |
+| First-party Copilot session and executable-tool parity | Main needs an explicit authentic identity policy and genuine ACP/tool context unavailable from Claude/Codex inbound headers. |
+| Original-client interrupt wire emission | The original Codex client must emit the control frame before live wire acceptance can be established. |
+
+The current catalogue advertises image/PDF support without establishing all other modalities as globally unsupported.
+Native Copilot CLI captures use `application/json` for streamed Chat/Responses and `*/*` for Messages.
+The plugin's current streamed `Accept: text/event-stream` is a recorded mismatch.
+The five existing provider WIP files remain unchanged and excluded from publication.
+Full HTTP/2, TLS framing and native first-party identity parity remain unverified.
+
 ## Assigned destinations
 
 | Exact model | Destination | Existing hosted-tool evidence |
@@ -55,7 +117,7 @@ A successful status or matching protocol label alone does not establish parity.
 
 The pinned CLIProxyAPI translator registry supplies reusable conversion routes.
 Its native Claude and Codex executor preparation resides in internal packages unavailable through the external plugin SDK.
-Those paths provide implementation guidance without authorizing direct Anthropic or ChatGPT credentials on Copilot requests.
+Those historical paths provide implementation guidance without authorizing direct Anthropic or ChatGPT credentials on Copilot requests.
 See [Claude preparation](https://github.com/router-for-me/CLIProxyAPI/blob/v8.0.15/internal/runtime/executor/claude_executor_request.go) and [Codex preparation](https://github.com/router-for-me/CLIProxyAPI/blob/v8.0.15/internal/runtime/executor/codex_executor_request.go).
 
 [OpenCodex routing](https://github.com/lidge-jun/opencodex/pull/3866) assigns GPT Responses destinations independently of incoming format.
@@ -130,7 +192,7 @@ Replay is recorded separately and does not establish a fresh public response.
 Normal SDK discovery and known-disabled policy remain required.
 Fresh outcomes, physical counts and unresolved cases must be recorded before expanded acceptance is closed.
 
-## Current native evidence
+## Historical native evidence snapshot
 
 Twelve native inference requests completed before the later isolated plugin startup.
 The later corrected startup, five native capability probes and original-client attachment attempts bring observed totals to twenty-seven inference requests, fourteen authentication dispatches and ten catalogue dispatches.
@@ -174,10 +236,12 @@ The later isolated startup completed token exchange and public catalogue discove
 The complete catalogue advertised fifty-seven entries with all three exact targets enabled and their expected endpoints.
 The first local model lookup preceded asynchronous registration by one second and returned an empty list.
 The host subsequently registered all three targets and nine models in total.
-The runner stopped before inference, preserving the startup failure and all five capability candidates as unrun.
+The first runner stopped before inference, preserving its startup failure and all five candidates as unrun at that time.
+The corrected runner below and current acceptance above supersede that readiness status.
 TCP listener readiness alone does not establish model-registry readiness.
 This failure does not establish provider unavailability or a catalogue parser regression.
-Main owns corrected isolated readiness and the remaining client, attachment and server-tool acceptance.
+The corrected isolated readiness is complete.
+Main owns the remaining acceptance listed above.
 
 The corrected runner polls the local registry until the exact targets are registered, checking process health and capture failures within a bounded deadline.
 Normal SDK authentication and public catalogue discovery completed before the five native probes.
@@ -208,7 +272,7 @@ These offline predicates and synthetic negatives validate acceptance checks rath
 An incomplete private capture stops further dispatch as soon as its retained-body limit is exceeded, before stream completion or capture serialization.
 The partial body and truncation marker remain available for failure diagnosis.
 
-## Original-client attachment evidence
+## Historical original-client attachment evidence
 
 The first cross-model packet uses Claude Code's built-in `Read` and Codex's original image or executable/view workflow.
 Original client bodies are captured before conversion, separately from converted public requests and both response streams.
@@ -259,7 +323,7 @@ The offline `TestAttachmentOriginalClaudePDFReadOffline` probe exercises install
 The independently reviewed `TestAttachmentPacketCorrectedPDFReplay` reads retained evidence and writes a separate verdict without changing the original failure.
 Ordinary tests cover strict terminal schemas, ordered content-block lifecycles, successful renderer/result correlation, counted authentication recovery and capture failure retention.
 
-## CPA v8.0.23 Codex follow-up
+## Historical CPA v8.0.23 Codex follow-up
 
 The earlier cached-only-search 422 is historical. The existing native-tool exclusion mechanism now excludes optional Responses search with `external_web_access=false` when targeting Messages, retaining ordinary functions and disclosing the exclusion. Forced excluded selection still fails before inference. Original request and paired response bodies are retained in a portable regression fixture; they do not establish clean EOF for the historical capture.
 

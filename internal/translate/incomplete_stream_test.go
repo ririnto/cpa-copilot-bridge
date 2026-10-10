@@ -103,7 +103,7 @@ func TestNativeResponsesIncompleteWebSearchPreservesAuthoritativeSnapshot(t *tes
 			var state any
 			var output [][]byte
 			for index, frame := range frames {
-				out, err := nativeResponsesStream(frame, &state)
+				out, err := nativeResponsesStream(frame, &state, false)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -154,11 +154,11 @@ func TestNativeResponsesIncompleteWebSearchRejectsMalformedSnapshot(t *testing.T
 		t.Run(test.name, func(t *testing.T) {
 			var state any
 			first := []byte(`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"early","type":"web_search_call","status":"in_progress"}}` + "\n\n")
-			if _, err := nativeResponsesStream(first, &state); err != nil {
+			if _, err := nativeResponsesStream(first, &state, false); err != nil {
 				t.Fatal(err)
 			}
 			if test.done {
-				if _, err := nativeResponsesStream([]byte(`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"done","type":"web_search_call","status":"completed"}}`+"\n\n"), &state); err != nil {
+				if _, err := nativeResponsesStream([]byte(`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"done","type":"web_search_call","status":"completed"}}`+"\n\n"), &state, false); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -166,7 +166,7 @@ func TestNativeResponsesIncompleteWebSearchRejectsMalformedSnapshot(t *testing.T
 			if err != nil {
 				t.Fatal(err)
 			}
-			if out, err := nativeResponsesStream(append(append([]byte("data: "), terminal...), '\n', '\n'), &state); err == nil || len(out) != 0 {
+			if out, err := nativeResponsesStream(append(append([]byte("data: "), terminal...), '\n', '\n'), &state, false); err == nil || len(out) != 0 {
 				t.Fatalf("malformed incomplete snapshot accepted: frames=%d error=%v", len(out), err)
 			}
 		})

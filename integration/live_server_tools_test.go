@@ -36,13 +36,20 @@ const liveMoonTask = "Use web search to find NASA's official Moon facts page. Gi
 const liveServerToolTransportCoverage = "http1_only_one_use_transport_http2_parity_unverified"
 
 var liveServerToolPhaseCells = map[string]struct{}{
-	"A/codex":                 {},
-	"A/claude":                {},
-	"B/gemini-chat-search":    {},
-	"B/gpt-responses-search":  {},
-	"B/claude-web-fetch":      {},
-	"B/claude-code-execution": {},
-	"B/gpt-code-interpreter":  {},
+	"A/codex":                                  {},
+	"A/claude":                                 {},
+	"B/gemini-chat-search":                     {},
+	"B/gpt-responses-search":                   {},
+	"B/claude-web-fetch":                       {},
+	"B/claude-code-execution":                  {},
+	"B/gpt-code-interpreter":                   {},
+	"S/gpt-responses-search":                   {},
+	"S/claude-code-execution":                  {},
+	"C/gpt-responses-search":                   {},
+	"C/claude-code-execution":                  {},
+	"S-native-identity/gpt-responses-search":   {},
+	"C-native-identity/gpt-responses-search":   {},
+	"C-captured-identity/gpt-responses-search": {},
 }
 
 type liveServerToolGate struct {
@@ -405,7 +412,8 @@ func (g *liveServerToolGate) withLedger(update func(*liveDispatchLedger) error) 
 }
 
 func (g *liveServerToolGate) freezeCell(cell string) {
-	if !strings.HasPrefix(cell, "A/") && !strings.HasPrefix(cell, "B/") && !liveAttachmentGateCell(cell) && !liveDependencyMatrixCell(cell) && !liveOriginalCLIClaimCell(cell) && !liveOriginalInterruptCell(cell) {
+	_, configured := liveServerToolPhaseCells[cell]
+	if !configured && !strings.HasPrefix(cell, "A/") && !strings.HasPrefix(cell, "B/") && !liveAttachmentGateCell(cell) && !liveDependencyMatrixCell(cell) && !liveOriginalCLIClaimCell(cell) && !liveOriginalInterruptCell(cell) {
 		return
 	}
 	g.mu.Lock()

@@ -61,26 +61,34 @@ func TestNativeResponsesWebSearchUsesTerminalSnapshotIdentity(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		path := ""
+		expected := source
 		kind := gjson.GetBytes(source, "type").String()
-		if gjson.GetBytes(source, "item.type").String() == "web_search_call" {
-			path = "item.id"
-		} else if strings.HasPrefix(kind, "response.web_search_call.") {
-			path = "item_id"
-		}
-		if path != "" {
-			expected, err := sjson.SetBytes(source, path, finalID)
-			if err != nil {
-				t.Fatal(err)
+		if kind != "response.completed" {
+			if gjson.GetBytes(source, "response.id").Exists() {
+				expected, err = sjson.SetBytes(expected, "response.id", gjson.GetBytes(terminal, "response.id").String())
+				if err != nil {
+					t.Fatal(err)
+				}
 			}
-			requireLiveBodyJSONEqual(t, actual, expected)
+			if outputIndex := gjson.GetBytes(source, "output_index"); outputIndex.Exists() {
+				id := gjson.GetBytes(terminal, fmt.Sprintf("response.output.%d.id", outputIndex.Int())).String()
+				for _, path := range []string{"item.id", "item_id"} {
+					if gjson.GetBytes(source, path).Exists() {
+						expected, err = sjson.SetBytes(expected, path, id)
+						if err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+			}
+		}
+		requireLiveBodyJSONEqual(t, actual, expected)
+		if !bytes.Equal(source, expected) {
 			changed++
-		} else if !bytes.Equal(source, actual) {
-			t.Fatalf("native stream event %d changed outside hosted search identity", index)
 		}
 	}
-	if changed != 5 || !bytes.Equal(translated[len(translated)-1], frames[len(frames)-1]) {
-		t.Fatal("captured five-phase search or authoritative terminal snapshot changed")
+	if changed < 5 || !bytes.Equal(translated[len(translated)-1], frames[len(frames)-1]) {
+		t.Fatal("captured hosted lifecycle or authoritative terminal snapshot changed")
 	}
 }
 
@@ -185,7 +193,7 @@ func TestNativeResponsesWebSearchRejectsIncompleteLifecycles(t *testing.T) {
 				if len(frame) == 0 {
 					continue
 				}
-				if _, err := nativeResponsesStream(frame, &state); err != nil {
+				if _, err := nativeResponsesStream(frame, &state, false); err != nil {
 					failed = true
 					break
 				}
@@ -201,11 +209,11 @@ func TestNativeResponsesWebSearchBufferIsBounded(t *testing.T) {
 	t.Parallel()
 	var state any
 	first := []byte(`data: {"type":"response.output_item.added","output_index":1,"item":{"type":"web_search_call","id":"early","status":"in_progress"}}` + "\n\n")
-	if out, err := nativeResponsesStream(first, &state); err != nil || len(out) != 0 {
+	if out, err := nativeResponsesStream(first, &state, false); err != nil || len(out) != 0 {
 		t.Fatalf("start buffer: count=%d err=%v", len(out), err)
 	}
 	frame := []byte(fmt.Sprintf("data: {\"type\":\"response.output_text.delta\",\"delta\":%q}\n\n", strings.Repeat("x", nativeWebSearchBufferLimit)))
-	if _, err := nativeResponsesStream(frame, &state); err == nil {
+	if _, err := nativeResponsesStream(frame, &state, false); err == nil {
 		t.Fatal("unbounded pending native search stream accepted")
 	}
 }
@@ -216,7 +224,7 @@ func TestNativeResponsesWebSearchRejectsInvalidOutputIndexes(t *testing.T) {
 		t.Run(index, func(t *testing.T) {
 			var state any
 			frame := []byte(`data: {"type":"response.output_item.added","output_index":` + index + `,"item":{"type":"web_search_call","id":"early","status":"in_progress"}}` + "\n\n")
-			if _, err := nativeResponsesStream(frame, &state); err == nil {
+			if _, err := nativeResponsesStream(frame, &state, false); err == nil {
 				t.Fatal("malformed output index was associated with a hosted search")
 			}
 		})
@@ -235,7 +243,7 @@ func TestNativeResponsesWebSearchKeepsMultipleOutputIndexesSeparate(t *testing.T
 	var state any
 	var out [][]byte
 	for _, frame := range frames {
-		translated, err := nativeResponsesStream([]byte("data: "+frame+"\n\n"), &state)
+		translated, err := nativeResponsesStream([]byte("data: "+frame+"\n\n"), &state, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -304,7 +312,7 @@ func TestNativeResponsesWebSearchPreservesInterleavedClientTool(t *testing.T) {
 	var state any
 	var translated [][]byte
 	for _, frame := range source {
-		out, err := nativeResponsesStream(frame, &state)
+		out, err := nativeResponsesStream(frame, &state, false)
 		if err != nil {
 			t.Fatal(err)
 		}

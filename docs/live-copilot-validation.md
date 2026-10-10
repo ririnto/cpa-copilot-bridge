@@ -47,6 +47,14 @@ Offline replay of the exact captures accepted the case after checking the carrie
 The audit records three physical inference requests and zero provider calls during replay.
 It preserves the original `accepted: false` result unchanged and writes the audited `accepted: true` result separately.
 
+Native Claude hosted Bash SSE and exact-history continuation now pass with actual paired stdout `385` and no repeated tool execution.
+Native GPT hosted search exposed changing response, reasoning and message identities.
+The plugin now buffers declared search from the first event and binds earlier identities to the unchanged terminal snapshot.
+An actual rerun passed identity checks but retained an exact result/citation URL-pairing failure.
+A separate real continuation reused the original captured terminal output and ciphertext unchanged and passed without another search.
+The original failed native streams remain failed; offline repair and authentic terminal eligibility are recorded separately.
+See [hosted-tool current acceptance and remaining inputs](server-tool-acceptance.md#current-acceptance-2026-10-10).
+
 To repeat the offline audit without writing an audit record, point the two private replay-directory variables at the retained capture directories.
 
 ```sh
@@ -199,7 +207,7 @@ The interrupt attempt defaults to `latest-dependencies` and also accepts `fix-re
 Each attempt creates a fresh captured host and claim ledger.
 Keep debug directories outside the repository and publish only sanitized summaries.
 
-## Fresh CPA authentication result
+## Historical fresh CPA authentication result (2026-10-09)
 
 The follow-up validation on 2026-10-09 used a completed CPA Copilot OAuth file with `token_exchange`.
 Discovery returned 59 models, including all three exact target IDs and their assigned native endpoints.
@@ -252,7 +260,8 @@ The temporary client home supplies the catalogue through the supported `model_ca
 The isolated Claude invocation enables WebSearch and Agent explicitly.
 
 Native Copilot hosted search changes its opaque item ID between stream phases and in the completed snapshot.
-The plugin buffers the ordered stream from the first hosted search until a valid terminal snapshot, bounded at 8 MiB.
+That earlier repair buffered from the first hosted search event until a valid terminal snapshot, bounded at 8 MiB.
+The current repair above starts at the first response event for declared native search and reconciles all output-index identities.
 It retains the final snapshot and replay data, and uses its native ID for earlier search lifecycle events.
 Later text and tool events wait behind this buffer.
 Valid `response.incomplete` snapshots retain their partial output, reason, usage, and actual search status.
@@ -277,9 +286,10 @@ Private values use placeholders while the protocol fields and events remain inta
 CPA's formatted SSE logs required reassembly at transport chunk boundaries; one lost instruction space was restored from the paired client response.
 Fixture notices record this reconstruction. Original diagnostics remain private and unchanged.
 
-## CPA v8.0.23 compatibility follow-up
+## Historical CPA v8.0.23 compatibility follow-up
 
-The current host and SDK are pinned to v8.0.23. Existing CPA handling now cancels an active plugin HTTP stream on `response.interrupt`, emits `response.incomplete` with reason `interrupted`, and permits the next request on the same client WebSocket. Native Codex WebSocket sessions forward the original interrupt body unchanged and retain continuation identity. These paths have required synthetic native-host regressions. After the completed plugin HTTP forwarder has exited, a late interrupt still returns HTTP 400; the native Codex completed-session handling does not extend to the plugin executor.
+This earlier follow-up predates the current attachment and late-interrupt fixes above.
+At that point, the host and SDK were pinned to v8.0.23. Existing CPA handling now cancels an active plugin HTTP stream on `response.interrupt`, emits `response.incomplete` with reason `interrupted`, and permits the next request on the same client WebSocket. Native Codex WebSocket sessions forward the original interrupt body unchanged and retain continuation identity. These paths have required synthetic native-host regressions. After the completed plugin HTTP forwarder has exited, a late interrupt still returns HTTP 400; the native Codex completed-session handling does not extend to the plugin executor.
 
 Codex Responses requests can declare optional `web_search` with `external_web_access: false`. When the selected endpoint is Claude Messages, the existing native-tool exclusion mechanism now removes this unrepresentable declaration and discloses it in `X-Copilot-Excluded-Native-Tools` and response metadata. Ordinary function tools remain intact. Forced selection of the excluded tool fails before inference. This does not implement cached-only search or change it to live web search.
 
@@ -309,7 +319,7 @@ supports_websockets = false
 Use the actual custom provider name when applying the transport setting.
 No operating proxy or global client configuration was changed during validation.
 
-## Earlier Keychain result
+## Historical earlier Keychain result
 
 The macOS validation on 2026-10-09 used the authenticated Copilot CLI account with `direct_oauth`.
 Discovery returned eight model entries and none of the three exact target IDs.
