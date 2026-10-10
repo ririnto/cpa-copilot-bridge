@@ -7,12 +7,15 @@ import (
 	"net/http"
 
 	"github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin/internal/provider"
+	"github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin/internal/transport"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 var pluginService = provider.New(hostTransport{})
 var pluginVersion = "0.3.3"
+
+var _ transport.PayloadFinalizer = hostTransport{}
 
 type lifecycleRequest struct {
 	ConfigYAML []byte `json:"config_yaml"`

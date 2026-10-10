@@ -1,28 +1,48 @@
 # Install into an existing CLIProxyAPI deployment
 
-This guide adds the GitHub Copilot plugin to an existing official CLIProxyAPI deployment.
+This guide adds the GitHub Copilot plugin to an existing CLIProxyAPI deployment.
 It keeps the existing configuration, API keys, and providers.
-The plugin targets CLIProxyAPI `v8.0.23`, ABI version 1, on Linux `amd64`.
+The plugin uses the official CLIProxyAPI `v8.0.23` SDK and ABI version 1 on Linux `amd64`.
+Runtime requests also require the paired maintained host module selected by this repository's `go.mod`.
+The official v8.0.23 server lacks the required `host.payload.finalize` callback.
 
-## 1. Build the plugin
+## 1. Build the plugin and paired host
 
 ```bash
 git clone https://github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin.git
 cd cliproxyapi-copilot-plugin
-make build
+make prepare-runtime-host
 ```
 
-The resulting library is:
+This builds the plugin library and matching Linux `amd64` server from the
+versioned host replacement selected by `go.mod`.
+Docker Compose v2 is required because the build uses the `golang:1.27-bookworm`
+container.
+The outputs are:
 
 ```text
 build/plugins/linux/amd64/cliproxyapi-copilot.so
+.cache/native-host/linux/amd64/cli-proxy-api
 ```
+
+Check the selected module identity with:
+
+```bash
+go list -mod=readonly -m -json github.com/router-for-me/CLIProxyAPI/v8
+```
+
+Use the `Replace.Path` and `Replace.Version` fields as the required host source.
+The release archive records the same selected identity in
+`cliproxyapi-copilot.host-requirements.json` alongside the required
+`host.payload.finalize` callback.
+The JSON is deployment metadata.
+The plugin loader does not read it or replace the server automatically.
 
 The filename is significant: CLIProxyAPI derives the plugin ID
 `cliproxyapi-copilot` from it. Do not rename the library unless the matching key
 under `plugins.configs` is also renamed.
 
-## 2. Install the library
+## 2. Install the plugin and paired host
 
 CLIProxyAPI searches both `<plugins.dir>/linux/amd64` and `<plugins.dir>`.
 Using the platform-specific directory avoids loading an incompatible binary.
@@ -40,6 +60,20 @@ sudo install -m 0755 \
 
 The CLIProxyAPI process must be able to read the library. Use a different
 absolute directory if `/opt/cliproxyapi` does not match the deployment.
+Install the matching server beside the existing binary, then configure the
+service to launch it during a planned deployment update.
+Keep the current binary as the rollback copy.
+
+```bash
+sudo install -d -m 0755 /opt/cliproxyapi/bin
+sudo install -m 0755 \
+  .cache/native-host/linux/amd64/cli-proxy-api \
+  /opt/cliproxyapi/bin/cli-proxy-api-copilot
+```
+
+Update the service's executable path to
+`/opt/cliproxyapi/bin/cli-proxy-api-copilot`, then restart CLIProxyAPI using
+the deployment's normal service procedure.
 
 ### Docker or Docker Compose
 
@@ -52,16 +86,28 @@ install -m 0755 \
   /path/to/cliproxyapi/plugins/linux/amd64/cliproxyapi-copilot.so
 ```
 
-Mount that directory into the existing container:
+Copy the paired host binary to a persistent host path:
+
+```bash
+install -d -m 0755 /path/to/cliproxyapi/bin
+install -m 0755 \
+  .cache/native-host/linux/amd64/cli-proxy-api \
+  /path/to/cliproxyapi/bin/cli-proxy-api-copilot
+```
+
+Mount the plugin directory and paired server into the existing container:
 
 ```yaml
 services:
   cliproxyapi:
     volumes:
       - /path/to/cliproxyapi/plugins:/CLIProxyAPI/plugins:ro
+      - /path/to/cliproxyapi/bin/cli-proxy-api-copilot:/CLIProxyAPI/CLIProxyAPI:ro
 ```
 
-Merge the mount into the existing service rather than replacing its current
+The server path above matches the official image used by this repository.
+Check the entrypoint path before using a different image.
+Merge both mounts into the existing service rather than replacing its current
 configuration and auth-volume mounts.
 
 ## 3. Merge the plugin configuration

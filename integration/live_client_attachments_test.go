@@ -49,12 +49,13 @@ func liveAttachmentFixturePath(name, override string) string {
 const attachmentExpectedReadablePDFPageSHA256 = "0ab5e7e997a5eecf128d90494e111a00c6e9e79ccee690e280cd7e7fa8187b54"
 
 type liveAttachmentCase struct {
-	cell      string
-	client    string
-	model     string
-	media     string
-	fixture   string
-	modelPath string
+	cell        string
+	client      string
+	model       string
+	media       string
+	fixture     string
+	modelPath   string
+	imageDetail string
 }
 
 type liveAttachmentCLI struct {
@@ -80,6 +81,7 @@ type liveAttachmentEvidence struct {
 	PublicEndpoint        bool   `json:"public_endpoint"`
 	PublicMedia           bool   `json:"public_media"`
 	PublicMediaSHA256     string `json:"public_media_sha256,omitempty"`
+	PublicMediaDetail     string `json:"public_media_detail,omitempty"`
 	PublicMediaCount      int    `json:"public_media_count,omitempty"`
 	PublicReadArgsSHA256  string `json:"public_read_args_sha256,omitempty"`
 	PublicReadCount       int    `json:"public_read_count,omitempty"`
@@ -93,6 +95,7 @@ type liveAttachmentEvidence struct {
 	RendererSHA256        string `json:"renderer_sha256,omitempty"`
 	IngressPrepared       bool   `json:"original_client_prepared"`
 	IngressMediaSHA256    string `json:"original_client_media_sha256,omitempty"`
+	IngressMediaDetail    string `json:"original_client_media_detail,omitempty"`
 	IngressMediaCount     int    `json:"original_client_media_count,omitempty"`
 	IngressReadArgsSHA256 string `json:"original_client_read_args_sha256,omitempty"`
 	IngressReadCount      int    `json:"original_client_read_count,omitempty"`
@@ -105,8 +108,8 @@ func liveAttachmentCases() []liveAttachmentCase {
 	return []liveAttachmentCase{
 		{cell: "claude-gpt-png", client: "claude", model: "gpt-6-luna", media: "png", fixture: attachmentPNG, modelPath: "/responses"},
 		{cell: "claude-gpt-pdf", client: "claude", model: "gpt-6-luna", media: "pdf", fixture: attachmentPDF, modelPath: "/responses"},
-		{cell: "codex-claude-png", client: "codex", model: "claude-haiku-5.5", media: "png", fixture: attachmentPNG, modelPath: "/v1/messages"},
-		{cell: "codex-claude-pdf", client: "codex", model: "claude-haiku-5.5", media: "pdf", fixture: attachmentPDF, modelPath: "/v1/messages"},
+		{cell: "codex-claude-png", client: "codex", model: "claude-haiku-5.5", media: "png", fixture: attachmentPNG, modelPath: "/chat/completions", imageDetail: "high"},
+		{cell: "codex-claude-pdf", client: "codex", model: "claude-haiku-5.5", media: "pdf", fixture: attachmentPDF, modelPath: "/chat/completions", imageDetail: "high"},
 	}
 }
 
@@ -162,6 +165,10 @@ func liveAttachmentOperationCell(candidate liveAttachmentCase, attempt string) (
 }
 
 func liveAttachmentPreparedPublicRequest(cell, path string, body []byte) bool {
+	return liveAttachmentPreparedPublicRequestForFixture(cell, path, body, "")
+}
+
+func liveAttachmentPreparedPublicRequestForFixture(cell, path string, body []byte, fixturePath string) bool {
 	if !liveAttachmentGateCell(cell) || path == "/copilot_internal/v2/token" || path == "/models" {
 		return true
 	}
@@ -170,8 +177,26 @@ func liveAttachmentPreparedPublicRequest(cell, path string, body []byte) bool {
 		if candidate.cell != name {
 			continue
 		}
+		if candidate.client == "codex" && candidate.media == "pdf" {
+			if fixturePath != "" {
+				candidate.fixture = fixturePath
+			}
+			switch path {
+			case "/v1/messages":
+				return liveAttachmentMessagesRequest(body, candidate)
+			case "/chat/completions":
+				_, ok := liveAttachmentChatRequest(body, candidate)
+				return ok
+			default:
+				return false
+			}
+		}
 		if path != candidate.modelPath {
 			return false
+		}
+		if candidate.modelPath == "/chat/completions" {
+			_, ok := liveAttachmentChatRequest(body, candidate)
+			return ok
 		}
 		var request map[string]any
 		if json.Unmarshal(body, &request) != nil || request["model"] != candidate.model {
@@ -200,6 +225,13 @@ func liveAttachmentExpectedModel(cell string) string {
 	return ""
 }
 
+func liveAttachmentExpectedPublicEndpoints(candidate liveAttachmentCase) []string {
+	if candidate.client == "codex" && candidate.media == "pdf" {
+		return []string{"/v1/messages", "/chat/completions"}
+	}
+	return []string{candidate.modelPath}
+}
+
 func liveAttachmentSelectedCases(selection string) ([]liveAttachmentCase, error) {
 	cases := liveAttachmentCases()
 	if selection == "" {
@@ -224,41 +256,59 @@ func liveAttachmentSelectedCases(selection string) ([]liveAttachmentCase, error)
 
 func liveAttachmentChangedCondition(candidate liveAttachmentCase) string {
 	switch candidate.cell {
+	case "claude-gpt-png":
+		return "refreshed dependencies and matched CPA host; original Claude Code Read image path and fixture bytes"
 	case "codex-claude-png":
-		return "CPA v8.0.23 host and explicit optional cached-only search exclusion; original high image detail remains unchanged"
+		return "refreshed dependencies and catalog-advertised same-model Chat routing preserve original Codex high image detail"
 	case "codex-claude-pdf":
-		return "CPA v8.0.23 host and explicit optional cached-only search exclusion; existing renderer and fonts with the original workspace-write CLI profile"
+		return "latest supported dependencies and matched CPA host; original workspace-write sandbox applies directly without the nested external Seatbelt wrapper"
 	case "claude-gpt-pdf":
-		return "bound existing LibreOffice Fontconfig Helvetica resources and verified the original PDF Read JPEG page in the isolated child environment"
+		return "refreshed dependencies and matched CPA host with existing Fontconfig resources; original Claude Code PDF Read JPEG page"
 	default:
 		return "none"
 	}
 }
 
+func liveAttachmentClientExecutable(candidate liveAttachmentCase, path string, args ...string) (string, []string) {
+	if candidate.client == "codex" && candidate.media == "pdf" {
+		return path, args
+	}
+	return livePacketExecutable(path, args...)
+}
+
+func liveAttachmentClientSandbox(candidate liveAttachmentCase) string {
+	if candidate.client == "codex" && candidate.media == "pdf" {
+		return "native_codex_workspace_write"
+	}
+	return "outer_loopback_seatbelt"
+}
+
 func liveAttachmentRunCLI(t *testing.T, candidate liveAttachmentCase, base, root string) liveAttachmentCLI {
+	t.Helper()
+	return liveAttachmentRunCLIIsolated(t, candidate, base, root, root, root)
+}
+
+func liveAttachmentRunCLIIsolated(t *testing.T, candidate liveAttachmentCase, base, home, workspace, temp string) liveAttachmentCLI {
 	t.Helper()
 	path, err := exec.LookPath(candidate.client)
 	if err != nil {
 		t.Fatal("required original client is unavailable")
 	}
-	args, err := liveAttachmentArgs(candidate, root)
+	args, err := liveAttachmentArgs(candidate, workspace)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if candidate.client == "codex" {
-		if err := os.WriteFile(filepath.Join(root, "config.toml"), []byte(liveAttachmentCodexConfiguration(base)), 0600); err != nil {
+		if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(liveAttachmentCodexConfiguration(base)), 0600); err != nil {
 			t.Fatal("could not write isolated Codex config")
 		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
-	commandPath, commandArgs := livePacketExecutable(path, args...)
+	commandPath, commandArgs := liveAttachmentClientExecutable(candidate, path, args...)
 	command := exec.CommandContext(ctx, commandPath, commandArgs...)
-	command.Dir = root
-	if candidate.client == "claude" {
-		command.Dir = filepath.Dir(candidate.fixture)
-	}
-	command.Env = liveAttachmentEnvironment(candidate, base, root)
+	command.Dir = workspace
+	command.Env = liveAttachmentIsolatedEnvironment(candidate, base, home, workspace, temp)
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	command.Cancel = func() error { return syscall.Kill(-command.Process.Pid, syscall.SIGKILL) }
 	command.WaitDelay = 5 * time.Second
@@ -294,6 +344,57 @@ func liveAttachmentEnvironment(candidate liveAttachmentCase, base, root string) 
 	}
 	env = append(env, "FONTCONFIG_PATH="+attachmentMaintainedFonts, "FONTCONFIG_FILE="+filepath.Join(attachmentMaintainedFonts, "fonts.conf"))
 	return env
+}
+
+func liveAttachmentIsolatedEnvironment(candidate liveAttachmentCase, base, home, workspace, temp string) []string {
+	env := liveCLIEnvironment(candidate.client, base, home)
+	for index, value := range env {
+		if strings.HasPrefix(value, "TMPDIR=") {
+			env[index] = "TMPDIR=" + temp
+		}
+		if candidate.client == "codex" && candidate.media == "pdf" && strings.HasPrefix(value, "XDG_CACHE_HOME=") {
+			env[index] = "XDG_CACHE_HOME=" + filepath.Join(workspace, ".cache")
+		}
+	}
+	if candidate.media != "pdf" {
+		return env
+	}
+	for index, value := range env {
+		if strings.HasPrefix(value, "PATH=") {
+			env[index] = "PATH=" + filepath.Dir(attachmentMaintainedPoppler) + string(os.PathListSeparator) + strings.TrimPrefix(value, "PATH=")
+			break
+		}
+	}
+	return append(env, "FONTCONFIG_PATH="+attachmentMaintainedFonts, "FONTCONFIG_FILE="+filepath.Join(attachmentMaintainedFonts, "fonts.conf"))
+}
+
+func liveAttachmentStageFixture(t *testing.T, source, workspace string) string {
+	t.Helper()
+	original, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal("original client attachment fixture could not be read")
+	}
+	staged := filepath.Join(workspace, filepath.Base(source))
+	file, err := os.OpenFile(staged, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		t.Fatal("could not stage the original attachment in the isolated client workspace")
+	}
+	written, writeErr := file.Write(original)
+	syncErr := file.Sync()
+	closeErr := file.Close()
+	if writeErr != nil || written != len(original) || syncErr != nil || closeErr != nil {
+		t.Fatal("staged original attachment could not be saved exactly")
+	}
+	stagedBytes, err := os.ReadFile(staged)
+	if err != nil || !bytes.Equal(original, stagedBytes) {
+		t.Fatal("staged client attachment does not match the original bytes")
+	}
+	originalHash := sha256.Sum256(original)
+	stagedHash := sha256.Sum256(stagedBytes)
+	if originalHash != stagedHash {
+		t.Fatal("staged client attachment SHA256 differs from the original")
+	}
+	return staged
 }
 
 func liveAttachmentPathValue(env []string) string {
@@ -457,6 +558,13 @@ func TestLiveCrossClientAttachmentsPacket(t *testing.T) {
 	if _, err := validateFreshPublicCatalog(publicCatalog); err != nil {
 		t.Fatal("fresh public catalog was invalid")
 	}
+	for _, candidate := range selected {
+		for _, endpoint := range liveAttachmentExpectedPublicEndpoints(candidate) {
+			if !liveFreshCatalogAdvertisesEndpoint(publicCatalog, candidate.model, endpoint) {
+				t.Fatalf("fresh public catalog does not advertise %s for the exact model %s", endpoint, candidate.model)
+			}
+		}
+	}
 	catalogHash := sha256.Sum256(publicCatalog)
 	livePacketWriteJSON(t, packetDirectory, "startup.json", map[string]any{"public_origin": origin, "catalog_sha256": hex.EncodeToString(catalogHash[:]), "gate_directory": gate.directory})
 	for _, candidate := range selected {
@@ -498,11 +606,31 @@ func liveRunAttachmentCase(t *testing.T, gate *liveServerToolGate, base, packetD
 	if err != nil || os.Chmod(caseDirectory, 0700) != nil {
 		t.Fatal("could not create private case evidence directory")
 	}
-	root := filepath.Join(caseDirectory, "client-home")
-	if err := os.MkdirAll(root, 0700); err != nil || os.Chmod(root, 0700) != nil {
-		t.Fatal("could not create retained isolated client home")
+	home := filepath.Join(caseDirectory, "client-home")
+	workspace := filepath.Join(caseDirectory, "client-workspace")
+	temp := filepath.Join(caseDirectory, "client-tmp")
+	for _, path := range []string{home, workspace, temp} {
+		if err := os.MkdirAll(path, 0700); err != nil || os.Chmod(path, 0700) != nil {
+			t.Fatal("could not create isolated client home, workspace, or temporary directory")
+		}
 	}
-	args, err := liveAttachmentArgs(candidate, root)
+	originalFixture := candidate.fixture
+	candidate.fixture = liveAttachmentStageFixture(t, originalFixture, workspace)
+	if candidate.client == "codex" && candidate.media == "pdf" {
+		fontconfigCache := filepath.Join(workspace, ".cache", "fontconfig")
+		if err := os.MkdirAll(fontconfigCache, 0700); err != nil || os.Chmod(fontconfigCache, 0700) != nil {
+			t.Fatal("could not create writable workspace Fontconfig cache for native Codex PDF rendering")
+		}
+		probe := filepath.Join(fontconfigCache, ".write-probe")
+		if err := os.WriteFile(probe, []byte("workspace-write"), 0600); err != nil {
+			t.Fatal("native Codex Fontconfig cache is not writable inside its workspace")
+		}
+		if err := os.Remove(probe); err != nil {
+			t.Fatal("native Codex Fontconfig cache write probe could not be cleaned up")
+		}
+	}
+	gate.setAttachmentFixture(cell, candidate.fixture)
+	args, err := liveAttachmentArgs(candidate, workspace)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -510,22 +638,22 @@ func liveRunAttachmentCase(t *testing.T, gate *liveServerToolGate, base, packetD
 	if captureErr != nil || livePacketDeniedCount(gate) != 0 || !livePacketCatalogHasModel(readinessFromGate(t, gate), candidate.model) {
 		t.Fatal("candidate lost exact model or capture readiness")
 	}
-	livePacketWriteJSON(t, caseDirectory, "claim.json", map[string]any{"cell": cell, "prior_cell": "X/" + candidate.cell, "attempt": attempt, "changed_condition": liveAttachmentChangedCondition(candidate), "client": candidate.client, "model": candidate.model, "media": candidate.media, "original_fixture": candidate.fixture, "original_cli_args": args, "requested_effort": "medium", "expected_public_path": candidate.modelPath, "inference_before": before, "renderer_executable": map[bool]string{true: attachmentMaintainedPoppler, false: ""}[candidate.media == "pdf"], "renderer_sha256": rendererSHA, "fontconfig_file": map[bool]string{true: filepath.Join(attachmentMaintainedFonts, "fonts.conf"), false: ""}[candidate.media == "pdf"], "isolated_child_path": liveAttachmentPathValue(liveAttachmentEnvironment(candidate, base, root))})
+	livePacketWriteJSON(t, caseDirectory, "claim.json", map[string]any{"cell": cell, "prior_cell": "X/" + candidate.cell, "attempt": attempt, "changed_condition": liveAttachmentChangedCondition(candidate), "client": candidate.client, "model": candidate.model, "media": candidate.media, "original_fixture": originalFixture, "original_fixture_sha256": livePacketFileSHA256(t, originalFixture), "staged_fixture": candidate.fixture, "staged_fixture_sha256": livePacketFileSHA256(t, candidate.fixture), "client_home": home, "client_workspace": workspace, "client_tmp": temp, "client_sandbox": liveAttachmentClientSandbox(candidate), "original_cli_args": args, "requested_effort": "medium", "expected_public_path": candidate.modelPath, "expected_public_paths": liveAttachmentExpectedPublicEndpoints(candidate), "inference_before": before, "renderer_executable": map[bool]string{true: attachmentMaintainedPoppler, false: ""}[candidate.media == "pdf"], "renderer_sha256": rendererSHA, "fontconfig_file": map[bool]string{true: filepath.Join(attachmentMaintainedFonts, "fonts.conf"), false: ""}[candidate.media == "pdf"], "isolated_child_path": liveAttachmentPathValue(liveAttachmentIsolatedEnvironment(candidate, base, home, workspace, temp))})
 	phase, name, _ := strings.Cut(cell, "/")
 	if err := gate.setPhaseCell(phase, name); err != nil {
 		t.Fatal(err)
 	}
 	ingress := newLiveAttachmentIngress(t, gate, base, filepath.Join(caseDirectory, "original-client-hop"), candidate.client)
 	gate.setFreshClaim("inference", cell)
-	result := liveAttachmentRunCLI(t, candidate, ingress.URL(), root)
+	result := liveAttachmentRunCLIIsolated(t, candidate, ingress.URL(), home, workspace, temp)
 	gate.clearFreshInferenceClaim(cell)
 	ingress.Close()
 	liveAttachmentCaptureCLI(t, caseDirectory, candidate, result)
 	after, total, auth, catalog, captureErr := gate.countsFor(cell)
-	evidence := inspectLiveAttachmentEvidence(t, gate, candidate, cell, result)
 	ingressCaptures, ingressReadErr := ingress.captures()
 	ingressDenials, ingressFailure := ingress.state()
 	ingressCaptureFailure, ingressRefusalStatus := ingress.failureState()
+	evidence := inspectLiveAttachmentEvidence(t, gate, candidate, cell, result, ingressCaptures)
 	inspectLiveOriginalClientAttachment(candidate, ingressCaptures, &evidence)
 	evidence.PhysicalInference = after - before
 	needsTool := candidate.client == "claude" || candidate.media == "pdf"
@@ -539,6 +667,9 @@ func liveRunAttachmentCase(t *testing.T, gate *liveServerToolGate, base, packetD
 }
 
 func liveAttachmentMediaPrepared(candidate liveAttachmentCase, evidence liveAttachmentEvidence) bool {
+	if candidate.modelPath == "/chat/completions" && candidate.client == "codex" {
+		return evidence.IngressMediaDetail != "" && evidence.IngressMediaDetail == evidence.PublicMediaDetail && (candidate.imageDetail == "" || evidence.PublicMediaDetail == candidate.imageDetail) && (evidence.SourcePreparedEqual || candidate.media == "pdf")
+	}
 	if evidence.SourcePreparedEqual {
 		return true
 	}
@@ -594,7 +725,7 @@ func readinessFromGate(t *testing.T, gate *liveServerToolGate) []byte {
 	return nil
 }
 
-func inspectLiveAttachmentEvidence(t *testing.T, gate *liveServerToolGate, candidate liveAttachmentCase, cell string, client liveAttachmentCLI) liveAttachmentEvidence {
+func inspectLiveAttachmentEvidence(t *testing.T, gate *liveServerToolGate, candidate liveAttachmentCase, cell string, client liveAttachmentCLI, ingress ...[]liveAttachmentIngressCapture) liveAttachmentEvidence {
 	t.Helper()
 	evidence := inspectLiveAttachmentClient(candidate, client.stdout)
 	entries, err := os.ReadDir(gate.directory)
@@ -605,8 +736,14 @@ func inspectLiveAttachmentEvidence(t *testing.T, gate *liveServerToolGate, candi
 	requestResults := make(map[string]bool)
 	requestCommandSuccess := make(map[string]bool)
 	toolInputs := make(map[string]map[string]any)
+	originalCalls := make(map[string]liveAttachmentCapturedToolCall)
+	if len(ingress) > 0 {
+		originalCalls = liveAttachmentOriginalResponsesToolCalls(ingress[0])
+	}
 	publicReadArguments := make(map[string]string)
 	publicMediaHashes := make(map[string]bool)
+	publicMediaDetails := make(map[string]string)
+	publicMediaDetailConflict := false
 	allModel, allEffort, allEndpoint, allStreamsClean, allStreamsProven, sawDispatch := true, true, true, true, true, false
 	rendererRoot := ""
 	for index, arg := range client.args {
@@ -627,11 +764,19 @@ func inspectLiveAttachmentEvidence(t *testing.T, gate *liveServerToolGate, candi
 			continue
 		}
 		sawDispatch = true
-		allEndpoint = allEndpoint && strings.HasSuffix(capture.PublicRequest.URL, candidate.modelPath)
+		evidence.PhysicalInference++
+		publicPath := liveAttachmentPublicPath(capture.PublicRequest.URL)
+		allEndpoint = allEndpoint && liveAttachmentPreparedPublicRequestForFixture("X/"+candidate.cell, publicPath, []byte(capture.PublicRequest.Body), candidate.fixture)
 		var request map[string]any
 		parsed := json.Unmarshal([]byte(capture.PublicRequest.Body), &request) == nil
 		allModel = allModel && parsed && request["model"] == candidate.model
-		if candidate.client == "claude" {
+		var chatRequest liveAttachmentChatRequestEvidence
+		chatRequestValid := false
+		if publicPath == "/chat/completions" {
+			chatRequest, chatRequestValid = liveAttachmentChatRequest([]byte(capture.PublicRequest.Body), candidate)
+			allModel = allModel && chatRequestValid && chatRequest.Model == candidate.model
+			allEffort = allEffort && chatRequestValid && chatRequest.Effort == "medium"
+		} else if candidate.client == "claude" {
 			reasoning, _ := request["reasoning"].(map[string]any)
 			allEffort = allEffort && reasoning["effort"] == "medium"
 		} else {
@@ -648,6 +793,44 @@ func inspectLiveAttachmentEvidence(t *testing.T, gate *liveServerToolGate, candi
 		}
 		requestHadPriorToolResult := false
 		requestHadRequiredToolResult := false
+		chatCarrierNames := map[string]string(nil)
+		if chatRequestValid && candidate.client == "codex" && candidate.media == "pdf" && len(ingress) > 0 {
+			messagesCalls := make(map[string]liveAttachmentCapturedToolCall, len(responseCalls))
+			for id, name := range responseCalls {
+				messagesCalls[id] = liveAttachmentCapturedToolCall{ItemID: "fc_" + id, CallID: id, Name: name, Arguments: toolInputs[id]}
+			}
+			var correlated bool
+			chatCarrierNames, correlated = liveAttachmentChatHistoryCorrelations(chatRequest, originalCalls, messagesCalls)
+			allEndpoint = allEndpoint && correlated
+			for _, call := range chatRequest.ToolCalls {
+				name := chatCarrierNames[call.ID]
+				if name != "" {
+					responseCalls[call.ID] = name
+					toolInputs[call.ID] = call.Arguments
+				}
+			}
+		}
+		if chatRequestValid {
+			for _, image := range chatRequest.Images {
+				publicMediaHashes[image.SHA256] = true
+				if previous, exists := publicMediaDetails[image.SHA256]; exists && previous != image.Detail {
+					publicMediaDetailConflict = true
+				}
+				publicMediaDetails[image.SHA256] = image.Detail
+			}
+			for _, result := range chatRequest.ToolResults {
+				id := result.ID
+				if id == "" {
+					continue
+				}
+				callName := responseCalls[id]
+				success := liveChatAttachmentToolResultSucceeded(result, callName, candidate)
+				requestResults[id] = success
+				requestCommandSuccess[id] = success
+				requestHadPriorToolResult = requestHadPriorToolResult || callName != "" && success
+				requestHadRequiredToolResult = requestHadRequiredToolResult || candidate.client == "codex" && candidate.media == "pdf" && callName == "view_image" && success
+			}
+		}
 		walkAttachmentJSON(request, func(item map[string]any) {
 			typeName, _ := item["type"].(string)
 			if typeName == "input_image" || typeName == "input_file" || typeName == "image" || typeName == "document" {
@@ -682,43 +865,62 @@ func inspectLiveAttachmentEvidence(t *testing.T, gate *liveServerToolGate, candi
 				}
 			}
 		})
-		for _, event := range attachmentStreamObjects(capture.Response.Body) {
-			walkAttachmentJSON(event, func(item map[string]any) {
-				typeName, _ := item["type"].(string)
-				if typeName != "function_call" && typeName != "tool_use" {
-					return
-				}
-				if event["type"] == "content_block_start" && typeName == "tool_use" {
-					return
-				}
-				id := attachmentString(item, "call_id", "id")
-				name := attachmentString(item, "name")
-				if id != "" && name != "" {
-					responseCalls[id] = name
-					if input, ok := item["input"].(map[string]any); ok {
-						toolInputs[id] = input
-					} else if rawArguments, ok := item["arguments"].(string); ok {
-						var input map[string]any
-						if json.Unmarshal([]byte(rawArguments), &input) == nil {
-							toolInputs[id] = input
-						}
-					}
-					if name == "Read" || name == "view_image" || name == "exec_command" || name == "shell_command" {
+		if publicPath == "/chat/completions" {
+			stream, valid := liveChatCompletionStream([]byte(capture.Response.Body), candidate.model)
+			if valid {
+				for _, call := range stream.ToolCalls {
+					responseCalls[call.ID] = call.Name
+					toolInputs[call.ID] = call.Arguments
+					if call.Name == "Read" || call.Name == "view_image" || call.Name == "exec_command" || call.Name == "shell_command" {
 						evidence.PublicToolCall = true
 					}
-					if candidate.cell == "claude-gpt-pdf" && name == "Read" {
-						publicReadArguments[id] = liveAttachmentArgumentSHA256(toolInputs[id])
+					if candidate.cell == "claude-gpt-pdf" && call.Name == "Read" {
+						publicReadArguments[call.ID] = liveAttachmentArgumentSHA256(call.Arguments)
 					}
 				}
-			})
+			}
+		} else {
+			for _, event := range attachmentStreamObjects(capture.Response.Body) {
+				walkAttachmentJSON(event, func(item map[string]any) {
+					typeName, _ := item["type"].(string)
+					if typeName != "function_call" && typeName != "tool_use" {
+						return
+					}
+					if event["type"] == "content_block_start" && typeName == "tool_use" {
+						return
+					}
+					id := attachmentString(item, "call_id", "id")
+					name := attachmentString(item, "name")
+					if id != "" && name != "" {
+						responseCalls[id] = name
+						if input, ok := item["input"].(map[string]any); ok {
+							toolInputs[id] = input
+						} else if rawArguments, ok := item["arguments"].(string); ok {
+							var input map[string]any
+							if json.Unmarshal([]byte(rawArguments), &input) == nil {
+								toolInputs[id] = input
+							}
+						}
+						if name == "Read" || name == "view_image" || name == "exec_command" || name == "shell_command" {
+							evidence.PublicToolCall = true
+						}
+						if candidate.cell == "claude-gpt-pdf" && name == "Read" {
+							publicReadArguments[id] = liveAttachmentArgumentSHA256(toolInputs[id])
+						}
+					}
+				})
+			}
 		}
 		needsTool := candidate.client == "claude" || candidate.media == "pdf"
-		evidence.PublicTerminal = evidence.PublicTerminal || liveCaptureStreamProven(capture, candidate.model) && attachmentResponseCompleted(capture.Response.Body, candidate) && (!needsTool || requestHadPriorToolResult && requestHadRequiredToolResult)
+		evidence.PublicTerminal = evidence.PublicTerminal || liveCaptureStreamProven(capture, candidate.model) && liveAttachmentCapturedResponseCompleted(capture.Response.Body, candidate, publicPath) && (!needsTool || requestHadPriorToolResult && requestHadRequiredToolResult)
 	}
 	if len(publicMediaHashes) == 1 {
 		evidence.PublicMedia = true
 		for hash := range publicMediaHashes {
 			evidence.PublicMediaSHA256 = hash
+			if !publicMediaDetailConflict {
+				evidence.PublicMediaDetail = publicMediaDetails[hash]
+			}
 		}
 	}
 	for id, name := range responseCalls {
@@ -787,6 +989,8 @@ func liveCaptureStreamProven(capture liveServerToolCapture, expectedModel string
 	}
 	terminal := false
 	switch {
+	case strings.HasSuffix(capture.PublicRequest.URL, "/chat/completions"):
+		_, terminal = liveChatCompletionStream([]byte(capture.Response.Body), expectedModel)
 	case strings.HasSuffix(capture.PublicRequest.URL, "/responses"):
 		terminal = liveCompleteResponseTerminal([]byte(capture.Response.Body), expectedModel)
 	case strings.HasSuffix(capture.PublicRequest.URL, "/v1/messages"):
@@ -821,12 +1025,12 @@ func liveCompleteMessagesTerminal(body []byte, expectedModel string) bool {
 		closed       bool
 	}
 	blocks := make(map[int]*blockState)
-	started, delta, stopped, meaningful := false, false, false, false
+	started, delta, stopped, meaningful, done := false, false, false, false, false
 	for _, frame := range bytes.Split(normalized, []byte("\n\n")) {
 		if len(bytes.TrimSpace(frame)) == 0 {
 			continue
 		}
-		if stopped {
+		if done {
 			return false
 		}
 		var eventName, data string
@@ -839,6 +1043,13 @@ func liveCompleteMessagesTerminal(body []byte, expectedModel string) bool {
 				}
 				data = strings.TrimSpace(string(bytes.TrimPrefix(line, []byte("data:"))))
 			}
+		}
+		if data == "[DONE]" && eventName == "" && stopped {
+			done = true
+			continue
+		}
+		if stopped {
+			return false
 		}
 		var event map[string]any
 		if eventName == "" || data == "" || json.Unmarshal([]byte(data), &event) != nil || event["type"] != eventName || event["error"] != nil {
@@ -884,8 +1095,8 @@ func liveCompleteMessagesTerminal(body []byte, expectedModel string) bool {
 					state.text = true
 				}
 			} else if state.kind == "tool_use" && detail["type"] == "input_json_delta" {
-				partial := attachmentString(detail, "partial_json")
-				if partial == "" || state.inputDelta.Len()+len(partial) > 1<<20 {
+				partial, ok := detail["partial_json"].(string)
+				if !ok || state.inputDelta.Len()+len(partial) > 1<<20 {
 					return false
 				}
 				state.inputDelta.WriteString(partial)
@@ -1095,7 +1306,7 @@ func liveAttachmentCommandOutputSuccess(item map[string]any) bool {
 		}
 	}
 	output := strings.TrimSpace(attachmentString(item, "output", "content"))
-	return strings.HasPrefix(output, "Process exited with code 0\n") || output == "Process exited with code 0"
+	return strings.HasPrefix(output, "Process exited with code 0\n") || output == "Process exited with code 0" || liveAttachmentPDFRenderOutput(output)
 }
 
 func liveAttachmentRendererPrefix(command, source, root string) (string, bool) {
@@ -1103,17 +1314,13 @@ func liveAttachmentRendererPrefix(command, source, root string) (string, bool) {
 		return "", false
 	}
 	parts := strings.Fields(command)
-	if len(parts) < 4 || filepath.Base(parts[0]) != "pdftoppm" {
+	if len(parts) != 4 && len(parts) != 7 && len(parts) != 8 || filepath.Base(parts[0]) != "pdftoppm" || parts[1] != "-png" || parts[2] != source {
 		return "", false
 	}
-	png := false
-	for _, part := range parts[1:] {
-		png = png || part == "-png"
-	}
-	if !png || parts[len(parts)-2] != source {
+	if len(parts) == 7 && (parts[4] != "&&" || parts[5] != "ls" || parts[6] != "-la") || len(parts) == 8 && (parts[4] != "&&" || parts[5] != "ls" || parts[6] != "-la" || parts[7] != "page*") {
 		return "", false
 	}
-	prefix := parts[len(parts)-1]
+	prefix := parts[3]
 	if !filepath.IsAbs(prefix) {
 		prefix = filepath.Join(root, prefix)
 	}
@@ -1205,6 +1412,8 @@ func inspectLiveOriginalClientAttachment(candidate liveAttachmentCase, captures 
 	evidence.SourceSHA256 = hex.EncodeToString(sourceHash[:])
 	allIdentity := len(captures) > 0
 	mediaHashes := make(map[string]bool)
+	mediaDetails := make(map[string]string)
+	mediaDetailConflict := false
 	readCalls := make(map[string]bool)
 	readPDFPageCalls := make(map[string]bool)
 	readArguments := make(map[string]string)
@@ -1219,7 +1428,9 @@ func inspectLiveOriginalClientAttachment(candidate liveAttachmentCase, captures 
 		requestURL, urlErr := url.Parse(capture.Request.URL)
 		var request map[string]any
 		parsed := json.Unmarshal([]byte(capture.Request.Body), &request) == nil
-		confirmedCancellation := capture.StreamOutcome == "semantic_complete_function_call_downstream_cancelled" && liveCompleteResponseFunctionCallTerminal([]byte(capture.Response.Body), candidate.model) && liveAttachmentIngressSemanticCancellation(capture, context.Canceled, context.Canceled)
+		confirmedFunctionCallCancellation := capture.StreamOutcome == "semantic_complete_function_call_downstream_cancelled" && liveCompleteResponseFunctionCallTerminal([]byte(capture.Response.Body), candidate.model) && liveAttachmentIngressSemanticCancellation(capture, context.Canceled, context.Canceled)
+		confirmedTextTerminalCancellation := capture.StreamOutcome == "semantic_complete_text_terminal_downstream_cancelled" && liveCompleteResponseTextTerminal([]byte(capture.Response.Body), candidate.model) && liveAttachmentIngressTextTerminalCancellation(capture, context.Canceled, context.Canceled)
+		confirmedCancellation := confirmedFunctionCallCancellation || confirmedTextTerminalCancellation
 		allIdentity = allIdentity && capture.Dispatched && capture.BodyComplete && (capture.ErrorClass == "" || confirmedCancellation) && urlErr == nil && requestURL.Path == path && parsed && request["model"] == candidate.model
 		if candidate.client == "claude" {
 			config, _ := request["output_config"].(map[string]any)
@@ -1262,6 +1473,13 @@ func inspectLiveOriginalClientAttachment(candidate liveAttachmentCase, captures 
 				hash := sha256.Sum256(body)
 				digest := hex.EncodeToString(hash[:])
 				mediaHashes[digest] = true
+				if candidate.client == "codex" && media == "png" {
+					detail := liveAttachmentImageDetail(item)
+					if previous, exists := mediaDetails[digest]; exists && previous != detail {
+						mediaDetailConflict = true
+					}
+					mediaDetails[digest] = detail
+				}
 				if candidate.cell == "claude-gpt-pdf" {
 					evidence.IngressMediaCount++
 				}
@@ -1279,6 +1497,9 @@ func inspectLiveOriginalClientAttachment(candidate liveAttachmentCase, captures 
 	if len(mediaHashes) == 1 {
 		for hash := range mediaHashes {
 			evidence.IngressMediaSHA256 = hash
+			if !mediaDetailConflict {
+				evidence.IngressMediaDetail = mediaDetails[hash]
+			}
 		}
 	}
 	evidence.SourcePreparedEqual = evidence.SourceSHA256 == evidence.IngressMediaSHA256
@@ -1376,6 +1597,10 @@ func attachmentTokenCount(value any, positive bool) bool {
 }
 
 func attachmentResponseCompleted(body string, candidate liveAttachmentCase) bool {
+	if candidate.modelPath == "/chat/completions" {
+		stream, valid := liveChatCompletionStream([]byte(body), candidate.model)
+		return valid && stream.FinishReason == "stop" && strings.TrimSpace(stream.Text) != ""
+	}
 	events := attachmentStreamObjects(body)
 	if candidate.client == "claude" {
 		if !liveCompleteResponseTerminal([]byte(body), candidate.model) || len(events) == 0 {
@@ -1495,12 +1720,11 @@ func TestAttachmentPacketCodexUnknownSlugReachesLocalProvider(t *testing.T) {
 	var calls atomic.Int32
 	var valid atomic.Bool
 	fixture := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if request.Method == http.MethodPost && request.URL.Path == "/v1/responses" {
+		if request.Method == http.MethodPost && request.URL.Path == "/chat/completions" {
 			calls.Add(1)
 			var body map[string]any
 			if json.NewDecoder(request.Body).Decode(&body) == nil {
-				reasoning, _ := body["reasoning"].(map[string]any)
-				valid.Store(body["model"] == "claude-haiku-5.5" && reasoning["effort"] == "medium")
+				valid.Store(body["model"] == "claude-haiku-5.5" && body["reasoning_effort"] == "medium" && body["stream"] == true)
 			}
 		}
 		writer.Header().Set("Content-Type", "application/json")
@@ -1512,7 +1736,7 @@ func TestAttachmentPacketCodexUnknownSlugReachesLocalProvider(t *testing.T) {
 	result := liveAttachmentRunCLI(t, candidate, fixture.URL, t.TempDir())
 	if calls.Load() != 1 || !valid.Load() || result.exitCode == 0 {
 		words := regexp.MustCompile(`[A-Za-z]+`).FindAllString(string(result.stderr), 12)
-		t.Fatalf("isolated Codex did not prepare one exact-model medium-effort Responses request: calls=%d valid=%t exit=%d stderr_bytes=%d stdout_bytes=%d stderr_words=%q", calls.Load(), valid.Load(), result.exitCode, len(result.stderr), len(result.stdout), words)
+		t.Fatalf("isolated Codex did not prepare one exact-model medium-effort Chat request: calls=%d valid=%t exit=%d stderr_bytes=%d stdout_bytes=%d stderr_words=%q", calls.Load(), valid.Load(), result.exitCode, len(result.stderr), len(result.stdout), words)
 	}
 }
 
@@ -1741,8 +1965,18 @@ func TestAttachmentPacketStrictPublicTerminalAndRendererProvenance(t *testing.T)
 	if !ok || !liveAttachmentRendererOutputMatchesPrefix(prefix+"-1.png", map[string]bool{prefix: true}) || liveAttachmentRendererOutputMatchesPrefix(filepath.Join(root, "unrelated.png"), map[string]bool{prefix: true}) {
 		t.Fatal("renderer output was not bound to the owned command prefix")
 	}
+	for _, command := range []string{"pdftoppm -png " + attachmentPDF + " page && ls -la", "pdftoppm -png " + attachmentPDF + " page && ls -la page*"} {
+		if _, ok := liveAttachmentRendererPrefix(command, attachmentPDF, root); !ok {
+			t.Fatal("captured PDF renderer command with its bounded listing suffix was rejected")
+		}
+	}
 	if _, ok := liveAttachmentRendererPrefix("pdftoppm -png other.pdf page", attachmentPDF, root); ok {
 		t.Fatal("renderer for a different PDF passed")
+	}
+	for _, command := range []string{"pdftoppm -png " + attachmentPDF + " page && cat page-1.png", "pdftoppm -png " + attachmentPDF + " page && ls -la unrelated", "pdftoppm -png " + attachmentPDF + " page && ls -la page* extra"} {
+		if _, ok := liveAttachmentRendererPrefix(command, attachmentPDF, root); ok {
+			t.Fatal("unobserved or extended renderer command passed")
+		}
 	}
 	if liveAttachmentCommandOutputSuccess(map[string]any{"type": "function_call_output", "output": "Process exited with code 1\n"}) || liveAttachmentCommandOutputSuccess(map[string]any{"type": "tool_result", "is_error": true, "exit_code": float64(0)}) || !liveAttachmentCommandOutputSuccess(map[string]any{"type": "function_call_output", "output": "Process exited with code 0\nFinal output:\n"}) {
 		t.Fatal("public renderer success was not tied to a genuine zero exit")
@@ -1903,7 +2137,7 @@ func TestAttachmentPacketTerminalRequiresCompletedStatusUsageAndText(t *testing.
 			t.Fatal("unproven Responses terminal was accepted")
 		}
 	}
-	claude := liveAttachmentCases()[2]
+	claude := liveAttachmentCase{client: "codex", model: "claude-haiku-5.5", modelPath: "/v1/messages"}
 	message := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-haiku-5-5\",\"usage\":{\"input_tokens\":2}}}\n\n" +
 		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" +
 		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"top red bottom blue\"}}\n\n" +

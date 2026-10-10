@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -245,6 +246,27 @@ func (s *Service) endpointForModel(ctx context.Context, callbackID, authID strin
 		}
 	}
 	return "", upstreamModel{}, token, statusError("model_not_found", "Copilot model is not present in the authenticated model catalog", http.StatusNotFound)
+}
+
+func (s *Service) endpointForModelWithPayload(ctx context.Context, callbackID, authID string, storage authStorage, modelID, sourceFormat string, payload []byte) (string, upstreamModel, copilotTokenEntry, error) {
+	endpoint, model, token, err := s.endpointForModel(ctx, callbackID, authID, storage, modelID, sourceFormat)
+	if err != nil || s.endpointOverride(modelID) != "" || !model.Capabilities.Supports.Vision {
+		return endpoint, model, token, err
+	}
+	var detailErr *translate.UnsupportedImageDetailError
+	if err := translate.ValidateRequestAttachmentsForEndpoint(sourceFormat, endpoint, payload); !errors.As(err, &detailErr) {
+		return endpoint, model, token, nil
+	}
+	endpoints := normalizeEndpoints(model.SupportedEndpoints)
+	for _, candidate := range endpointPreferences(model, sourceFormat) {
+		if candidate == endpoint || !contains(endpoints, candidate) {
+			continue
+		}
+		if err := translate.ValidateRequestAttachmentsForEndpoint(sourceFormat, candidate, payload); err == nil {
+			return candidate, model, token, nil
+		}
+	}
+	return endpoint, model, token, nil
 }
 
 func availableModels(models []upstreamModel) []upstreamModel {

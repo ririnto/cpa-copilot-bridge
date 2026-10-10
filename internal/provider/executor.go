@@ -60,7 +60,7 @@ func (s *Service) Execute(ctx context.Context, req ExecuteRequest) (pluginapi.Ex
 	if v1Compact {
 		endpointFormat = "openai-response"
 	}
-	endpoint, model, token, errEndpoint := s.endpointForModel(ctx, req.HostCallbackID, req.AuthID, storage, req.Model, endpointFormat)
+	endpoint, model, token, errEndpoint := s.endpointForModelWithPayload(ctx, req.HostCallbackID, req.AuthID, storage, req.Model, endpointFormat, translationPayload)
 	if errEndpoint != nil {
 		return pluginapi.ExecutorResponse{}, errEndpoint
 	}
@@ -85,7 +85,7 @@ func (s *Service) Execute(ctx context.Context, req ExecuteRequest) (pluginapi.Ex
 	}
 	requestBody, errTranslate := translate.RequestForEndpointFrom(sourceFormat, req.Model, translationPayload, false, endpoint)
 	if errTranslate != nil {
-		return pluginapi.ExecutorResponse{}, statusError("translation_error", errTranslate.Error(), http.StatusUnprocessableEntity)
+		return pluginapi.ExecutorResponse{}, translationStatusError(errTranslate)
 	}
 	if endpoint == translate.EndpointMessages {
 		requestBody, errTranslate = normalizeClaudeMessagesRequest(model, sourceFormat, req.Payload, requestBody)
@@ -131,6 +131,10 @@ func (s *Service) Execute(ctx context.Context, req ExecuteRequest) (pluginapi.Ex
 		if errTranslate != nil {
 			return pluginapi.ExecutorResponse{}, statusError("translation_error", errTranslate.Error(), http.StatusUnprocessableEntity)
 		}
+	}
+	requestBody, errFinalize := s.finalizeModelRequest(ctx, req.HostCallbackID, endpoint, requestBody)
+	if errFinalize != nil {
+		return pluginapi.ExecutorResponse{}, errFinalize
 	}
 	resp, token, errDo := s.doModelRequest(ctx, req.HostCallbackID, req.AuthID, storage, token, endpoint, requestBody, false)
 	if errDo != nil {
@@ -215,7 +219,7 @@ func (s *Service) ExecuteStream(ctx context.Context, req ExecuteRequest) (http.H
 		headers.Set("Cache-Control", "no-cache")
 		return headers, nil
 	}
-	endpoint, model, token, errEndpoint := s.endpointForModel(ctx, req.HostCallbackID, req.AuthID, storage, req.Model, sourceFormat)
+	endpoint, model, token, errEndpoint := s.endpointForModelWithPayload(ctx, req.HostCallbackID, req.AuthID, storage, req.Model, sourceFormat, translationPayload)
 	if errEndpoint != nil {
 		return nil, errEndpoint
 	}
@@ -237,7 +241,7 @@ func (s *Service) ExecuteStream(ctx context.Context, req ExecuteRequest) (http.H
 	}
 	requestBody, errTranslate := translate.RequestForEndpointFrom(sourceFormat, req.Model, translationPayload, true, endpoint)
 	if errTranslate != nil {
-		return nil, statusError("translation_error", errTranslate.Error(), http.StatusUnprocessableEntity)
+		return nil, translationStatusError(errTranslate)
 	}
 	if endpoint == translate.EndpointMessages {
 		requestBody, errTranslate = normalizeClaudeMessagesRequest(model, sourceFormat, req.Payload, requestBody)
@@ -276,6 +280,10 @@ func (s *Service) ExecuteStream(ctx context.Context, req ExecuteRequest) (http.H
 		if errTranslate != nil {
 			return nil, statusError("translation_error", errTranslate.Error(), http.StatusUnprocessableEntity)
 		}
+	}
+	requestBody, errFinalize := s.finalizeModelRequest(ctx, req.HostCallbackID, endpoint, requestBody)
+	if errFinalize != nil {
+		return nil, errFinalize
 	}
 	upstream, token, errOpen := s.openModelStream(ctx, req.HostCallbackID, req.AuthID, storage, token, endpoint, requestBody)
 	if errOpen != nil {

@@ -6,6 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -63,15 +66,49 @@ func TestClaudeMalformedToolTypeFilterGuards(t *testing.T) {
 			for _, choice := range []string{`{"type":"auto"}`, `{"type":"tool","name":"lookup"}`} {
 				body := []byte(fmt.Sprintf(`{"tools":[{"type":%s,"name":"lookup","input_schema":{"type":"object"}}],"tool_choice":%s}`, typ, choice))
 				filtered, exclusions, err := filterUnrepresentableNativeTools("claude", endpoint, body)
-				if choice == `{"type":"auto"}` {
-					if err != nil || len(exclusions) != 1 || gjson.GetBytes(filtered, "tools").Exists() {
-						t.Fatalf("malformed type became a client tool: %s %v %v", filtered, exclusions, err)
-					}
-				} else if err == nil {
-					t.Fatalf("forced malformed type %s did not fail before inference", typ)
+				if err != nil || len(exclusions) != 0 || string(filtered) != string(body) {
+					t.Fatalf("malformed declaration was filtered before validation: %s %v %v", filtered, exclusions, err)
+				}
+				if _, err := translate.RequestForEndpointFrom("claude", "gpt-test", filtered, false, endpoint); err == nil {
+					t.Fatalf("malformed type %s was accepted for choice %s", typ, choice)
 				}
 			}
 		}
+	}
+}
+
+func TestCapturedCodexCachedSearchFilterPreservesClientToolDeclarations(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join("testdata", "codex-cached-search", "request.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	filtered, exclusions, err := filterUnrepresentableNativeTools("openai-response", translate.EndpointMessages, body)
+	if err != nil || len(exclusions) != 1 || exclusions[0].Type != "web_search" {
+		t.Fatalf("captured optional native tool was not excluded: exclusions=%v error=%v", exclusions, err)
+	}
+	originalTools := gjson.GetBytes(body, "tools").Array()
+	filteredTools := gjson.GetBytes(filtered, "tools").Array()
+	if len(originalTools) != len(filteredTools)+1 || len(filteredTools) != 8 {
+		t.Fatalf("captured tool count changed unexpectedly: original=%d filtered=%d", len(originalTools), len(filteredTools))
+	}
+	for originalIndex, filteredIndex := 0, 0; originalIndex < len(originalTools); originalIndex++ {
+		if originalTools[originalIndex].Get("type").String() == "web_search" {
+			continue
+		}
+		var originalDeclaration, filteredDeclaration map[string]any
+		if err := json.Unmarshal([]byte(originalTools[originalIndex].Raw), &originalDeclaration); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal([]byte(filteredTools[filteredIndex].Raw), &filteredDeclaration); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(originalDeclaration, filteredDeclaration) {
+			t.Fatalf("captured client tool changed at original index %d", originalIndex)
+		}
+		filteredIndex++
+	}
+	if gjson.GetBytes(filtered, "tools.4.type").String() != "namespace" || nativeToolResponseHeaders(http.Header{}, exclusions).Get("X-Copilot-Excluded-Native-Tools") != "web_search;reason=unrepresentable_by_selected_endpoint" {
+		t.Fatalf("captured namespace or exclusion disclosure changed: %s", filtered)
 	}
 }
 

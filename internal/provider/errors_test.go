@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -8,8 +9,30 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin/internal/translate"
 	"github.com/tidwall/gjson"
 )
+
+func TestTranslationStatusErrorClassifiesUnsupportedImageDetail(t *testing.T) {
+	imageDetailErr := &translate.UnsupportedImageDetailError{Endpoint: translate.EndpointMessages, Detail: "high"}
+	err := translationStatusError(fmt.Errorf("translate captured request: %w", imageDetailErr))
+	statusErr, ok := err.(*StatusError)
+	if !ok || statusErr.Code != "unsupported_image_detail" || statusErr.HTTPStatus != http.StatusUnprocessableEntity || statusErr.Message != imageDetailErr.Error() {
+		t.Fatalf("unexpected image detail status: %#v", statusErr)
+	}
+	var got *translate.UnsupportedImageDetailError
+	if !errors.As(imageDetailErr, &got) || got.Endpoint != translate.EndpointMessages || got.Detail != "high" {
+		t.Fatalf("typed image detail context changed: %#v", got)
+	}
+}
+
+func TestTranslationStatusErrorKeepsGeneralTranslationError(t *testing.T) {
+	err := translationStatusError(errors.New("unsupported input"))
+	statusErr, ok := err.(*StatusError)
+	if !ok || statusErr.Code != "translation_error" || statusErr.HTTPStatus != http.StatusUnprocessableEntity || statusErr.Message != "unsupported input" {
+		t.Fatalf("unexpected translation status: %#v", statusErr)
+	}
+}
 
 func TestUpstreamStatusErrorOmitsResponseText(t *testing.T) {
 	detail := "echoed SYNTHETIC_PROMPT_MARKER synthetic/path/file.txt synthetic-token-marker"

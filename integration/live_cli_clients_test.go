@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -82,7 +83,59 @@ func TestLiveCLIClients(t *testing.T) {
 	}
 }
 
+func TestLiveCapturedCLIClients(t *testing.T) {
+	if os.Getenv("CPA_LIVE_CAPTURED_CLIENTS") != "1" {
+		t.Skip("set CPA_LIVE_CAPTURED_CLIENTS=1 to run captured real CLI clients")
+	}
+	phase, err := liveCapturedCLIAttemptPhase(os.Getenv("CPA_LIVE_CAPTURED_CLIENTS_ATTEMPT"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	caseValue, casesSet := os.LookupEnv("CPA_LIVE_CAPTURED_CLIENTS_CASES")
+	clients, err := liveCapturedCLISelectedClients(caseValue, casesSet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimCells := liveOriginalCLIClaimCells(phase)
+	if len(claimCells) != 6 {
+		t.Fatal("captured CLI attempt did not resolve to the fixed six claim cells")
+	}
+	for _, key := range claimCells {
+		if !liveOriginalCLIClaimCell(key) {
+			t.Fatalf("captured CLI attempt contains an invalid claim cell %q", key)
+		}
+	}
+	gate, base, stop := startLiveCapturedHarness(t, nil, liveEndpointOverrides(nil))
+	defer stop()
+	models := make([]string, 0, len(clients))
+	for _, client := range clients {
+		model := "claude-haiku-5.5"
+		if client == "codex" {
+			model = "gpt-6-luna"
+		}
+		models = append(models, model)
+	}
+	for _, model := range models {
+		if !liveCapturedCatalogAdvertisesEndpoint(gate, model, liveCopilotRoutes[model]) {
+			t.Fatalf("captured catalog did not advertise the original endpoint for %s", model)
+		}
+	}
+	for _, client := range clients {
+		client := client
+		t.Run(client, func(t *testing.T) {
+			testLiveCLIClientWithGate(t, client, base, gate, phase)
+		})
+	}
+	if _, inferenceCount, _, _, err := gate.countsFor(""); err != nil || inferenceCount == 0 || livePacketDeniedCount(gate) != 0 {
+		t.Fatal("captured original-client dispatch or request/response recording failed")
+	}
+}
+
 func testLiveCLIClient(t *testing.T, client, base string) {
+	testLiveCLIClientWithGate(t, client, base, nil, "L-latest-dependencies")
+}
+
+func testLiveCLIClientWithGate(t *testing.T, client, base string, gate *liveServerToolGate, phase string) {
 	t.Helper()
 	path, err := exec.LookPath(client)
 	if err != nil {
@@ -117,7 +170,9 @@ func testLiveCLIClient(t *testing.T, client, base string) {
 	t.Logf("client=%s model=%s", client, model)
 	baselineOK := true
 	t.Run("baseline", func(t *testing.T) {
-		baseline := runLiveCLI(t, path, client, base, root, "Reply with the single word READY.")
+		baseline := runLiveCLIClaimed(t, gate, phase, client, "baseline", func() liveCLIResult {
+			return runLiveCLIWithEffort(t, path, client, base, root, "Reply with the single word READY.", "medium")
+		})
 		logLiveCLIResult(t, client, "baseline", baseline)
 		baselineOK = baseline.exitCode == 0 && baseline.final && !baseline.truncated
 		if !baselineOK {
@@ -136,14 +191,18 @@ func testLiveCLIClient(t *testing.T, client, base string) {
 		delegationPrompt = "Invoke collaboration.spawn_agent to delegate this bounded task: calculate 17 multiplied by 19 and return the answer. Then invoke collaboration.wait_agent to wait for that spawned agent to complete before reporting its answer. If either tool is unavailable, report that failure. Do not calculate the answer yourself or invent a subagent result."
 	}
 	t.Run("web_search", func(t *testing.T) {
-		search := runLiveCLI(t, path, client, base, root, searchPrompt)
+		search := runLiveCLIClaimed(t, gate, phase, client, "web-search", func() liveCLIResult {
+			return runLiveCLIWithEffort(t, path, client, base, root, searchPrompt, "medium")
+		})
 		logLiveCLIResult(t, client, "web_search", search)
 		if search.exitCode != 0 || !search.final || search.truncated || !liveSearchCompleted(client, search) {
 			t.Errorf("%s web search did not complete", client)
 		}
 	})
 	t.Run("subagent", func(t *testing.T) {
-		delegation := runLiveCLI(t, path, client, base, root, delegationPrompt)
+		delegation := runLiveCLIClaimed(t, gate, phase, client, "subagent", func() liveCLIResult {
+			return runLiveCLIWithEffort(t, path, client, base, root, delegationPrompt, "medium")
+		})
 		logLiveCLIResult(t, client, "subagent", delegation)
 		if delegation.exitCode != 0 || !delegation.final || delegation.truncated || !liveDelegationCompleted(client, delegation) {
 			t.Errorf("%s subagent did not complete", client)
@@ -151,8 +210,83 @@ func testLiveCLIClient(t *testing.T, client, base string) {
 	})
 }
 
-func runLiveCLI(t *testing.T, path, client, base, root, prompt string) liveCLIResult {
-	return runLiveCLIWithEffort(t, path, client, base, root, prompt, "")
+func runLiveCLIClaimed(t *testing.T, gate *liveServerToolGate, phase, client, task string, run func() liveCLIResult) liveCLIResult {
+	t.Helper()
+	if gate == nil {
+		return run()
+	}
+	cell := client + "-" + task
+	key := phase + "/" + cell
+	if !liveOriginalCLIClaimCell(key) {
+		t.Fatalf("invalid original CLI claim cell %q", key)
+	}
+	if err := gate.setPhaseCell(phase, cell); err != nil {
+		t.Fatal("original CLI claim cell was not accepted")
+	}
+	gate.setFreshClaim("inference", key)
+	t.Cleanup(func() {
+		gate.freezeCell(key)
+		gate.clearFreshInferenceClaim(key)
+	})
+	return run()
+}
+
+func liveCapturedCLISelectedClients(value string, present bool) ([]string, error) {
+	if !present {
+		return []string{"claude", "codex"}, nil
+	}
+	if value == "" {
+		return nil, errors.New("captured CLI client selection is empty")
+	}
+	clients := strings.Split(value, ",")
+	seen := make(map[string]bool, len(clients))
+	for _, client := range clients {
+		if client == "" || strings.TrimSpace(client) != client {
+			return nil, errors.New("captured CLI client selection is malformed")
+		}
+		if client != "claude" && client != "codex" {
+			return nil, errors.New("captured CLI client selection contains an unknown client")
+		}
+		if seen[client] {
+			return nil, errors.New("captured CLI client selection contains a duplicate client")
+		}
+		seen[client] = true
+	}
+	return clients, nil
+}
+
+func TestLiveCapturedCLISelectedClients(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		present bool
+		want    string
+		wantErr bool
+	}{
+		{name: "default both", want: "claude,codex"},
+		{name: "Claude only", value: "claude", present: true, want: "claude"},
+		{name: "Codex only", value: "codex", present: true, want: "codex"},
+		{name: "explicit both", value: "claude,codex", present: true, want: "claude,codex"},
+		{name: "reverse order", value: "codex,claude", present: true, want: "codex,claude"},
+		{name: "explicit empty", value: "", present: true, wantErr: true},
+		{name: "unknown", value: "copilot", present: true, wantErr: true},
+		{name: "duplicate", value: "codex,codex", present: true, wantErr: true},
+		{name: "empty item", value: "claude,,codex", present: true, wantErr: true},
+		{name: "leading separator", value: ",codex", present: true, wantErr: true},
+		{name: "trailing separator", value: "claude,", present: true, wantErr: true},
+		{name: "whitespace", value: "claude, codex", present: true, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clients, err := liveCapturedCLISelectedClients(test.value, test.present)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("liveCapturedCLISelectedClients(%q, %t) error = %v", test.value, test.present, err)
+			}
+			if err == nil && strings.Join(clients, ",") != test.want {
+				t.Fatalf("liveCapturedCLISelectedClients(%q, %t) = %v, want %q", test.value, test.present, clients, test.want)
+			}
+		})
+	}
 }
 
 func runLiveCLIWithEffort(t *testing.T, path, client, base, root, prompt, effort string) liveCLIResult {

@@ -5,11 +5,12 @@ SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 REPO_DIR=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)
 TARGET_GOOS=${NATIVE_HOST_GOOS:-}
 TARGET_GOARCH=${NATIVE_HOST_GOARCH:-}
-NATIVE_HOST_IMAGE=${NATIVE_HOST_IMAGE:-golang:1.26-bookworm}
-TEST_SELECTOR='^(TestNativeHostProtocolRoundTrips|TestNativeHostOAuth.*|TestFilteredChildEnvironment|TestNativeHostCanonicalResponsesRouting|TestNativeHostConfiguredCanonicalResponsesCompaction|TestNativeHostPluginResponsesWebsocket|TestNativeHostToolAndSystemCompatibility|TestNativeHostClaudeUnsupportedServerToolGuards|TestNativeHostPreservesIncompleteResponsesTerminal|TestNativeHostResponseInterrupt)$'
+NATIVE_HOST_IMAGE=${NATIVE_HOST_IMAGE:-golang:1.27-bookworm}
+NATIVE_HOST_KEEP_ARTIFACTS=${NATIVE_HOST_KEEP_ARTIFACTS:-0}
+TEST_SELECTOR='^(TestNativeHostProtocolRoundTrips|TestNativeHostOAuth.*|TestFilteredChildEnvironment|TestNativeHostCanonicalResponsesRouting|TestNativeHostConfiguredCanonicalResponsesCompaction|TestNativeHostPluginResponsesWebsocket|TestNativeHostToolAndSystemCompatibility|TestNativeHostClaudeUnsupportedServerToolGuards|TestNativeHostPreservesIncompleteResponsesTerminal|TestNativeHostResponseInterrupt|TestNativeHostPayloadFinalization|TestNativeHostPayloadFinalizationPreservesCodexReservedSchemas)$'
 TEST_LIST_PATTERN='^(TestNativeHost|TestFilteredChildEnvironment)'
 REQUIRED_SEEDS='manifest.json auth.json legacy-auth.json model-catalog.json responses-request.json responses-history.json responses.json responses.sse chat.json chat.sse messages.json messages.sse responses-compaction.json responses-compaction.sse'
-REQUIRED_TESTS='TestNativeHostProtocolRoundTrips TestNativeHostOAuthContinuityPersistsAcrossRestart TestNativeHostOAuthExcludedModelsFilterPluginModels TestNativeHostOAuthSettingsOverrideCopilotModelContext TestFilteredChildEnvironment TestNativeHostCanonicalResponsesRouting TestNativeHostConfiguredCanonicalResponsesCompaction TestNativeHostPluginResponsesWebsocket TestNativeHostToolAndSystemCompatibility TestNativeHostClaudeUnsupportedServerToolGuards TestNativeHostPreservesIncompleteResponsesTerminal TestNativeHostResponseInterrupt'
+REQUIRED_TESTS='TestNativeHostProtocolRoundTrips TestNativeHostOAuthContinuityPersistsAcrossRestart TestNativeHostOAuthExcludedModelsFilterPluginModels TestNativeHostOAuthSettingsOverrideCopilotModelContext TestFilteredChildEnvironment TestNativeHostCanonicalResponsesRouting TestNativeHostConfiguredCanonicalResponsesCompaction TestNativeHostPluginResponsesWebsocket TestNativeHostToolAndSystemCompatibility TestNativeHostClaudeUnsupportedServerToolGuards TestNativeHostPreservesIncompleteResponsesTerminal TestNativeHostResponseInterrupt TestNativeHostPayloadFinalization TestNativeHostPayloadFinalizationPreservesCodexReservedSchemas'
 
 if [ -z "$TARGET_GOOS" ] || [ -z "$TARGET_GOARCH" ]; then
   case "$(uname -s)" in
@@ -70,15 +71,23 @@ fi
 
 TEMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/cliproxyapi-native-host.XXXXXX")
 cleanup() {
+  status=$?
+  trap - 0
+  if [ "$status" -ne 0 ] || [ "$NATIVE_HOST_KEEP_ARTIFACTS" = 1 ]; then
+    printf 'Preserving native host test diagnostics in %s\n' "$TEMP_ROOT" >&2
+    exit "$status"
+  fi
   if [ -d "$TEMP_ROOT/source" ]; then
     chmod -R u+w "$TEMP_ROOT/source"
   fi
   rm -rf "$TEMP_ROOT"
+  exit "$status"
 }
 trap cleanup 0
 trap 'exit 1' HUP INT TERM
 
 SNAPSHOT="$TEMP_ROOT/source"
+SNAPSHOT_PLUGIN="$SNAPSHOT/build/plugins/$TARGET_GOOS/$TARGET_GOARCH/cliproxyapi-copilot.$PLUGIN_EXT"
 SEED_LIST="$TEMP_ROOT/seed-paths"
 mkdir -p \
   "$SNAPSHOT/config" \
@@ -86,16 +95,18 @@ mkdir -p \
   "$SNAPSHOT/build/plugins/$TARGET_GOOS/$TARGET_GOARCH" \
   "$SNAPSHOT/.cache/native-host/$TARGET_GOOS/$TARGET_GOARCH" \
   "$TEMP_ROOT/home" \
-  "$TEMP_ROOT/tmp"
+  "$TEMP_ROOT/tmp" \
+  "$TEMP_ROOT/container-tmp"
+chmod 1777 "$TEMP_ROOT/container-tmp"
 
 cp "$REPO_DIR/config/config.yaml" "$SNAPSHOT/config/config.yaml"
-cp "$PLUGIN" "$SNAPSHOT/build/plugins/$TARGET_GOOS/$TARGET_GOARCH/cliproxyapi-copilot.$PLUGIN_EXT"
+cp "$PLUGIN" "$SNAPSHOT_PLUGIN"
 cp "$CPA_BINARY" "$SNAPSHOT/.cache/native-host/$TARGET_GOOS/$TARGET_GOARCH/cli-proxy-api"
 cp "$INTEGRATION_BINARY" "$SNAPSHOT/.cache/native-host/$TARGET_GOOS/$TARGET_GOARCH/integration.test"
 
 git -C "$REPO_DIR" ls-files --cached --others --exclude-standard -- \
   'integration/testdata/native/v1/*.json' \
-  'integration/testdata/native/v1/*.sse' > "$SEED_LIST"
+  'integration/testdata/native/v1/*.sse' >"$SEED_LIST"
 if [ ! -s "$SEED_LIST" ]; then
   printf 'error: native fixture seeds are missing from the worktree\n' >&2
   exit 1
@@ -128,7 +139,7 @@ while IFS= read -r relative_path; do
     exit 1
   fi
   cp "$REPO_DIR/$relative_path" "$SNAPSHOT/$relative_path"
-done < "$SEED_LIST"
+done <"$SEED_LIST"
 
 chmod -R a-w "$SNAPSHOT"
 
@@ -139,9 +150,9 @@ if [ "$TARGET_GOOS" = linux ]; then
   }
   printf 'Running prepared native host tests in a network-isolated Linux container\n'
   docker run --rm --pull=never --platform="$TARGET_GOOS/$TARGET_GOARCH" --network=none --read-only \
-    --tmpfs /tmp:rw,exec,nosuid,size=1g,mode=1777 \
     --user "$(id -u):$(id -g)" \
     -v "$SNAPSHOT:/src:ro" \
+    -v "$TEMP_ROOT/container-tmp:/tmp" \
     -w /src/integration \
     --entrypoint /usr/bin/env \
     "$NATIVE_HOST_IMAGE" \
@@ -150,8 +161,10 @@ if [ "$TARGET_GOOS" = linux ]; then
     HOME=/tmp \
     TMPDIR=/tmp \
     CPA_BINARY="/src/.cache/native-host/$TARGET_GOOS/$TARGET_GOARCH/cli-proxy-api" \
+    CPA_LIVE_PLUGIN_PATH="/src/build/plugins/$TARGET_GOOS/$TARGET_GOARCH/cliproxyapi-copilot.$PLUGIN_EXT" \
+    CPA_LIVE_COPILOT_DEBUG_DIR=/tmp/native-host-debug \
     "/src/.cache/native-host/$TARGET_GOOS/$TARGET_GOARCH/integration.test" \
-    -test.list "$TEST_LIST_PATTERN" > "$TEMP_ROOT/test-list"
+    -test.list "$TEST_LIST_PATTERN" >"$TEMP_ROOT/test-list"
 else
   printf 'Running prepared native host tests with a sanitized macOS environment\n'
   SANDBOX_EXEC=/usr/bin/sandbox-exec
@@ -180,9 +193,11 @@ else
       HOME="$TEMP_ROOT/home" \
       TMPDIR="$TEMP_ROOT/tmp" \
       CPA_BINARY="$SNAPSHOT/.cache/native-host/$TARGET_GOOS/$TARGET_GOARCH/cli-proxy-api" \
+      CPA_LIVE_PLUGIN_PATH="$SNAPSHOT_PLUGIN" \
+      CPA_LIVE_COPILOT_DEBUG_DIR="$TEMP_ROOT/debug" \
       "$SANDBOX_EXEC" -p "$SANDBOX_PROFILE" \
       "$SNAPSHOT/.cache/native-host/$TARGET_GOOS/$TARGET_GOARCH/integration.test" \
-      -test.list "$TEST_LIST_PATTERN" > "$TEMP_ROOT/test-list"
+      -test.list "$TEST_LIST_PATTERN" >"$TEMP_ROOT/test-list"
   )
 fi
 
@@ -195,9 +210,9 @@ done
 
 if [ "$TARGET_GOOS" = linux ]; then
   docker run --rm --pull=never --platform="$TARGET_GOOS/$TARGET_GOARCH" --network=none --read-only \
-    --tmpfs /tmp:rw,exec,nosuid,size=1g,mode=1777 \
     --user "$(id -u):$(id -g)" \
     -v "$SNAPSHOT:/src:ro" \
+    -v "$TEMP_ROOT/container-tmp:/tmp" \
     -w /src/integration \
     --entrypoint /usr/bin/env \
     "$NATIVE_HOST_IMAGE" \
@@ -206,6 +221,8 @@ if [ "$TARGET_GOOS" = linux ]; then
     HOME=/tmp \
     TMPDIR=/tmp \
     CPA_BINARY="/src/.cache/native-host/$TARGET_GOOS/$TARGET_GOARCH/cli-proxy-api" \
+    CPA_LIVE_PLUGIN_PATH="/src/build/plugins/$TARGET_GOOS/$TARGET_GOARCH/cliproxyapi-copilot.$PLUGIN_EXT" \
+    CPA_LIVE_COPILOT_DEBUG_DIR=/tmp/native-host-debug \
     "/src/.cache/native-host/$TARGET_GOOS/$TARGET_GOARCH/integration.test" \
     -test.run "$TEST_SELECTOR" -test.count=1 -test.v
 else
@@ -216,6 +233,8 @@ else
       HOME="$TEMP_ROOT/home" \
       TMPDIR="$TEMP_ROOT/tmp" \
       CPA_BINARY="$SNAPSHOT/.cache/native-host/$TARGET_GOOS/$TARGET_GOARCH/cli-proxy-api" \
+      CPA_LIVE_PLUGIN_PATH="$SNAPSHOT_PLUGIN" \
+      CPA_LIVE_COPILOT_DEBUG_DIR="$TEMP_ROOT/debug" \
       "$SANDBOX_EXEC" -p "$SANDBOX_PROFILE" \
       "$SNAPSHOT/.cache/native-host/$TARGET_GOOS/$TARGET_GOARCH/integration.test" \
       -test.run "$TEST_SELECTOR" -test.count=1 -test.v

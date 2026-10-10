@@ -5,10 +5,10 @@ SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 REPO_DIR=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)
 TARGET_GOOS=${NATIVE_HOST_GOOS:-}
 TARGET_GOARCH=${NATIVE_HOST_GOARCH:-}
+NATIVE_HOST_SOURCE=${NATIVE_HOST_SOURCE:-}
 HOST_MODULE=github.com/router-for-me/CLIProxyAPI/v8
-HOST_VERSION=v8.0.23
 TEST_LIST_PATTERN='^(TestNativeHost|TestFilteredChildEnvironment)'
-REQUIRED_TESTS='TestNativeHostProtocolRoundTrips TestNativeHostOAuthContinuityPersistsAcrossRestart TestNativeHostOAuthExcludedModelsFilterPluginModels TestNativeHostOAuthSettingsOverrideCopilotModelContext TestFilteredChildEnvironment TestNativeHostCanonicalResponsesRouting TestNativeHostConfiguredCanonicalResponsesCompaction TestNativeHostPluginResponsesWebsocket TestNativeHostResponseInterrupt'
+REQUIRED_TESTS='TestNativeHostProtocolRoundTrips TestNativeHostOAuthContinuityPersistsAcrossRestart TestNativeHostOAuthExcludedModelsFilterPluginModels TestNativeHostOAuthSettingsOverrideCopilotModelContext TestFilteredChildEnvironment TestNativeHostCanonicalResponsesRouting TestNativeHostConfiguredCanonicalResponsesCompaction TestNativeHostPluginResponsesWebsocket TestNativeHostResponseInterrupt TestNativeHostPayloadFinalization TestNativeHostPayloadFinalizationPreservesCodexReservedSchemas'
 
 if [ -z "$TARGET_GOOS" ] || [ -z "$TARGET_GOARCH" ]; then
   case "$(uname -s)" in
@@ -111,17 +111,43 @@ run_go() {
     "$GO_BIN" "$@"
 }
 
-MODULE_IDENTITY=$(cd "$REPO_DIR" && run_go list -mod=readonly -m -f '{{.Version}}|{{if .Replace}}replaced{{end}}' "$HOST_MODULE")
-if [ "$MODULE_IDENTITY" != "$HOST_VERSION|" ]; then
-  printf 'error: expected the official %s module without a replacement, got %s\n' "$HOST_VERSION" "$MODULE_IDENTITY" >&2
-  exit 1
+if [ -n "$NATIVE_HOST_SOURCE" ]; then
+  case "$NATIVE_HOST_SOURCE" in
+    /*) HOST_MODULE_DIR=$(CDPATH='' cd -- "$NATIVE_HOST_SOURCE" && pwd) ;;
+    *) HOST_MODULE_DIR=$(CDPATH='' cd -- "$REPO_DIR/$NATIVE_HOST_SOURCE" && pwd) ;;
+  esac
+  HOST_SOURCE_LABEL="explicit local source"
+else
+  (
+    cd "$REPO_DIR"
+    run_go mod download "$HOST_MODULE"
+  )
+  MODULE_IDENTITY=$(cd "$REPO_DIR" && run_go list -mod=readonly -m -f '{{.Version}}|{{if .Replace}}{{.Replace.Path}}{{end}}|{{if .Replace}}{{.Replace.Version}}{{end}}|{{.Dir}}' "$HOST_MODULE")
+  IFS='|' read -r HOST_VERSION HOST_REPLACEMENT_PATH HOST_REPLACEMENT_VERSION HOST_MODULE_DIR <<EOF
+$MODULE_IDENTITY
+EOF
+  if [ -z "$HOST_VERSION" ]; then
+    printf 'error: expected a versioned %s module, got %s\n' "$HOST_MODULE" "$MODULE_IDENTITY" >&2
+    exit 1
+  fi
+  case "$HOST_REPLACEMENT_PATH" in
+    '')
+      HOST_SOURCE_LABEL="official module $HOST_VERSION"
+      ;;
+    github.com/ririnto/CLIProxyAPI/v8)
+      if [ -z "$HOST_REPLACEMENT_VERSION" ]; then
+        printf 'error: the maintained CLIProxyAPI replacement must use a published module version\n' >&2
+        exit 1
+      fi
+      HOST_SOURCE_LABEL="maintained fork module $HOST_REPLACEMENT_PATH@$HOST_REPLACEMENT_VERSION"
+      ;;
+    *)
+      printf 'error: unsupported CLIProxyAPI replacement source: %s\n' "$HOST_REPLACEMENT_PATH" >&2
+      exit 1
+      ;;
+  esac
 fi
 
-(
-  cd "$REPO_DIR"
-  run_go mod download "$HOST_MODULE"
-)
-HOST_MODULE_DIR=$(cd "$REPO_DIR" && run_go list -mod=readonly -m -f '{{.Dir}}' "$HOST_MODULE")
 if [ ! -f "$HOST_MODULE_DIR/go.mod" ] || [ ! -f "$HOST_MODULE_DIR/cmd/server/main.go" ]; then
   printf 'error: selected CLIProxyAPI module does not contain the server source\n' >&2
   exit 1
@@ -131,7 +157,7 @@ if ! sed -n '1p' "$HOST_MODULE_DIR/go.mod" | grep -Fqx -- "module $HOST_MODULE";
   exit 1
 fi
 
-printf 'Building CLIProxyAPI %s server from its selected module source\n' "$HOST_VERSION"
+printf 'Building CLIProxyAPI server from %s\n' "$HOST_SOURCE_LABEL"
 (
   cd "$HOST_MODULE_DIR"
   run_go build -mod=readonly -buildvcs=false -trimpath -o "$BUILD_DIR/cli-proxy-api" ./cmd/server
@@ -143,7 +169,7 @@ printf 'Compiling native host integration tests for %s/%s\n' "$TARGET_GOOS" "$TA
   run_go test -mod=readonly -c -o "$BUILD_DIR/integration.test" ./integration
 )
 
-"$BUILD_DIR/integration.test" -test.list "$TEST_LIST_PATTERN" > "$BUILD_DIR/test-list"
+"$BUILD_DIR/integration.test" -test.list "$TEST_LIST_PATTERN" >"$BUILD_DIR/test-list"
 for test_name in $REQUIRED_TESTS; do
   if ! grep -Fqx -- "$test_name" "$BUILD_DIR/test-list"; then
     printf 'error: integration binary is missing required test: %s\n' "$test_name" >&2

@@ -118,32 +118,27 @@ func validateResponsesToolsForTarget(root map[string]any, target sdktranslator.F
 				continue
 			}
 			typ := strings.TrimSpace(stringValue(tool["type"]))
-			switch typ {
-			case "", "function", "custom", "namespace":
-			case "web_search", "web_search_preview":
-				if typ == "web_search_preview" && target == sdktranslator.FormatClaude {
-					if err := validateResponsesWebSearchToolOptions(tool, true); err != nil {
-						return err
-					}
-				} else if typ == "web_search" && target == sdktranslator.FormatClaude {
-					if err := validateResponsesWebSearchToolOptions(tool, false); err != nil {
-						return err
-					}
-				} else {
-					return fmt.Errorf("Responses native %s tool cannot be represented by %s", typ, responsesTargetName(target))
+			representable, valid := NativeToolRepresentable(sdktranslator.FormatOpenAIResponse.String(), endpointForFormat(target), tool)
+			if !valid {
+				return fmt.Errorf("Responses %s contains an unsupported tool definition", source.label)
+			}
+			if target == sdktranslator.FormatClaude && (typ == "web_search" || typ == "web_search_preview") {
+				if err := validateResponsesWebSearchToolOptions(tool, typ == "web_search_preview"); err != nil {
+					return err
 				}
+			}
+			if !representable {
+				return fmt.Errorf("Responses native %s tool cannot be represented by %s", typ, responsesTargetName(target))
+			}
+			switch typ {
+			case "web_search", "web_search_preview":
 				name := stringValue(tool["name"])
 				if name == "" {
 					name = "web_search"
 				}
 				webSearchNames[name] = struct{}{}
 			case "shell":
-				if target != sdktranslator.FormatOpenAI || stringValue(objectValue(tool["environment"])["type"]) != "local" {
-					return fmt.Errorf("Responses native %s tool cannot be represented by %s", typ, responsesTargetName(target))
-				}
 				localShell = true
-			default:
-				return fmt.Errorf("Responses native %s tool cannot be represented by %s", typ, responsesTargetName(target))
 			}
 		}
 	}
@@ -156,6 +151,19 @@ func responsesTargetName(target sdktranslator.Format) string {
 		return "Claude Messages"
 	}
 	return "Chat Completions"
+}
+
+func endpointForFormat(target sdktranslator.Format) string {
+	switch target {
+	case sdktranslator.FormatOpenAIResponse:
+		return EndpointResponses
+	case sdktranslator.FormatOpenAI:
+		return EndpointChatCompletions
+	case sdktranslator.FormatClaude:
+		return EndpointMessages
+	default:
+		return ""
+	}
 }
 
 func validateResponsesWebSearchToolOptions(tool map[string]any, preview bool) error {

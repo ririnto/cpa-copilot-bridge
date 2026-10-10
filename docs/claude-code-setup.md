@@ -1,8 +1,10 @@
 # Route Claude Code through Claude and Copilot subscriptions
 
-This guide deploys the official CLIProxyAPI with this repository's GitHub
-Copilot plugin, authenticates both a Claude subscription and a GitHub Copilot
-subscription, and configures Claude Code to use both through one local endpoint.
+This guide deploys CLIProxyAPI with this repository's GitHub Copilot plugin,
+authenticates both a Claude subscription and a GitHub Copilot subscription, and
+configures Claude Code to use both through one local endpoint.
+The Compose deployment uses the official v8.0.23 runtime image with a paired
+maintained host binary built from the module replacement selected in `go.mod`.
 
 Every step is an explicit command; no repository setup scripts are involved.
 
@@ -13,7 +15,7 @@ Claude Code
     |
     | Anthropic Messages API
     v
-official CLIProxyAPI
+paired CLIProxyAPI host
     |-- built-in Claude OAuth ------> Anthropic subscription
     `-- cliproxyapi-copilot plugin -> GitHub Copilot subscription
                                       (OpenAI Responses, Chat Completions,
@@ -87,16 +89,23 @@ chmod 600 .runtime/config.yaml
 
 Re-run this step whenever `config/config.yaml` changes.
 
-## 4. Build the plugin and start the stack
+## 4. Build the paired plugin and host, then start the stack
 
-Build the plugin shared library inside the pinned Go container:
+Build the plugin shared library and the matching CLIProxyAPI host inside the
+pinned Go container:
 
 ```bash
-make build
+make prepare-runtime-host
 ```
 
-The Compose file pins the published CLIProxyAPI image tag `v8.0.23`.
-Compose pulls that image when it is absent locally.
+The plugin uses the official CLIProxyAPI v8.0.23 SDK and plugin ABI. Its final
+payload-rule callback is supplied by the published maintained CLIProxyAPI
+module replacement selected in `go.mod`; the official v8.0.23 server does not
+implement that callback. The Compose file keeps the official image as the
+runtime base, then mounts the host binary built from that paired module over the
+image's server binary. Do not run Compose before `make prepare-runtime-host`, or
+the required host binary will be missing. Compose pulls the official base image
+when it is absent locally.
 
 Start the stack. The `--env-file` flag passes the management password to the
 container; the API key is only read from the mounted `.runtime/config.yaml`:

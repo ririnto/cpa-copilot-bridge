@@ -19,6 +19,37 @@ type requestAttachment struct {
 	detail   string
 }
 
+// UnsupportedImageDetailError identifies image detail that cannot be preserved
+// by a destination endpoint.
+type UnsupportedImageDetailError struct {
+	Endpoint string
+	Detail   string
+}
+
+func (e *UnsupportedImageDetailError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return fmt.Sprintf("image detail %q cannot be represented by endpoint %s", e.Detail, e.Endpoint)
+}
+
+// ValidateRequestAttachmentsForEndpoint checks whether attachment semantics can
+// be preserved when translating a request to the selected Copilot endpoint.
+func ValidateRequestAttachmentsForEndpoint(source, endpoint string, body []byte) error {
+	from := sdktranslator.FromString(source)
+	if from == "" {
+		return fmt.Errorf("unsupported request source format %q", source)
+	}
+	to, err := endpointFormat(endpoint)
+	if err != nil {
+		return err
+	}
+	if from == to {
+		return nil
+	}
+	return validateRequestAttachments(body, from, to)
+}
+
 func requestAttachments(root map[string]any, format sdktranslator.Format) ([]requestAttachment, error) {
 	var attachments []requestAttachment
 	var visit func(any) error
@@ -133,10 +164,10 @@ func validateRequestAttachments(body []byte, from, to sdktranslator.Format) erro
 			case "", "auto", "low", "high":
 			case "original":
 				if from == sdktranslator.FormatOpenAI {
-					return fmt.Errorf("Chat image detail original is unsupported for cross-format translation")
+					return &UnsupportedImageDetailError{Endpoint: endpointForFormat(to), Detail: attachment.detail}
 				}
 				if to == sdktranslator.FormatOpenAI {
-					return fmt.Errorf("original image detail cannot be represented by Chat Completions")
+					return &UnsupportedImageDetailError{Endpoint: EndpointChatCompletions, Detail: attachment.detail}
 				}
 			default:
 				return fmt.Errorf("image detail cannot be represented by the destination endpoint")
@@ -145,7 +176,7 @@ func validateRequestAttachments(body []byte, from, to sdktranslator.Format) erro
 				return fmt.Errorf("image attachment requires a URL or inline data")
 			}
 			if to == sdktranslator.FormatClaude && attachment.detail != "" && attachment.detail != "auto" {
-				return fmt.Errorf("image detail cannot be represented by Claude Messages")
+				return &UnsupportedImageDetailError{Endpoint: EndpointMessages, Detail: attachment.detail}
 			}
 			if strings.HasPrefix(attachment.data, "data:") {
 				if _, err := inlineAttachmentData(attachment.data, "image/"); err != nil {

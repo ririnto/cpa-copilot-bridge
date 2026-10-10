@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -166,12 +167,25 @@ func TestSyntheticAttachmentOriginalDetailContract(t *testing.T) {
 						if err != nil {
 							t.Fatal(err)
 						}
+						originalBody := append([]byte(nil), body...)
 						endpoint := map[sdktranslator.Format]string{sdktranslator.FormatOpenAI: EndpointChatCompletions, sdktranslator.FormatOpenAIResponse: EndpointResponses, sdktranslator.FormatClaude: EndpointMessages}[to]
 						converted, err := RequestForEndpointFrom(from.String(), "exact-upstream-id", body, stream, endpoint)
 						reject := from != to && (detail == "original" && (from == sdktranslator.FormatOpenAI || to == sdktranslator.FormatOpenAI) || to == sdktranslator.FormatClaude && detail != "auto")
 						if reject {
 							if err == nil {
 								t.Fatalf("unsupported image detail was accepted or normalized: %s", converted)
+							}
+							if from != to && (to == sdktranslator.FormatClaude && detail != "auto" || detail == "original") {
+								var detailErr *UnsupportedImageDetailError
+								wantEndpoint := endpoint
+								if to == sdktranslator.FormatClaude {
+									wantEndpoint = EndpointMessages
+								} else if to == sdktranslator.FormatOpenAI {
+									wantEndpoint = EndpointChatCompletions
+								}
+								if !errors.As(err, &detailErr) || detailErr.Endpoint != wantEndpoint || detailErr.Detail != detail || !bytes.Equal(body, originalBody) {
+									t.Fatalf("unsupported Messages image detail lost its typed context or source request: error=%v", err)
+								}
 							}
 							if from == sdktranslator.FormatOpenAIResponse {
 								if err := validateResponsesRequestForTarget(body, to); err == nil {
@@ -201,6 +215,75 @@ func TestSyntheticAttachmentOriginalDetailContract(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func TestValidateRequestAttachmentsForEndpointPreservesOriginalSemantics(t *testing.T) {
+	imageData := "data:image/png;base64,YQ=="
+	for _, test := range []struct {
+		name     string
+		body     string
+		endpoint string
+		wantCode bool
+		wantPath string
+	}{
+		{
+			name:     "Responses high detail to Messages is incompatible",
+			body:     `{"input":[{"role":"user","content":[{"type":"input_image","image_url":"` + imageData + `","detail":"high"}]}]}`,
+			endpoint: EndpointMessages,
+			wantCode: true,
+			wantPath: EndpointMessages,
+		},
+		{
+			name:     "Responses high detail to Chat is preserved",
+			body:     `{"input":[{"role":"user","content":[{"type":"input_image","image_url":"` + imageData + `","detail":"high"}]}]}`,
+			endpoint: EndpointChatCompletions,
+		},
+		{
+			name:     "Responses original detail to Chat is incompatible",
+			body:     `{"input":[{"role":"user","content":[{"type":"input_image","image_url":"` + imageData + `","detail":"original"}]}]}`,
+			endpoint: EndpointChatCompletions,
+			wantCode: true,
+			wantPath: EndpointChatCompletions,
+		},
+		{
+			name:     "attachment in custom tool output is checked",
+			body:     `{"input":[{"type":"custom_tool_call_output","call_id":"call_fixture","output":[{"type":"input_image","image_url":"` + imageData + `","detail":"high"}]}]}`,
+			endpoint: EndpointMessages,
+			wantCode: true,
+			wantPath: EndpointMessages,
+		},
+		{
+			name:     "attachment in function output is checked",
+			body:     `{"input":[{"type":"function_call_output","call_id":"call_fixture","output":[{"type":"input_image","image_url":"` + imageData + `","detail":"high"}]}]}`,
+			endpoint: EndpointMessages,
+			wantCode: true,
+			wantPath: EndpointMessages,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := ValidateRequestAttachmentsForEndpoint(sdktranslator.FormatOpenAIResponse.String(), test.endpoint, []byte(test.body))
+			var detailErr *UnsupportedImageDetailError
+			if test.wantCode {
+				if !errors.As(err, &detailErr) || detailErr.Endpoint != test.wantPath {
+					t.Fatalf("attachment validation error = %v, want endpoint %q image-detail error", err, test.wantPath)
+				}
+			} else if err != nil {
+				t.Fatalf("compatible attachment was rejected: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateRequestAttachmentsForEndpointUsesClaudeSourceFixture(t *testing.T) {
+	body := readLiveBodyFixture(t, "native-attachment-captures/claude-png", "request.json")
+	if err := ValidateRequestAttachmentsForEndpoint(sdktranslator.FormatClaude.String(), EndpointMessages, body); err != nil {
+		t.Fatalf("captured Claude image request was rejected on its native endpoint: %v", err)
+	}
+
+	uploadedFile := []byte(`{"messages":[{"role":"user","content":[{"type":"document","source":{"type":"file","file_id":"file_uploaded"}}]}]}`)
+	if err := ValidateRequestAttachmentsForEndpoint(sdktranslator.FormatClaude.String(), EndpointResponses, uploadedFile); err == nil {
+		t.Fatal("Claude uploaded file reference was accepted for cross-format translation")
 	}
 }
 

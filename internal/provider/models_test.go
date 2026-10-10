@@ -1,9 +1,14 @@
 package provider
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -182,6 +187,182 @@ func TestSelectEndpoint(t *testing.T) {
 				t.Fatalf("endpoint = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestEndpointForModelWithPayloadSelectsAdvertisedLosslessImageRoute(t *testing.T) {
+	t.Parallel()
+
+	model := capturedCopilotModel(t, "claude-haiku-5.5")
+	if !model.Capabilities.Supports.Vision || !contains(model.SupportedEndpoints, translate.EndpointMessages) || !contains(model.SupportedEndpoints, translate.EndpointChatCompletions) {
+		t.Fatalf("captured Claude catalog capabilities changed: %#v", model)
+	}
+	for _, detail := range []string{"high", "low"} {
+		t.Run(detail, func(t *testing.T) {
+			service, storage, _ := serviceWithCachedModels(t, []upstreamModel{model})
+			body := capturedResponsesImageRequest(t, detail)
+			endpoint, selected, _, err := service.endpointForModelWithPayload(context.Background(), "callback", "auth", storage, model.ID, "openai-response", body)
+			if err != nil {
+				t.Fatalf("select attachment-compatible endpoint: %v", err)
+			}
+			if selected.ID != model.ID || endpoint != translate.EndpointChatCompletions {
+				t.Fatalf("selected endpoint = (%q, %q), want same model via advertised Chat Completions", endpoint, selected.ID)
+			}
+			if err := translate.ValidateRequestAttachmentsForEndpoint("openai-response", endpoint, body); err != nil {
+				t.Fatalf("selected endpoint does not preserve captured image detail: %v", err)
+			}
+		})
+	}
+}
+
+func TestEndpointForModelWithPayloadPreservesDefaultAndOverrideRoutes(t *testing.T) {
+	t.Parallel()
+
+	model := capturedCopilotModel(t, "claude-haiku-5.5")
+	service, storage, _ := serviceWithCachedModels(t, []upstreamModel{model})
+	plain := []byte(`{"input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}]}`)
+	endpoint, _, _, err := service.endpointForModelWithPayload(context.Background(), "callback", "auth", storage, model.ID, "openai-response", plain)
+	if err != nil || endpoint != translate.EndpointMessages {
+		t.Fatalf("plain Responses request endpoint = %q, error=%v; want unchanged Messages preference", endpoint, err)
+	}
+
+	service.config.ModelEndpointOverrides[model.ID] = translate.EndpointMessages
+	body := capturedResponsesImageRequest(t, "high")
+	endpoint, _, _, err = service.endpointForModelWithPayload(context.Background(), "callback", "auth", storage, model.ID, "openai-response", body)
+	if err != nil || endpoint != translate.EndpointMessages {
+		t.Fatalf("explicit Messages override endpoint = %q, error=%v", endpoint, err)
+	}
+	translationErr := translate.ValidateRequestAttachmentsForEndpoint("openai-response", endpoint, body)
+	var detailErr *translate.UnsupportedImageDetailError
+	if !errors.As(translationErr, &detailErr) || detailErr.Endpoint != translate.EndpointMessages {
+		t.Fatalf("explicit override incompatibility = %v, want typed Messages image-detail error", translationErr)
+	}
+	statusErr, ok := translationStatusError(translationErr).(*StatusError)
+	if !ok || statusErr.Code != "unsupported_image_detail" || statusErr.HTTPStatus != http.StatusUnprocessableEntity {
+		t.Fatalf("explicit override status = %#v, want 422 unsupported_image_detail", statusErr)
+	}
+}
+
+func TestEndpointForModelWithPayloadRequiresAdvertisedVisionAndLosslessRoute(t *testing.T) {
+	t.Parallel()
+
+	body := capturedResponsesImageRequest(t, "high")
+	base := capturedCopilotModel(t, "claude-haiku-5.5")
+	for _, test := range []struct {
+		name  string
+		model upstreamModel
+	}{
+		{
+			name: "Chat endpoint is not advertised",
+			model: func() upstreamModel {
+				model := base
+				model.SupportedEndpoints = []string{translate.EndpointMessages}
+				return model
+			}(),
+		},
+		{
+			name: "vision capability is absent",
+			model: func() upstreamModel {
+				model := base
+				model.Capabilities.Supports.Vision = false
+				return model
+			}(),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service, storage, _ := serviceWithCachedModels(t, []upstreamModel{test.model})
+			endpoint, _, _, err := service.endpointForModelWithPayload(context.Background(), "callback", "auth", storage, base.ID, "openai-response", body)
+			if err != nil || endpoint != translate.EndpointMessages {
+				t.Fatalf("endpoint = %q, error=%v; want original Messages route", endpoint, err)
+			}
+			translationErr := translate.ValidateRequestAttachmentsForEndpoint("openai-response", endpoint, body)
+			var detailErr *translate.UnsupportedImageDetailError
+			if !errors.As(translationErr, &detailErr) || detailErr.Endpoint != translate.EndpointMessages {
+				t.Fatalf("Messages validation error = %v, want typed image-detail incompatibility", translationErr)
+			}
+		})
+	}
+}
+
+func TestEndpointForModelWithPayloadDoesNotFallbackForClaudeFileReferences(t *testing.T) {
+	t.Parallel()
+
+	model := capturedCopilotModel(t, "claude-haiku-5.5")
+	service, storage, _ := serviceWithCachedModels(t, []upstreamModel{model})
+	body := []byte(`{"messages":[{"role":"user","content":[{"type":"document","source":{"type":"file","file_id":"file_uploaded"}}]}]}`)
+	endpoint, _, _, err := service.endpointForModelWithPayload(context.Background(), "callback", "auth", storage, model.ID, "claude", body)
+	if err != nil || endpoint != translate.EndpointMessages {
+		t.Fatalf("Claude file-reference route = %q, error=%v; want unchanged native Messages", endpoint, err)
+	}
+	if err := translate.ValidateRequestAttachmentsForEndpoint("claude", translate.EndpointResponses, body); err == nil {
+		t.Fatal("Claude uploaded file reference was accepted by a cross-format endpoint")
+	}
+}
+
+func TestEndpointForModelWithPayloadLeavesMalformedAndUnknownSourceRequestsForValidation(t *testing.T) {
+	t.Parallel()
+
+	model := capturedCopilotModel(t, "claude-haiku-5.5")
+	for _, test := range []struct {
+		name         string
+		sourceFormat string
+		model        upstreamModel
+		payload      []byte
+		wantEndpoint string
+	}{
+		{
+			name:         "malformed attachment stays on default endpoint",
+			sourceFormat: "openai-response",
+			model:        model,
+			payload:      []byte(`{"input":[{"role":"user","content":[{"type":"input_image","detail":"high"}]}]}`),
+			wantEndpoint: translate.EndpointMessages,
+		},
+		{
+			name:         "unknown source format gets no compatibility fallback",
+			sourceFormat: "custom-source",
+			model: func() upstreamModel {
+				model := model
+				model.SupportedEndpoints = []string{translate.EndpointResponses, translate.EndpointMessages}
+				return model
+			}(),
+			payload:      capturedResponsesImageRequest(t, "high"),
+			wantEndpoint: translate.EndpointResponses,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service, storage, _ := serviceWithCachedModels(t, []upstreamModel{test.model})
+			endpoint, _, _, err := service.endpointForModelWithPayload(context.Background(), "callback", "auth", storage, model.ID, test.sourceFormat, test.payload)
+			if err != nil || endpoint != test.wantEndpoint {
+				t.Fatalf("endpoint = %q, error=%v; want original endpoint %q", endpoint, err, test.wantEndpoint)
+			}
+			validationErr := translate.ValidateRequestAttachmentsForEndpoint(test.sourceFormat, endpoint, test.payload)
+			var detailErr *translate.UnsupportedImageDetailError
+			if errors.As(validationErr, &detailErr) {
+				t.Fatalf("non-image-detail input was misclassified for fallback: %v", validationErr)
+			}
+			if test.sourceFormat == "openai-response" && validationErr == nil {
+				t.Fatal("malformed attachment unexpectedly passed validation")
+			}
+		})
+	}
+}
+
+func TestEndpointForModelWithPayloadKeepsOriginalDetailUnrepresentable(t *testing.T) {
+	t.Parallel()
+
+	model := capturedCopilotModel(t, "claude-haiku-5.5")
+	service, storage, _ := serviceWithCachedModels(t, []upstreamModel{model})
+	body := capturedResponsesImageRequest(t, "original")
+	endpoint, _, _, err := service.endpointForModelWithPayload(context.Background(), "callback", "auth", storage, model.ID, "openai-response", body)
+	if err != nil || endpoint != translate.EndpointMessages {
+		t.Fatalf("original-detail endpoint = %q, error=%v; want no fabricated compatible route", endpoint, err)
+	}
+	for _, unsupported := range []string{translate.EndpointMessages, translate.EndpointChatCompletions} {
+		translationErr := translate.ValidateRequestAttachmentsForEndpoint("openai-response", unsupported, body)
+		var detailErr *translate.UnsupportedImageDetailError
+		if !errors.As(translationErr, &detailErr) || detailErr.Endpoint != unsupported || detailErr.Detail != "original" {
+			t.Fatalf("endpoint %s original-detail validation = %v, want typed incompatibility", unsupported, translationErr)
+		}
 	}
 }
 
@@ -433,6 +614,38 @@ func serviceWithCachedModels(t *testing.T, models []upstreamModel) (*Service, au
 		Models:      cloneUpstreamModels(models),
 	}
 	return service, storage, rawStorage
+}
+
+func capturedCopilotModel(t *testing.T, modelID string) upstreamModel {
+	t.Helper()
+	body, err := os.ReadFile(filepath.Join("testdata", "current-copilot-catalog", "response.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var list modelListResponse
+	if err := json.Unmarshal(body, &list); err != nil {
+		t.Fatalf("decode captured Copilot catalog: %v", err)
+	}
+	for _, model := range list.Data {
+		if strings.EqualFold(model.ID, modelID) {
+			return normalizeModels([]upstreamModel{model})[0]
+		}
+	}
+	t.Fatalf("captured Copilot catalog has no model %q", modelID)
+	return upstreamModel{}
+}
+
+func capturedResponsesImageRequest(t *testing.T, detail string) []byte {
+	t.Helper()
+	body, err := os.ReadFile(filepath.Join("..", "translate", "testdata", "native-attachment-captures", "gpt-png", "request.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldDetail := []byte(`"detail": "auto"`)
+	if count := bytes.Count(body, oldDetail); count != 1 {
+		t.Fatalf("captured Responses request has %d image detail fields with auto value, want 1", count)
+	}
+	return bytes.Replace(body, oldDetail, []byte(`"detail": "`+detail+`"`), 1)
 }
 
 func boolPointer(value bool) *bool {

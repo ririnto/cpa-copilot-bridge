@@ -1,5 +1,62 @@
 # Live Copilot compatibility validation
 
+## Current validation (2026-10-10)
+
+The latest dependency and original-client checks use CLIProxyAPI SDK v8.0.23.
+The matched host used `replace github.com/router-for-me/CLIProxyAPI/v8 => github.com/ririnto/CLIProxyAPI/v8 v8.0.0-20261010040012-c48c64443575` from `go.mod` and Go 1.27.2.
+Claude Code 2.1.296 and Codex CLI 0.162.1 ran against that matched host.
+
+All 18 protocol matrix calls passed across JSON and SSE.
+Each of the three models passed Chat, Responses, and Messages in both formats.
+
+| Model | Chat | Responses | Messages |
+| --- | --- | --- | --- |
+| `gemini-3.8-flash` | JSON and SSE: PASS | JSON and SSE: PASS | JSON and SSE: PASS |
+| `gpt-6-luna` | JSON and SSE: PASS | JSON and SSE: PASS | JSON and SSE: PASS |
+| `claude-haiku-5.5` | JSON and SSE: PASS | JSON and SSE: PASS | JSON and SSE: PASS |
+
+| Client | Baseline | Web search | Delegation |
+| --- | --- | --- | --- |
+| Claude Code 2.1.296 | PASS | Invoked; Copilot returned HTTP 400 `unsupported_value` | Real Agent subdelegation: PASS |
+| Codex CLI 0.162.1 | PASS | Native search: PASS | Child spawn, wait, and handback: PASS |
+
+The Codex result followed preservation of the reserved Responses schema's `collaboration.wait_agent.timeout_ms` number type through CPA.
+The plugin did not rewrite that schema or invent a delegated result.
+
+The original Codex app-server completed `turn/interrupt` and a same-thread follow-up across two actual GPT-6-Luna medium Responses requests.
+The original client sent zero `response.interrupt` frames to CPA during that run.
+The RPC result does not prove that Codex emitted that wire frame.
+Synthetic native-control regressions remain separate evidence.
+The relay records application messages but cannot expose WebSocket masking bits or fragmentation boundaries.
+
+The original 177-byte Codex CLI PNG request to Haiku retained its SHA-256 and `detail: high` through the advertised Chat route.
+Haiku returned the correct red-and-blue answer.
+The original Claude Code PDF request to GPT-6-Luna preserved attachment bytes and tool-result correlation, then returned the correct `Q7B9` blue answer.
+The original Claude Code PNG request to GPT-6-Luna preserved bytes and transport but received an incorrect blue answer.
+That PNG-to-GPT case remains a semantic failure despite successful transport.
+Do not substitute another model to make it pass.
+
+Image-detail routing uses the model catalog and preserves the original request semantics.
+If Messages cannot represent image detail, the plugin selects Chat before dispatch when the same model advertises compatibility.
+It keeps the original image bytes and detail unchanged.
+If no advertised route can preserve the detail, or the caller explicitly forces Messages, the plugin returns HTTP 422 `unsupported_image_detail`.
+It does not downgrade the detail to `auto` or substitute a model.
+
+The latest original Codex PDF run completed with three HTTP 200 responses, exit code 0, and the correct `Q7B9` blue answer, independently verified against the full response bodies.
+Offline replay of the exact captures accepted the case after checking the carrier pair and actual mixed Messages-to-Chat endpoint sequence.
+The audit records three physical inference requests and zero provider calls during replay.
+It preserves the original `accepted: false` result unchanged and writes the audited `accepted: true` result separately.
+
+To repeat the offline audit without writing an audit record, point the two private replay-directory variables at the retained capture directories.
+
+```sh
+CPA_ATTACHMENT_CHAT_TRANSITION_REPLAY_GATE_DIR=/path/to/private-gate-directory \
+  CPA_ATTACHMENT_CHAT_TRANSITION_REPLAY_CASE_DIR=/path/to/private-case-directory \
+  go test ./integration -run '^TestAttachmentPacketHistoricalCodexPDFChatTransitionReplay$' -count=1 -v
+```
+
+Set `CPA_ATTACHMENT_CHAT_TRANSITION_WRITE_AUDIT=1` only to create a new separate audit result; the exclusive write refuses to overwrite an existing file.
+
 Validate each model through all three client APIs on a separate, loopback-only CPA host.
 Use existing Copilot credentials through the local credential resolver, without changing the operating proxy or global client settings.
 
@@ -23,7 +80,9 @@ Live validation uses that production path without a separate converter.
 
 Client function tools, including web search and delegated-task functions, retain their names and input schemas through conversion.
 Provider-owned native tools have a different execution contract.
-The existing filter excludes native tools that the selected endpoint cannot represent and reports exclusions through response metadata and headers.
+The same endpoint representability check drives both optional native-tool filtering and translation preflight, so the selected endpoint cannot silently discard a declaration that preflight would accept.
+Malformed declarations remain on the validation path.
+The filter reports excluded optional tools through response metadata and headers.
 Forced unsupported tools return an error instead of fabricated tool output.
 Ordinary Claude system text remains supported.
 The plugin preserves Copilot's structured `model_not_supported` rejection using a fixed message recognized by CPA.
@@ -81,6 +140,64 @@ Each CLI's failed baseline prevents subsequent tool requests for that client.
 Debug evidence includes original client and upstream request/response bodies and CLI output.
 The checks exclude authentication material and retain evidence in private directories even when validation fails.
 Regression fixtures preserve captured JSON fields and stream events, replacing only private or changing values.
+
+### Latest dependency and original-client reruns
+
+Prepare the matched CPA host and plugin, then set these portable environment variables.
+Run the commands from the plugin repository root.
+The host binary must be built with the versioned replacement shown above and the Go 1.27.2 toolchain used for these results.
+
+```sh
+export CPA_BINARY=/path/to/prepared/cli-proxy-api
+export CPA_LIVE_COPILOT_AUTH_FILE=/path/to/copilot-auth.json
+export CPA_LIVE_COPILOT_AUTH_MODE=token_exchange
+export CPA_LIVE_COPILOT_DEBUG_DIR=/path/to/private-debug-directory
+```
+
+These common settings provide the prepared CPA binary, copied `token_exchange` auth, and private diagnostics directory required by all three opt-in checks below.
+
+Run the latest captured dependency matrix with all nine model/API pairs in JSON and SSE.
+
+```sh
+CPA_LIVE_DEPENDENCY_MATRIX=1 \
+  go test ./integration -run '^TestLiveDependencyProtocolMatrix$' -count=1 -v
+```
+
+Run only the affected Codex baseline, native search, and real delegation checks after a host schema fix.
+The captured-client test resolves `claude` and `codex` through `PATH`; use Claude Code 2.1.296 and Codex CLI 0.162.1 to reproduce the recorded results.
+
+```sh
+CPA_LIVE_CAPTURED_CLIENTS=1 \
+  CPA_LIVE_CAPTURED_CLIENTS_ATTEMPT=fix-native-reserved-schema \
+  CPA_LIVE_CAPTURED_CLIENTS_CASES=codex \
+  go test ./integration -run '^TestLiveCapturedCLIClients$' -count=1 -v
+```
+
+The captured-client attempt defaults to `latest-dependencies` and also accepts `fix-native-reserved-schema`.
+The client selector defaults to both clients when unset and accepts `claude`, `codex`, or `claude,codex` in either client order.
+Invalid, duplicate, empty, and malformed selections fail before the host or catalog starts.
+Selecting `codex` reruns only Codex and leaves the prior Claude result untouched.
+
+The original Codex interrupt test requires the verified Codex 0.162.1 app-server inputs as private files.
+Copy the real client binary, exact model catalog, loopback-restricted sandbox profile, and app-server driver into private locations.
+Place the driver's real `codex_interrupt_probe.py` helper beside it with mode 0600.
+The test does not generate, fabricate, or bundle an app-server driver.
+The driver and helper must have mode 0600, and the existing Python `websockets` dependency must be installed.
+
+```sh
+CPA_LIVE_ORIGINAL_INTERRUPT=1 \
+  CPA_LIVE_ORIGINAL_INTERRUPT_ATTEMPT=fix-relay-origin \
+  CPA_LIVE_CODEX_EXPECTED_VERSION=0.162.1 \
+  CPA_LIVE_CODEX_BINARY=/path/to/private/codex-binary \
+  CPA_LIVE_CODEX_CATALOG=/path/to/private/codex-model-catalog.json \
+  CPA_LIVE_CODEX_SANDBOX=/path/to/private/loopback-sandbox-profile \
+  CPA_LIVE_CODEX_INTERRUPT_DRIVER=/path/to/private/codex_interrupt_live_driver.py \
+  go test ./integration -run '^TestLiveOriginalCodexInterrupt$' -count=1 -v
+```
+
+The interrupt attempt defaults to `latest-dependencies` and also accepts `fix-relay-origin`.
+Each attempt creates a fresh captured host and claim ledger.
+Keep debug directories outside the repository and publish only sanitized summaries.
 
 ## Fresh CPA authentication result
 
@@ -167,6 +284,8 @@ The current host and SDK are pinned to v8.0.23. Existing CPA handling now cancel
 Codex Responses requests can declare optional `web_search` with `external_web_access: false`. When the selected endpoint is Claude Messages, the existing native-tool exclusion mechanism now removes this unrepresentable declaration and discloses it in `X-Copilot-Excluded-Native-Tools` and response metadata. Ordinary function tools remain intact. Forced selection of the excluded tool fails before inference. This does not implement cached-only search or change it to live web search.
 
 Original Codex 0.161.0 PNG and PDF requests were rerun with full private body captures. PNG still fails before inference because its `detail: high` has no verified lossless Claude Messages mapping. The PDF initial request now reaches the provider and returns an actual rendering function call; The existing strict cancellation proof now permits continuation after a fully forwarded function-call terminal while retaining the read-cancellation record. A subsequent original renderer attempt failed because nested Seatbelt could not launch shell commands. An alternate isolated `danger-full-access` attempt avoided nesting but changed the generated search declaration to `external_web_access=true`, even with an explicit cached-search setting; Copilot refused it with HTTP 400. Those failures and every physical call remain retained. The maintained packet keeps the original `workspace-write` profile and renderer/view tools. The installed CLI rejects an external-sandbox mode; the distinct app-server policy was not substituted for the original PDF CLI route. Full PDF rendering and attachment completion remain unverified. An isolated original app-server run through the real proxy also confirms that `turn/interrupt` ends an active turn and permits another turn in the same thread, but this client version closes its WebSocket without emitting `response.interrupt`. Synthetic wire-control coverage must not be presented as an original-client interrupt frame.
+
+Cross-format image detail that Claude Messages cannot preserve returns a local HTTP 422 with code `unsupported_image_detail` and includes the destination endpoint and requested detail. The request retains its original image bytes; the adapter does not downgrade the detail to `auto`.
 
 ## Historical WebSocket interrupt limitation
 

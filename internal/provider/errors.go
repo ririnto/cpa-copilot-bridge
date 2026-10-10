@@ -1,9 +1,11 @@
 package provider
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 
+	"github.com/arthur-sommer-etc/cliproxyapi-copilot-plugin/internal/translate"
 	"github.com/tidwall/gjson"
 )
 
@@ -26,6 +28,17 @@ func statusError(code, message string, status int) error {
 		status = http.StatusInternalServerError
 	}
 	return &StatusError{Code: code, Message: message, HTTPStatus: status}
+}
+
+func translationStatusError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var imageDetailErr *translate.UnsupportedImageDetailError
+	if errors.As(err, &imageDetailErr) {
+		return statusError("unsupported_image_detail", imageDetailErr.Error(), http.StatusUnprocessableEntity)
+	}
+	return statusError("translation_error", err.Error(), http.StatusUnprocessableEntity)
 }
 
 // upstreamStatusError keeps provider response text out of client-visible errors.

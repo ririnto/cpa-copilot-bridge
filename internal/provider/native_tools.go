@@ -47,24 +47,16 @@ func filterUnrepresentableNativeTools(source, endpoint string, body []byte) ([]b
 		for _, tool := range declarations.tools.Array() {
 			typ := strings.TrimSpace(tool.Get("type").String())
 			unsupported := false
-			switch source {
-			case "openai-response":
-				switch typ {
-				case "", "function", "custom", "namespace":
-				case "web_search", "web_search_preview":
-					unsupported = endpoint == translate.EndpointChatCompletions || endpoint == translate.EndpointMessages && tool.Get("external_web_access").Type == gjson.False
-				case "shell":
-					unsupported = endpoint == translate.EndpointMessages || endpoint == translate.EndpointChatCompletions && tool.Get("environment.type").String() != "local"
-				default:
-					unsupported = endpoint == translate.EndpointChatCompletions || endpoint == translate.EndpointMessages
+			if source == "openai-response" || source == "claude" {
+				if !tool.IsObject() {
+					return nil, nil, statusError("invalid_tool_definition", "tool declarations must be objects", http.StatusUnprocessableEntity)
 				}
-			case "claude":
-				declarationType := tool.Get("type")
-				value := declarationType.Value()
-				if declarationType.Raw == "" {
-					value = ""
+				declaration := make(map[string]any)
+				if err := json.Unmarshal([]byte(tool.Raw), &declaration); err != nil {
+					return nil, nil, fmt.Errorf("decode tool declaration: %w", err)
 				}
-				unsupported = !translate.IsClaudeClientToolType(value) && (endpoint == translate.EndpointResponses || endpoint == translate.EndpointChatCompletions)
+				representable, valid := translate.NativeToolRepresentable(source, endpoint, declaration)
+				unsupported = valid && !representable
 			}
 			if unsupported {
 				removed = append(removed, tool)

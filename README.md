@@ -5,10 +5,12 @@ Licensed under the [MIT License](LICENSE).
 For an end-to-end deployment and Claude Code configuration walkthrough, see
 [`docs/claude-code-setup.md`](docs/claude-code-setup.md).
 
-To add only the plugin to an existing CLIProxyAPI installation, see
+To add the plugin and its required paired host to an existing CLIProxyAPI installation, see
 [`docs/install-existing-deployment.md`](docs/install-existing-deployment.md).
 
-Initial, self-owned GitHub Copilot subscription provider for the official `router-for-me/CLIProxyAPI` v8.0.23 release (plugin ABI version 1).
+GitHub Copilot subscription plugin built against the official `router-for-me/CLIProxyAPI` v8.0.23 SDK and plugin ABI version 1.
+Runtime requests require the paired maintained host selected by `go.mod`.
+The official v8.0.23 server lacks the required `host.payload.finalize` callback.
 The repository also defines a strictly isolated Docker deployment that retains CLIProxyAPI's built-in Claude subscription OAuth support.
 
 This stack uses only:
@@ -116,24 +118,37 @@ integration headers because Copilot rejects unrecognized
 
 ## Build and test
 
-Use Docker with Compose v2 and Go 1.26.8 or newer for `make test`.
-The production plugin build uses `golang:1.26-bookworm`, matching the Debian Bookworm runtime of the official image.
+Use Docker with Compose v2, Go 1.27.2 or newer, and Python 3.9 or newer for `make test`.
+The production plugin build uses `golang:1.27-bookworm`, matching the Debian Bookworm runtime of the official image.
 
 ```sh
 make test
 make build
+make prepare-runtime-host
 make test-native
 ```
 
 For opt-in calls against real Copilot models and isolated Claude Code/Codex client checks, see
 [`docs/live-copilot-validation.md`](docs/live-copilot-validation.md).
 
-`make test-native` prepares a CLIProxyAPI host from the SDK version selected in `go.mod` and compiles the integration test executable.
+`make test-native` prepares a CLIProxyAPI host from the version or maintained-fork
+replacement selected in `go.mod` and compiles the integration test executable.
+Set `NATIVE_HOST_SOURCE` to a local CLIProxyAPI checkout to test unreleased host
+changes; the script verifies its module identity and labels it as a local source.
 Preparation may download dependencies.
+The plugin uses the official v8.0.23 SDK and ABI. Payload-rule finalization requires
+the published maintained host replacement selected in `go.mod`; the official
+v8.0.23 release does not provide that callback. The development Compose file still
+defaults to the official image as its runtime base. `make prepare-runtime-host`
+builds the selected host and mounts it over the image's server binary, so the default
+development stack runs the maintained host while reusing the official image runtime.
+Set `CLI_PROXY_API_IMAGE` only when you intentionally want to change the runtime base.
 The runtime loads the built plugin and uses committed synthetic seeds under `integration/testdata/native/v1`.
 Linux runs the prepared binaries in a container with `--network=none` and only loopback available.
 The fixtures require no Copilot login.
 Missing artifacts or seed files fail the required lane.
+Failed native runs preserve their temporary request and response logs; set
+`NATIVE_HOST_KEEP_ARTIFACTS=1` to retain them after a successful run as well.
 
 To test a prebuilt plugin for the local platform, prepare the host and test executable before running the fixtures.
 
@@ -162,10 +177,15 @@ plugin directory, merge the `cliproxyapi-copilot` entry into
 `plugins.configs`, and restart CLIProxyAPI. Native and Docker instructions,
 including the complete configuration block, are in
 [`docs/install-existing-deployment.md`](docs/install-existing-deployment.md).
+The release archive includes `cliproxyapi-copilot.host-requirements.json`,
+which records the required `host.payload.finalize` callback and Go's selected
+versioned host module source. The plugin loader does not consume this metadata.
+Deploy the paired maintained host module recorded in the JSON; the official
+v8.0.23 server does not provide that callback.
 
 ## CI and releases
 
-Every push and pull request runs the Go tests and builds a production-compatible
+Every push and pull request runs the Go and release-metadata tests and builds a production-compatible
 Linux `amd64` marketplace package. Pushes do not publish releases.
 
 CI and release builds run the native host fixtures against the packaged plugin before publishing artifacts.
@@ -210,9 +230,16 @@ sed "s/__CLIPROXYAPI_API_KEY__/$(sed -n 's/^CLIPROXYAPI_API_KEY=//p' .runtime/se
   config/config.yaml > .runtime/config.yaml
 chmod 600 .runtime/config.yaml
 
-make build
+make prepare-runtime-host
 docker compose --env-file .runtime/secrets.env up -d
 ```
+
+`make prepare-runtime-host` builds both the plugin and its paired CLIProxyAPI
+host. The plugin uses the official v8.0.23 SDK and ABI, while payload-rule
+finalization requires the published maintained host module selected by the
+`go.mod` replacement. Compose overlays that built host on the official runtime
+image; the official v8.0.23 server alone does not implement the required
+callback.
 
 This generates `.runtime/secrets.env` and `.runtime/config.yaml` with mode
 0600. CLIProxyAPI does not expand environment variables in `api-keys`, so the

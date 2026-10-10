@@ -264,6 +264,12 @@ func livePacketFileSHA256(t *testing.T, path string) string {
 }
 
 func startLiveAttachmentHarness(t *testing.T, readiness func([]byte)) (*liveServerToolGate, string, func()) {
+	endpointOverrides := liveEndpointOverrides(nil)
+	delete(endpointOverrides, "claude-haiku-5.5")
+	return startLiveCapturedHarness(t, readiness, endpointOverrides)
+}
+
+func startLiveCapturedHarness(t *testing.T, readiness func([]byte), endpointOverrides map[string]string) (*liveServerToolGate, string, func()) {
 	t.Helper()
 	binary := livePacketBinary()
 	authPath := strings.TrimSpace(os.Getenv("CPA_LIVE_COPILOT_AUTH_FILE"))
@@ -296,6 +302,6 @@ func startLiveAttachmentHarness(t *testing.T, readiness func([]byte)) (*liveServ
 			readiness(body)
 		}
 	}
-	base, stop := startLiveNativeHostWithGate(t, binary, storageJSON, "token_exchange", liveEndpointOverrides(nil), gate.server.URL, check)
+	base, stop := startLiveNativeHostWithGate(t, binary, storageJSON, "token_exchange", endpointOverrides, gate.server.URL, check)
 	return gate, base, stop
 }

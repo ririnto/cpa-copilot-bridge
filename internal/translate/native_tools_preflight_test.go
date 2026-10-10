@@ -48,6 +48,35 @@ func TestResponsesNativePreflightRejectsSDKDroppedTools(t *testing.T) {
 	}
 }
 
+func TestNativeToolRepresentabilityMatchesTranslationPreflight(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		source        string
+		endpoint      string
+		declaration   map[string]any
+		wantSupported bool
+		wantValid     bool
+	}{
+		{name: "Responses namespace maps to Messages", source: "openai-response", endpoint: EndpointMessages, declaration: map[string]any{"type": "namespace", "name": "functions"}, wantSupported: true, wantValid: true},
+		{name: "Responses web search maps to Messages", source: "openai-response", endpoint: EndpointMessages, declaration: map[string]any{"type": "web_search", "external_web_access": true}, wantSupported: true, wantValid: true},
+		{name: "cached search is excluded", source: "openai-response", endpoint: EndpointMessages, declaration: map[string]any{"type": "web_search", "external_web_access": false}, wantSupported: false, wantValid: true},
+		{name: "malformed search option reaches preflight", source: "openai-response", endpoint: EndpointMessages, declaration: map[string]any{"type": "web_search", "external_web_access": "false"}, wantSupported: true, wantValid: true},
+		{name: "local shell maps to Chat", source: "openai-response", endpoint: EndpointChatCompletions, declaration: map[string]any{"type": "shell", "environment": map[string]any{"type": "local"}}, wantSupported: true, wantValid: true},
+		{name: "container shell is unsupported by Chat", source: "openai-response", endpoint: EndpointChatCompletions, declaration: map[string]any{"type": "shell", "environment": map[string]any{"type": "container_auto"}}, wantSupported: false, wantValid: true},
+		{name: "malformed shell environment reaches validation", source: "openai-response", endpoint: EndpointChatCompletions, declaration: map[string]any{"type": "shell", "environment": "local"}, wantSupported: false, wantValid: false},
+		{name: "Claude native tools stay on Messages", source: "claude", endpoint: EndpointMessages, declaration: map[string]any{"type": "web_fetch_20250910"}, wantSupported: true, wantValid: true},
+		{name: "Claude server tools do not become Responses functions", source: "claude", endpoint: EndpointResponses, declaration: map[string]any{"type": "web_fetch_20250910"}, wantSupported: false, wantValid: true},
+		{name: "malformed declaration type is retained for validation", source: "claude", endpoint: EndpointResponses, declaration: map[string]any{"type": false}, wantSupported: false, wantValid: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			supported, valid := NativeToolRepresentable(test.source, test.endpoint, test.declaration)
+			if supported != test.wantSupported || valid != test.wantValid {
+				t.Fatalf("representability=(%t,%t), want (%t,%t)", supported, valid, test.wantSupported, test.wantValid)
+			}
+		})
+	}
+}
+
 func TestResponsesNativePreflightRejectsUnsupportedChoicesWithoutDeclarations(t *testing.T) {
 	for _, typ := range []string{"file_search", "code_interpreter", "computer_use_preview", "mcp", "tool_search", "apply_patch", "shell"} {
 		for _, endpoint := range []string{EndpointChatCompletions, EndpointMessages} {

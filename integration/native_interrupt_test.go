@@ -65,6 +65,16 @@ func TestNativeHostResponseInterrupt(t *testing.T) {
 		if captured["fixture_cancel"] != true {
 			t.Fatalf("active plugin request did not reach the blocking fixture: %+v", captured)
 		}
+		wrongID := []byte(`{"type":"response.interrupt","response_id":"another-response"}`)
+		recordBody("client-interrupt-wrong-id.json", wrongID)
+		if err := connection.WriteMessage(websocket.TextMessage, wrongID); err != nil {
+			t.Fatal(err)
+		}
+		wrongEvent, wrongBody := readNativeInterruptEvent(t, connection)
+		recordBody("client-response-wrong-id.json", wrongBody)
+		if wrongEvent["type"] != "error" || wrongEvent["status"] != float64(http.StatusBadRequest) {
+			t.Fatalf("mismatched interrupt did not reject without canceling the active stream: %s", wrongBody)
+		}
 		interrupt := []byte(`{"type":"response.interrupt","response_id":"resp_cancel","mode":"discard_partial_items","extension":{"trace":"keep"}}`)
 		recordBody("client-interrupt-active.json", interrupt)
 		if err := connection.WriteMessage(websocket.TextMessage, interrupt); err != nil {
@@ -88,6 +98,10 @@ func TestNativeHostResponseInterrupt(t *testing.T) {
 		if after := upstreamRequestCount(state); after != beforeInterrupt {
 			t.Fatalf("response.interrupt dispatched %d extra upstream inference requests", after-beforeInterrupt)
 		}
+		if err := connection.WriteMessage(websocket.TextMessage, interrupt); err != nil {
+			t.Fatal(err)
+		}
+		recordBody("client-interrupt-duplicate.json", interrupt)
 		nextRequest := map[string]any{"type": "response.create", "model": "gpt-6-luna", "input": []any{map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "Continue on the same socket"}}}}}
 		nextRequestBody, err := json.Marshal(nextRequest)
 		if err != nil {
@@ -134,12 +148,25 @@ func TestNativeHostResponseInterrupt(t *testing.T) {
 		if err := connection.WriteMessage(websocket.TextMessage, lateInterrupt); err != nil {
 			t.Fatal(err)
 		}
-		lateEvent, lateEventBody := readNativeInterruptEvent(t, connection)
-		recordBody("client-response-late-interrupt.json", lateEventBody)
-		lateError, _ := lateEvent["error"].(map[string]any)
-		if lateEvent["type"] != "error" || lateEvent["status"] != float64(http.StatusBadRequest) || !strings.Contains(stringValue(lateError["message"]), "response.interrupt") {
-			t.Fatalf("late plugin interrupt = %+v, want the current truthful 400 unsupported-session boundary", lateEvent)
+		if err := connection.WriteMessage(websocket.TextMessage, barrier); err != nil {
+			t.Fatal(err)
 		}
+		lateEvent, lateEventBody := readNativeInterruptEvent(t, connection)
+		recordBody("client-response-after-late-interrupt-barrier.json", lateEventBody)
+		lateError, _ := lateEvent["error"].(map[string]any)
+		if lateEvent["type"] != "error" || !strings.Contains(stringValue(lateError["message"]), "fixture.lifecycle_barrier") {
+			t.Fatalf("known-terminal interrupt emitted an extra event before the queued barrier: %s", lateEventBody)
+		}
+		unknownID := []byte(`{"type":"response.interrupt","response_id":"never-created"}`)
+		if err := connection.WriteMessage(websocket.TextMessage, unknownID); err != nil {
+			t.Fatal(err)
+		}
+		unknownEvent, unknownBody := readNativeInterruptEvent(t, connection)
+		recordBody("client-response-unknown-interrupt.json", unknownBody)
+		if unknownEvent["type"] != "error" || unknownEvent["status"] != float64(http.StatusBadRequest) {
+			t.Fatalf("unknown response ID was accepted: %s", unknownBody)
+		}
+
 		if after := upstreamRequestCount(state); after != beforeInterrupt+1 {
 			t.Fatalf("late response.interrupt dispatched an upstream inference request: count=%d", after)
 		}

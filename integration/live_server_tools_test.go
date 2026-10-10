@@ -62,6 +62,7 @@ type liveServerToolGate struct {
 	captureCount                   int
 	captureErr                     error
 	freshClaims                    map[string]bool
+	attachmentFixtures             map[string]string
 	freshOperationArmed            bool
 	freshCatalogUnauthorizedSeen   bool
 	freshInferenceUnauthorizedSeen bool
@@ -139,11 +140,12 @@ func newLiveServerToolGateWithLedger(t *testing.T, directory, ledgerDirectory st
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 			Transport:     liveOneShotTransport{},
 		},
-		directory:   directory,
-		ledgerPath:  filepath.Join(ledgerDirectory, "dispatch-ledger.json"),
-		secrets:     append([]string{liveCopilotClientKey}, secrets...),
-		counts:      make(map[string]int),
-		freshClaims: make(map[string]bool),
+		directory:          directory,
+		ledgerPath:         filepath.Join(ledgerDirectory, "dispatch-ledger.json"),
+		secrets:            append([]string{liveCopilotClientKey}, secrets...),
+		counts:             make(map[string]int),
+		freshClaims:        make(map[string]bool),
+		attachmentFixtures: make(map[string]string),
 	}
 	if err := gate.withLedger(func(ledger *liveDispatchLedger) error { return nil }); err != nil {
 		t.Fatal("private dispatch ledger could not be initialized")
@@ -155,13 +157,22 @@ func newLiveServerToolGateWithLedger(t *testing.T, directory, ledgerDirectory st
 
 func (g *liveServerToolGate) setPhaseCell(phase, cell string) error {
 	key := phase + "/" + cell
-	if _, ok := liveServerToolPhaseCells[key]; !ok && !liveAttachmentGateCell(key) {
+	if _, ok := liveServerToolPhaseCells[key]; !ok && !liveAttachmentGateCell(key) && !liveDependencyMatrixCell(key) && !liveOriginalCLIClaimCell(key) && !liveOriginalInterruptCell(key) {
 		return errors.New("unknown server-tool phase cell")
 	}
 	g.mu.Lock()
 	g.phaseCell = key
 	g.mu.Unlock()
 	return nil
+}
+
+func (g *liveServerToolGate) setAttachmentFixture(cell, path string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.attachmentFixtures == nil {
+		g.attachmentFixtures = make(map[string]string)
+	}
+	g.attachmentFixtures[cell] = path
 }
 
 func liveAttachmentGateCell(key string) bool {
@@ -299,7 +310,7 @@ func (g *liveServerToolGate) reserve(path string) (string, string, string, bool)
 		case "/chat/completions", "/responses", "/v1/messages":
 			category = "inference"
 			_, configured := liveServerToolPhaseCells[key]
-			if liveAttachmentGateCell(key) {
+			if liveAttachmentGateCell(key) || liveDependencyMatrixCell(key) || liveOriginalCLIClaimCell(key) || liveOriginalInterruptCell(key) {
 				configured = true
 			}
 			if configured && !ledger.Frozen[key] && g.publicAPI != nil {
@@ -394,7 +405,7 @@ func (g *liveServerToolGate) withLedger(update func(*liveDispatchLedger) error) 
 }
 
 func (g *liveServerToolGate) freezeCell(cell string) {
-	if !strings.HasPrefix(cell, "A/") && !strings.HasPrefix(cell, "B/") && !liveAttachmentGateCell(cell) {
+	if !strings.HasPrefix(cell, "A/") && !strings.HasPrefix(cell, "B/") && !liveAttachmentGateCell(cell) && !liveDependencyMatrixCell(cell) && !liveOriginalCLIClaimCell(cell) && !liveOriginalInterruptCell(cell) {
 		return
 	}
 	g.mu.Lock()
@@ -413,8 +424,9 @@ func (g *liveServerToolGate) serveHTTP(writer http.ResponseWriter, request *http
 	}
 	g.mu.Lock()
 	preparedCell := g.phaseCell
+	preparedFixture := g.attachmentFixtures[preparedCell]
 	g.mu.Unlock()
-	if liveAttachmentGateCell(preparedCell) && !liveAttachmentPreparedPublicRequest(preparedCell, request.URL.Path, body) {
+	if liveAttachmentGateCell(preparedCell) && !liveAttachmentPreparedPublicRequestForFixture(preparedCell, request.URL.Path, body, preparedFixture) {
 		g.mu.Lock()
 		if g.captureErr == nil {
 			g.captureErr = errors.New("original client attempted an unprepared model, effort, or endpoint")

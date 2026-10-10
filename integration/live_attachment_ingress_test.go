@@ -201,12 +201,15 @@ func (i *liveAttachmentIngress) serveHTTP(writer http.ResponseWriter, request *h
 				capture.CaptureTruncated = true
 				i.fail(errors.New("original client response capture was truncated"))
 			}
-			if !capture.CaptureTruncated && requestModel.Model != "" && liveCompleteResponseFunctionCallTerminal(retained.Bytes(), requestModel.Model) {
-				capture.StreamTerminalComplete = true
-				capture.StreamTerminalFunction = true
-				if capture.StreamTerminalBytes == 0 {
-					capture.StreamTerminalBytes = retained.Len()
-					capture.StreamContextAtTerminal = liveSafeStreamReadErrorKind(request.Context().Err())
+			if !capture.CaptureTruncated && requestModel.Model != "" {
+				complete, functionCall := liveAttachmentIngressCompleteTerminal(retained.Bytes(), requestModel.Model)
+				if complete {
+					capture.StreamTerminalComplete = true
+					capture.StreamTerminalFunction = functionCall
+					if capture.StreamTerminalBytes == 0 {
+						capture.StreamTerminalBytes = retained.Len()
+						capture.StreamContextAtTerminal = liveSafeStreamReadErrorKind(request.Context().Err())
+					}
 				}
 			}
 			written, writeErr := writer.Write(chunk[:n])
@@ -245,6 +248,8 @@ func (i *liveAttachmentIngress) serveHTTP(writer http.ResponseWriter, request *h
 	switch {
 	case capture.ErrorClass == "local_host_response_read_error" && liveAttachmentIngressSemanticCancellation(capture, request.Context().Err(), forward.Context().Err()):
 		capture.StreamOutcome = "semantic_complete_function_call_downstream_cancelled"
+	case capture.ErrorClass == "local_host_response_read_error" && liveAttachmentIngressTextTerminalCancellation(capture, request.Context().Err(), forward.Context().Err()):
+		capture.StreamOutcome = "semantic_complete_text_terminal_downstream_cancelled"
 	case streamEndedCleanly && capture.ErrorClass == "" && !capture.CaptureTruncated:
 		capture.StreamOutcome = "clean_eof"
 	case capture.ErrorClass != "":
@@ -265,7 +270,16 @@ func liveAttachmentIngressConfirmFinalTerminal(capture *liveAttachmentIngressCap
 	if capture == nil {
 		return
 	}
-	if capture.CaptureTruncated || !liveCompleteResponseFunctionCallTerminal(body, expectedModel) {
+	if capture.CaptureTruncated {
+		capture.StreamTerminalComplete = false
+		capture.StreamTerminalFunction = false
+		capture.StreamTerminalForwarded = false
+		capture.StreamTerminalBytes = 0
+		capture.StreamContextAtTerminal = ""
+		return
+	}
+	complete, functionCall := liveAttachmentIngressCompleteTerminal(body, expectedModel)
+	if !complete {
 		capture.StreamTerminalComplete = false
 		capture.StreamTerminalFunction = false
 		capture.StreamTerminalForwarded = false
@@ -274,7 +288,68 @@ func liveAttachmentIngressConfirmFinalTerminal(capture *liveAttachmentIngressCap
 		return
 	}
 	capture.StreamTerminalComplete = true
-	capture.StreamTerminalFunction = true
+	capture.StreamTerminalFunction = functionCall
+}
+
+func liveAttachmentIngressCompleteTerminal(body []byte, expectedModel string) (complete bool, functionCall bool) {
+	if liveCompleteResponseFunctionCallTerminal(body, expectedModel) {
+		return true, true
+	}
+	if liveCompleteResponseTextTerminal(body, expectedModel) {
+		return true, false
+	}
+	return false, false
+}
+
+func liveCompleteResponseTextTerminal(body []byte, expectedModel string) bool {
+	if expectedModel == "" || !liveCompleteResponseTerminal(body, expectedModel) || liveCompleteResponseFunctionCallTerminal(body, expectedModel) {
+		return false
+	}
+	normalized := bytes.ReplaceAll(body, []byte("\r\n"), []byte("\n"))
+	frames := bytes.Split(bytes.TrimRight(normalized, "\n"), []byte("\n\n"))
+	if len(frames) == 0 {
+		return false
+	}
+	lastFrame := len(frames) - 1
+	for lastFrame >= 0 && len(bytes.TrimSpace(frames[lastFrame])) == 0 {
+		lastFrame--
+	}
+	if lastFrame < 0 {
+		return false
+	}
+	var data string
+	for _, line := range bytes.Split(frames[lastFrame], []byte("\n")) {
+		if bytes.HasPrefix(line, []byte("data:")) {
+			data = strings.TrimSpace(string(bytes.TrimPrefix(line, []byte("data:"))))
+		}
+	}
+	var event struct {
+		Response struct {
+			Output []struct {
+				Type    string `json:"type"`
+				Role    string `json:"role"`
+				Status  string `json:"status"`
+				Content []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"output"`
+		} `json:"response"`
+	}
+	if json.Unmarshal([]byte(data), &event) != nil {
+		return false
+	}
+	for _, item := range event.Response.Output {
+		if item.Type != "message" || item.Status != "completed" || item.Role != "assistant" {
+			continue
+		}
+		for _, content := range item.Content {
+			if content.Type == "output_text" && strings.TrimSpace(content.Text) != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func liveAttachmentIngressSemanticCancellation(capture liveAttachmentIngressCapture, downstream, outbound error) bool {
@@ -295,6 +370,161 @@ func liveAttachmentIngressSemanticCancellation(capture liveAttachmentIngressCapt
 		CaptureTruncated:        capture.CaptureTruncated,
 	}
 	return liveSemanticDownstreamCancellation(proof, downstream, outbound)
+}
+
+func liveAttachmentIngressTextTerminalCancellation(capture liveAttachmentIngressCapture, downstream, outbound error) bool {
+	var request struct {
+		Model string `json:"model"`
+	}
+	if json.Unmarshal([]byte(capture.Request.Body), &request) != nil || request.Model == "" || capture.ErrorClass != "local_host_response_read_error" || !capture.BodyComplete || capture.ResponseBodyComplete || !capture.StreamTerminalComplete || capture.StreamTerminalFunction || !capture.StreamTerminalForwarded || capture.StreamTerminalBytes <= 0 || capture.Response.Status < 200 || capture.Response.Status >= 300 || capture.StreamReadErrorKind != "context_canceled" || capture.DownstreamContextState != "context_canceled" || capture.OutboundContextState != "context_canceled" || capture.StreamContextAtTerminal != "active" || capture.CaptureTruncated {
+		return false
+	}
+	body := []byte(capture.Response.Body)
+	if !liveCompleteResponseTextTerminal(body, request.Model) || capture.StreamForwardedBytes < len(body) || capture.StreamFlushedBytes < len(body) {
+		return false
+	}
+	proof := liveServerToolCapture{
+		ErrorClass:              "upstream_response_read_error",
+		StreamReadErrorKind:     capture.StreamReadErrorKind,
+		DownstreamContextState:  capture.DownstreamContextState,
+		OutboundContextState:    capture.OutboundContextState,
+		StreamTerminalComplete:  capture.StreamTerminalComplete,
+		StreamTerminalForwarded: capture.StreamTerminalForwarded,
+		StreamTerminalBytes:     capture.StreamTerminalBytes,
+		StreamForwardedBytes:    capture.StreamForwardedBytes,
+		StreamFlushedBytes:      capture.StreamFlushedBytes,
+		StreamContextAtTerminal: capture.StreamContextAtTerminal,
+		CaptureTruncated:        capture.CaptureTruncated,
+	}
+	return liveSemanticDownstreamCancellation(proof, downstream, outbound)
+}
+
+func TestLiveAttachmentIngressCompletedTextTerminalCancellationRequiresFullForwardedProof(t *testing.T) {
+	body := []byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"object\":\"response\",\"status\":\"completed\",\"model\":\"claude-haiku-5.5\",\"usage\":{\"input_tokens\":12,\"output_tokens\":4},\"output\":[{\"type\":\"message\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"The top half is red and the bottom half is blue.\"}]}]}}\n\n")
+	capture := liveAttachmentIngressCapture{
+		Dispatched: true,
+		Request:    liveHTTPLog{Body: `{"model":"claude-haiku-5.5"}`},
+		Response:   liveHTTPLog{Status: http.StatusOK, Body: string(body)},
+		ErrorClass: "local_host_response_read_error", BodyComplete: true, ResponseBodyComplete: false,
+		StreamReadErrorKind: "context_canceled", DownstreamContextState: "context_canceled", OutboundContextState: "context_canceled",
+		StreamTerminalComplete: true, StreamTerminalForwarded: true, StreamTerminalBytes: len(body),
+		StreamForwardedBytes: len(body), StreamFlushedBytes: len(body), StreamContextAtTerminal: "active",
+		StreamOutcome: "semantic_complete_text_terminal_downstream_cancelled",
+	}
+	if !liveCompleteResponseTextTerminal(body, "claude-haiku-5.5") || !liveAttachmentIngressTextTerminalCancellation(capture, context.Canceled, context.Canceled) {
+		t.Fatal("complete native Responses text terminal canceled after full delivery was not recognized")
+	}
+	for name, alter := range map[string]func(*liveAttachmentIngressCapture){
+		"wrong-model": func(value *liveAttachmentIngressCapture) {
+			value.Response.Body = strings.Replace(value.Response.Body, `"model":"claude-haiku-5.5"`, `"model":"other"`, 1)
+		},
+		"missing-usage": func(value *liveAttachmentIngressCapture) {
+			value.Response.Body = strings.Replace(value.Response.Body, `"usage":{"input_tokens":12,"output_tokens":4}`, `"usage":{}`, 1)
+		},
+		"truncated": func(value *liveAttachmentIngressCapture) {
+			value.Response.Body = strings.TrimSuffix(value.Response.Body, "\n\n")
+		},
+		"nonterminal": func(value *liveAttachmentIngressCapture) {
+			value.Response.Body = strings.ReplaceAll(value.Response.Body, "response.completed", "response.incomplete")
+		},
+		"tool-calls-not-text": func(value *liveAttachmentIngressCapture) {
+			value.Response.Body = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"object\":\"response\",\"status\":\"completed\",\"model\":\"claude-haiku-5.5\",\"usage\":{\"input_tokens\":12,\"output_tokens\":4},\"output\":[{\"type\":\"function_call\",\"status\":\"completed\",\"call_id\":\"call-exec\",\"name\":\"exec_command\",\"arguments\":\"{}\"}]}}\n\n"
+		},
+		"short-forward": func(value *liveAttachmentIngressCapture) { value.StreamForwardedBytes-- },
+		"short-flush":   func(value *liveAttachmentIngressCapture) { value.StreamFlushedBytes-- },
+		"wrong-read-error": func(value *liveAttachmentIngressCapture) {
+			value.StreamReadErrorKind = "unexpected_eof"
+		},
+		"not-downstream-cancel": func(value *liveAttachmentIngressCapture) {
+			value.DownstreamContextState = "active"
+		},
+		"capture-truncated":        func(value *liveAttachmentIngressCapture) { value.CaptureTruncated = true },
+		"wrong-status":             func(value *liveAttachmentIngressCapture) { value.Response.Status = http.StatusBadRequest },
+		"function-terminal-marker": func(value *liveAttachmentIngressCapture) { value.StreamTerminalFunction = true },
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := capture
+			alter(&changed)
+			before, _ := json.Marshal(capture)
+			after, _ := json.Marshal(changed)
+			if bytes.Equal(before, after) {
+				t.Fatal("negative cancellation fixture did not mutate the captured proof")
+			}
+			if liveAttachmentIngressTextTerminalCancellation(changed, context.Canceled, context.Canceled) {
+				t.Fatal("truncated, unproven, mismatched, or tool-call response was treated as a text terminal")
+			}
+		})
+	}
+}
+
+func TestAttachmentPacketRetainedPNGResponseTextTerminalReplay(t *testing.T) {
+	caseDirectory := os.Getenv("CPA_ATTACHMENT_REPLAY_CASE_DIR")
+	if caseDirectory == "" {
+		t.Skip("set CPA_ATTACHMENT_REPLAY_CASE_DIR to inspect the retained original Codex PNG response body")
+	}
+	body, err := os.ReadFile(filepath.Join(caseDirectory, "original-client-hop", "client-hop-001.json"))
+	if err != nil {
+		t.Fatal("retained original-client response capture is unavailable")
+	}
+	var capture liveAttachmentIngressCapture
+	if json.Unmarshal(body, &capture) != nil || !liveCompleteResponseTextTerminal([]byte(capture.Response.Body), "claude-haiku-5.5") {
+		t.Fatal("actual captured Codex PNG completed text response did not match its native Responses terminal schema")
+	}
+	mutations := map[string]func(map[string]any){
+		"wrong-model":        func(response map[string]any) { response["model"] = "claude-haiku-5.5-low" },
+		"missing-usage":      func(response map[string]any) { delete(response, "usage") },
+		"nonterminal-status": func(response map[string]any) { response["status"] = "incomplete" },
+		"tool-calls-not-text": func(response map[string]any) {
+			response["output"] = []any{map[string]any{"type": "function_call", "status": "completed", "call_id": "call-exec", "name": "exec_command", "arguments": "{}"}}
+		},
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			changed := liveAttachmentMutateFinalResponsesResponse(t, capture.Response.Body, mutate)
+			if liveCompleteResponseTextTerminal(changed, "claude-haiku-5.5") {
+				t.Fatal("mutated actual captured Responses terminal was still recognized")
+			}
+		})
+	}
+	if liveCompleteResponseTextTerminal([]byte(strings.TrimSuffix(capture.Response.Body, "\n\n")), "claude-haiku-5.5") {
+		t.Fatal("truncated actual captured Responses stream was recognized as complete")
+	}
+}
+
+func liveAttachmentMutateFinalResponsesResponse(t *testing.T, body string, mutate func(map[string]any)) []byte {
+	t.Helper()
+	normalized := bytes.ReplaceAll([]byte(body), []byte("\r\n"), []byte("\n"))
+	frames := bytes.Split(normalized, []byte("\n\n"))
+	for index := len(frames) - 1; index >= 0; index-- {
+		frame := frames[index]
+		if len(bytes.TrimSpace(frame)) == 0 {
+			continue
+		}
+		lines := bytes.Split(frame, []byte("\n"))
+		for lineIndex, line := range lines {
+			if !bytes.HasPrefix(line, []byte("data:")) {
+				continue
+			}
+			var event map[string]any
+			if json.Unmarshal(bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:"))), &event) != nil {
+				t.Fatal("captured terminal event did not decode")
+			}
+			response, ok := event["response"].(map[string]any)
+			if !ok {
+				t.Fatal("captured terminal did not contain a response object")
+			}
+			mutate(response)
+			encoded, err := json.Marshal(event)
+			if err != nil {
+				t.Fatal("mutated captured terminal could not be encoded")
+			}
+			lines[lineIndex] = append([]byte("data: "), encoded...)
+			frames[index] = bytes.Join(lines, []byte("\n"))
+			return bytes.Join(frames, []byte("\n\n"))
+		}
+	}
+	t.Fatal("captured response terminal data event was not found")
+	return nil
 }
 
 func liveCompleteResponseFunctionCallTerminal(body []byte, expectedModel string) bool {
