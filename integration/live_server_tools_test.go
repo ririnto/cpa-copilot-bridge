@@ -46,21 +46,25 @@ var liveServerToolPhaseCells = map[string]struct{}{
 }
 
 type liveServerToolGate struct {
-	mu             sync.Mutex
-	server         *httptest.Server
-	client         *http.Client
-	directory      string
-	ledgerPath     string
-	secrets        []string
-	publicAPI      *url.URL
-	phaseCell      string
-	counts         map[string]int
-	inferenceCount int
-	authCount      int
-	catalogCount   int
-	deniedCount    int
-	captureCount   int
-	captureErr     error
+	mu                             sync.Mutex
+	server                         *httptest.Server
+	client                         *http.Client
+	directory                      string
+	ledgerPath                     string
+	secrets                        []string
+	publicAPI                      *url.URL
+	phaseCell                      string
+	counts                         map[string]int
+	inferenceCount                 int
+	authCount                      int
+	catalogCount                   int
+	deniedCount                    int
+	captureCount                   int
+	captureErr                     error
+	freshClaims                    map[string]bool
+	freshOperationArmed            bool
+	freshCatalogUnauthorizedSeen   bool
+	freshInferenceUnauthorizedSeen bool
 }
 
 type liveDispatchLedger struct {
@@ -83,6 +87,17 @@ type liveServerToolCapture struct {
 	Response                liveHTTPLog `json:"public_response"`
 	LocalResponse           liveHTTPLog `json:"test_hop_response"`
 	ErrorClass              string      `json:"error_class,omitempty"`
+	StreamReadErrorKind     string      `json:"stream_read_error_kind,omitempty"`
+	StreamReadErrorDetail   string      `json:"stream_read_error_detail,omitempty"`
+	DownstreamContextState  string      `json:"downstream_context_state,omitempty"`
+	OutboundContextState    string      `json:"outbound_context_state,omitempty"`
+	StreamTerminalComplete  bool        `json:"stream_terminal_complete,omitempty"`
+	StreamTerminalForwarded bool        `json:"stream_terminal_forwarded,omitempty"`
+	StreamTerminalBytes     int         `json:"stream_terminal_bytes,omitempty"`
+	StreamForwardedBytes    int         `json:"stream_forwarded_bytes,omitempty"`
+	StreamFlushedBytes      int         `json:"stream_flushed_bytes,omitempty"`
+	StreamContextAtTerminal string      `json:"stream_context_at_terminal,omitempty"`
+	StreamOutcome           string      `json:"stream_outcome,omitempty"`
 	CaptureTruncated        bool        `json:"capture_truncated,omitempty"`
 }
 
@@ -124,10 +139,11 @@ func newLiveServerToolGateWithLedger(t *testing.T, directory, ledgerDirectory st
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 			Transport:     liveOneShotTransport{},
 		},
-		directory:  directory,
-		ledgerPath: filepath.Join(ledgerDirectory, "dispatch-ledger.json"),
-		secrets:    append([]string{liveCopilotClientKey}, secrets...),
-		counts:     make(map[string]int),
+		directory:   directory,
+		ledgerPath:  filepath.Join(ledgerDirectory, "dispatch-ledger.json"),
+		secrets:     append([]string{liveCopilotClientKey}, secrets...),
+		counts:      make(map[string]int),
+		freshClaims: make(map[string]bool),
 	}
 	if err := gate.withLedger(func(ledger *liveDispatchLedger) error { return nil }); err != nil {
 		t.Fatal("private dispatch ledger could not be initialized")
@@ -139,13 +155,91 @@ func newLiveServerToolGateWithLedger(t *testing.T, directory, ledgerDirectory st
 
 func (g *liveServerToolGate) setPhaseCell(phase, cell string) error {
 	key := phase + "/" + cell
-	if _, ok := liveServerToolPhaseCells[key]; !ok {
+	if _, ok := liveServerToolPhaseCells[key]; !ok && !liveAttachmentGateCell(key) {
 		return errors.New("unknown server-tool phase cell")
 	}
 	g.mu.Lock()
 	g.phaseCell = key
 	g.mu.Unlock()
 	return nil
+}
+
+func liveAttachmentGateCell(key string) bool {
+	phase, name, ok := strings.Cut(key, "/")
+	if !ok {
+		return false
+	}
+	for _, candidate := range liveAttachmentCases() {
+		if candidate.cell != name {
+			continue
+		}
+		if phase == "X" {
+			return true
+		}
+		if strings.HasPrefix(phase, "X-") {
+			derived, err := liveAttachmentOperationCell(candidate, strings.TrimPrefix(phase, "X-"))
+			return err == nil && derived == key
+		}
+	}
+	return false
+}
+
+func (g *liveServerToolGate) setFreshClaim(category, cell string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.freshClaims[category+"/"+cell] = true
+	if category == "inference" {
+		g.freshInferenceUnauthorizedSeen = false
+	}
+}
+
+func (g *liveServerToolGate) clearFreshInferenceClaim(cell string) {
+	g.mu.Lock()
+	delete(g.freshClaims, "inference/"+cell)
+	g.freshInferenceUnauthorizedSeen = false
+	g.mu.Unlock()
+}
+
+func (g *liveServerToolGate) freshUnauthorizedRepeated(category string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if category == "catalog" {
+		repeated := g.freshCatalogUnauthorizedSeen
+		g.freshCatalogUnauthorizedSeen = true
+		return repeated
+	}
+	repeated := g.freshInferenceUnauthorizedSeen
+	g.freshInferenceUnauthorizedSeen = true
+	return repeated
+}
+
+func (g *liveServerToolGate) freshCatalogRecovered() {
+	g.mu.Lock()
+	g.freshCatalogUnauthorizedSeen = false
+	g.mu.Unlock()
+}
+
+func (g *liveServerToolGate) freshInferenceRecovered() {
+	g.mu.Lock()
+	g.freshInferenceUnauthorizedSeen = false
+	g.mu.Unlock()
+}
+
+func (g *liveServerToolGate) armFreshOperation() {
+	g.mu.Lock()
+	g.freshOperationArmed = true
+	g.mu.Unlock()
+}
+
+func (g *liveServerToolGate) stopFreshOperationOnFailure(category string) {
+	if os.Getenv("CPA_LIVE_CLIENT_ATTACHMENTS") != "1" || category != "auth" && category != "catalog" {
+		return
+	}
+	g.mu.Lock()
+	if g.captureErr == nil {
+		g.captureErr = errors.New("fresh SDK discovery failed; automatic retry denied")
+	}
+	g.mu.Unlock()
 }
 
 func (g *liveServerToolGate) reserve(path string) (string, string, string, bool) {
@@ -162,6 +256,32 @@ func (g *liveServerToolGate) reserve(path string) (string, string, string, bool)
 		}
 	}
 	category, key, origin, allowed := "unknown", g.phaseCell, "", false
+	if os.Getenv("CPA_LIVE_CLIENT_ATTACHMENTS") == "1" {
+		claimCategory := "unknown"
+		switch path {
+		case "/copilot_internal/v2/token":
+			claimCategory = "auth"
+		case "/models":
+			claimCategory = "catalog"
+		case "/chat/completions", "/responses", "/v1/messages":
+			claimCategory = "inference"
+		}
+		claimKey := claimCategory + "/"
+		if claimCategory == "inference" {
+			claimKey += key
+		}
+		if claimCategory == "auth" || claimCategory == "catalog" {
+			if !g.freshOperationArmed {
+				g.deniedCount++
+				return claimCategory, key, "", false
+			}
+		} else {
+			if !g.freshClaims[claimKey] {
+				g.deniedCount++
+				return claimCategory, key, "", false
+			}
+		}
+	}
 	err := g.withLedger(func(ledger *liveDispatchLedger) error {
 		switch path {
 		case "/copilot_internal/v2/token":
@@ -179,6 +299,9 @@ func (g *liveServerToolGate) reserve(path string) (string, string, string, bool)
 		case "/chat/completions", "/responses", "/v1/messages":
 			category = "inference"
 			_, configured := liveServerToolPhaseCells[key]
+			if liveAttachmentGateCell(key) {
+				configured = true
+			}
 			if configured && !ledger.Frozen[key] && g.publicAPI != nil {
 				ledger.Counts[key]++
 				ledger.Inference++
@@ -271,7 +394,7 @@ func (g *liveServerToolGate) withLedger(update func(*liveDispatchLedger) error) 
 }
 
 func (g *liveServerToolGate) freezeCell(cell string) {
-	if !strings.HasPrefix(cell, "A/") && !strings.HasPrefix(cell, "B/") {
+	if !strings.HasPrefix(cell, "A/") && !strings.HasPrefix(cell, "B/") && !liveAttachmentGateCell(cell) {
 		return
 	}
 	g.mu.Lock()
@@ -286,6 +409,18 @@ func (g *liveServerToolGate) serveHTTP(writer http.ResponseWriter, request *http
 	body, err := io.ReadAll(io.LimitReader(request.Body, maxBody+1))
 	if err != nil || len(body) > maxBody {
 		g.writeLocalFailure(writer, request, body, "request_body_unavailable", http.StatusRequestEntityTooLarge)
+		return
+	}
+	g.mu.Lock()
+	preparedCell := g.phaseCell
+	g.mu.Unlock()
+	if liveAttachmentGateCell(preparedCell) && !liveAttachmentPreparedPublicRequest(preparedCell, request.URL.Path, body) {
+		g.mu.Lock()
+		if g.captureErr == nil {
+			g.captureErr = errors.New("original client attempted an unprepared model, effort, or endpoint")
+		}
+		g.mu.Unlock()
+		g.writeLocalFailure(writer, request, body, "attachment_request_unprepared", http.StatusBadRequest)
 		return
 	}
 	category, phaseCell, origin, allowed := g.reserve(request.URL.Path)
@@ -337,24 +472,41 @@ func (g *liveServerToolGate) serveHTTP(writer http.ResponseWriter, request *http
 	if err != nil {
 		capture.ErrorClass = "upstream_transport_error"
 		g.record(capture)
+		g.stopFreshOperationOnFailure(category)
 		g.freezeCell(phaseCell)
 		g.writeJSONFailure(writer, "upstream_transport_error", http.StatusBadGateway)
 		return
 	}
 	defer response.Body.Close()
 	capture.Response = g.responseLog(response, nil, category)
-	// The accepted executor may refresh authentication once after a 401.
-	// Preserve and count that response without blocking its bounded recovery.
-	if category == "inference" && response.StatusCode >= 400 && response.StatusCode != http.StatusUnauthorized {
-		g.freezeCell(phaseCell)
+	if category == "inference" {
+		if os.Getenv("CPA_LIVE_CLIENT_ATTACHMENTS") == "1" && response.StatusCode == http.StatusUnauthorized {
+			if g.freshUnauthorizedRepeated(category) {
+				g.freezeCell(phaseCell)
+			}
+		} else if os.Getenv("CPA_LIVE_CLIENT_ATTACHMENTS") == "1" && response.StatusCode >= 200 && response.StatusCode < 300 {
+			g.freshInferenceRecovered()
+		} else if os.Getenv("CPA_LIVE_CLIENT_ATTACHMENTS") != "1" && response.StatusCode >= 400 && response.StatusCode != http.StatusUnauthorized || os.Getenv("CPA_LIVE_CLIENT_ATTACHMENTS") == "1" && (response.StatusCode < 200 || response.StatusCode >= 300) {
+			g.freezeCell(phaseCell)
+		}
 	}
 	if category != "inference" {
+		if os.Getenv("CPA_LIVE_CLIENT_ATTACHMENTS") == "1" && category == "catalog" && response.StatusCode == http.StatusUnauthorized {
+			if g.freshUnauthorizedRepeated(category) {
+				g.stopFreshOperationOnFailure(category)
+			}
+		} else if response.StatusCode < 200 || response.StatusCode >= 300 {
+			g.stopFreshOperationOnFailure(category)
+		} else if category == "catalog" && os.Getenv("CPA_LIVE_CLIENT_ATTACHMENTS") == "1" {
+			g.freshCatalogRecovered()
+		}
 		responseBody, readErr := io.ReadAll(io.LimitReader(response.Body, maxBody+1))
 		capture.Response = g.responseLog(response, responseBody, category)
 		if readErr != nil || len(responseBody) > maxBody {
 			capture.ErrorClass = "upstream_response_unavailable"
 			capture.CaptureTruncated = len(responseBody) > maxBody
 			g.record(capture)
+			g.stopFreshOperationOnFailure(category)
 			g.writeJSONFailure(writer, "upstream_response_unavailable", http.StatusBadGateway)
 			return
 		}
@@ -364,6 +516,7 @@ func (g *liveServerToolGate) serveHTTP(writer http.ResponseWriter, request *http
 			if err != nil {
 				capture.ErrorClass = "token_endpoint_invalid"
 				g.record(capture)
+				g.stopFreshOperationOnFailure(category)
 				g.writeJSONFailure(writer, "token_endpoint_invalid", http.StatusBadGateway)
 				return
 			}
@@ -376,6 +529,7 @@ func (g *liveServerToolGate) serveHTTP(writer http.ResponseWriter, request *http
 		_, err = writer.Write(forwardBody)
 		if err != nil {
 			capture.ErrorClass = "test_hop_write_error"
+			g.stopFreshOperationOnFailure(category)
 		}
 		g.record(capture)
 		return
@@ -387,39 +541,169 @@ func (g *liveServerToolGate) serveHTTP(writer http.ResponseWriter, request *http
 	capture.LocalResponse = liveHTTPLog{Proto: request.Proto, Status: response.StatusCode, Headers: g.redactedHeaders(writer.Header()), ContentLength: -1, ContentEncoding: writer.Header().Get("Content-Encoding"), FramingCoverage: "outgoing_framing_unobserved"}
 	var retained bytes.Buffer
 	chunk := make([]byte, 32<<10)
+	streamEndedCleanly := false
+	forwardedBytes, flushedBytes := 0, 0
 	for {
 		n, readErr := response.Body.Read(chunk)
 		if n > 0 {
 			remaining := maxBody - retained.Len()
-			if remaining > 0 {
-				retained.Write(chunk[:min(n, remaining)])
+			forwardN := min(n, remaining)
+			if forwardN > 0 {
+				retained.Write(chunk[:forwardN])
 			}
 			if n > remaining {
 				capture.CaptureTruncated = true
+				capture.ErrorClass = "capture_truncated"
 				g.mu.Lock()
 				if g.captureErr == nil {
 					g.captureErr = errors.New("private gate capture was truncated")
 				}
 				g.mu.Unlock()
 			}
-			if _, writeErr := writer.Write(chunk[:n]); writeErr != nil {
-				capture.ErrorClass = "test_hop_write_error"
-				break
+			if forwardN > 0 {
+				written, writeErr := writer.Write(chunk[:forwardN])
+				forwardedBytes += written
+				if writeErr != nil || written != forwardN {
+					capture.ErrorClass = "test_hop_write_error"
+					break
+				}
+				if flusher, ok := writer.(http.Flusher); ok {
+					flusher.Flush()
+					flushedBytes = forwardedBytes
+				}
+				if liveCompleteResponseTerminal(retained.Bytes(), liveAttachmentExpectedModel(phaseCell)) {
+					capture.StreamTerminalComplete = true
+					if capture.StreamTerminalBytes == 0 {
+						capture.StreamTerminalBytes = retained.Len()
+						capture.StreamContextAtTerminal = liveSafeStreamReadErrorKind(request.Context().Err())
+					}
+					if capture.StreamContextAtTerminal == "active" && flushedBytes >= capture.StreamTerminalBytes && !capture.CaptureTruncated {
+						capture.StreamTerminalForwarded = true
+					}
+				}
 			}
-			if flusher, ok := writer.(http.Flusher); ok {
-				flusher.Flush()
+			if capture.CaptureTruncated {
+				break
 			}
 		}
 		if readErr == io.EOF {
+			streamEndedCleanly = true
 			break
 		}
 		if readErr != nil {
 			capture.ErrorClass = "upstream_response_read_error"
+			capture.StreamReadErrorKind = liveSafeStreamReadErrorKind(readErr)
+			capture.StreamReadErrorDetail = g.redactedBody([]byte(fmt.Sprintf("%T: %s", readErr, readErr.Error())))
+			capture.DownstreamContextState = liveSafeStreamReadErrorKind(request.Context().Err())
+			capture.OutboundContextState = liveSafeStreamReadErrorKind(upstreamRequest.Context().Err())
 			break
 		}
 	}
+	capture.StreamTerminalComplete = liveCompleteResponseTerminal(retained.Bytes(), liveAttachmentExpectedModel(phaseCell))
+	capture.StreamForwardedBytes = forwardedBytes
+	capture.StreamFlushedBytes = flushedBytes
+	capture.StreamTerminalForwarded = capture.StreamTerminalForwarded && capture.StreamTerminalComplete && forwardedBytes >= capture.StreamTerminalBytes && flushedBytes >= capture.StreamTerminalBytes && capture.ErrorClass != "test_hop_write_error" && !capture.CaptureTruncated
+	switch {
+	case streamEndedCleanly && capture.ErrorClass == "" && !capture.CaptureTruncated:
+		capture.StreamOutcome = "clean_eof"
+	case liveSemanticDownstreamCancellation(capture, request.Context().Err(), upstreamRequest.Context().Err()):
+		capture.StreamOutcome = "semantic_complete_downstream_cancelled"
+	default:
+		capture.StreamOutcome = "unconfirmed_stream_failure"
+	}
 	capture.Response = g.responseLog(response, retained.Bytes(), category)
 	g.record(capture)
+}
+
+func liveCompleteResponseTerminal(body []byte, expectedModel ...string) bool {
+	normalized := bytes.ReplaceAll(body, []byte("\r\n"), []byte("\n"))
+	if !bytes.HasSuffix(normalized, []byte("\n\n")) {
+		return false
+	}
+	frames := bytes.Split(bytes.TrimRight(normalized, "\n"), []byte("\n\n"))
+	if len(frames) == 0 {
+		return false
+	}
+	lastFrame := len(frames) - 1
+	for lastFrame >= 0 && len(bytes.TrimSpace(frames[lastFrame])) == 0 {
+		lastFrame--
+	}
+	if lastFrame < 0 {
+		return false
+	}
+	var eventName, data string
+	for _, line := range bytes.Split(frames[lastFrame], []byte("\n")) {
+		if bytes.HasPrefix(line, []byte("event:")) {
+			eventName = strings.TrimSpace(string(bytes.TrimPrefix(line, []byte("event:"))))
+		}
+		if bytes.HasPrefix(line, []byte("data:")) {
+			data = strings.TrimSpace(string(bytes.TrimPrefix(line, []byte("data:"))))
+		}
+	}
+	if eventName != "response.completed" || data == "" {
+		return false
+	}
+	var event map[string]any
+	if json.Unmarshal([]byte(data), &event) != nil || event["type"] != "response.completed" || event["error"] != nil {
+		return false
+	}
+	response, _ := event["response"].(map[string]any)
+	usage, _ := response["usage"].(map[string]any)
+	if response["object"] != "response" || response["status"] != "completed" || response["error"] != nil || response["incomplete_details"] != nil || attachmentString(response, "model") == "" || !attachmentTokenCount(usage["input_tokens"], false) || !attachmentTokenCount(usage["output_tokens"], true) {
+		return false
+	}
+	if len(expectedModel) > 0 && expectedModel[0] != "" && response["model"] != expectedModel[0] {
+		return false
+	}
+	output, _ := response["output"].([]any)
+	meaningful := false
+	for _, raw := range output {
+		item, _ := raw.(map[string]any)
+		switch item["type"] {
+		case "reasoning":
+			continue
+		case "function_call":
+			var arguments map[string]any
+			if item["status"] != "completed" || attachmentString(item, "call_id") == "" || attachmentString(item, "name") == "" || json.Unmarshal([]byte(attachmentString(item, "arguments")), &arguments) != nil || arguments == nil {
+				return false
+			}
+			meaningful = true
+		case "message":
+			if item["status"] != "completed" || item["role"] != "assistant" {
+				return false
+			}
+			foundText := false
+			walkAttachmentJSON(item["content"], func(part map[string]any) {
+				foundText = foundText || part["type"] == "output_text" && strings.TrimSpace(attachmentString(part, "text")) != ""
+			})
+			if !foundText {
+				return false
+			}
+			meaningful = true
+		default:
+			return false
+		}
+	}
+	return meaningful
+}
+
+func liveSemanticDownstreamCancellation(capture liveServerToolCapture, downstream, outbound error) bool {
+	return capture.ErrorClass == "upstream_response_read_error" && capture.StreamReadErrorKind == "context_canceled" && errors.Is(downstream, context.Canceled) && errors.Is(outbound, context.Canceled) && capture.StreamContextAtTerminal == "active" && capture.StreamTerminalComplete && capture.StreamTerminalForwarded && capture.StreamTerminalBytes > 0 && capture.StreamForwardedBytes >= capture.StreamTerminalBytes && capture.StreamFlushedBytes >= capture.StreamTerminalBytes && !capture.CaptureTruncated
+}
+
+func liveSafeStreamReadErrorKind(err error) string {
+	switch {
+	case err == nil:
+		return "active"
+	case errors.Is(err, context.Canceled):
+		return "context_canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "context_deadline_exceeded"
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		return "unexpected_eof"
+	default:
+		return "other_read_error"
+	}
 }
 
 // HTTP/1-only single-use connections prevent hidden HTTP/2 retries from bypassing
@@ -1853,8 +2137,8 @@ func TestLiveServerToolGateTruncatedCaptureStopsFurtherDispatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer first.Body.Close()
-	if _, err := io.CopyN(io.Discard, first.Body, (16<<20)+1); err != nil {
-		t.Fatal(err)
+	if n, err := io.CopyN(io.Discard, first.Body, (16<<20)+1); err != io.EOF || n != 16<<20 {
+		t.Fatalf("truncated stream forwarded %d bytes with error %v, want bounded prefix and EOF", n, err)
 	}
 	// The upstream is paused before EOF, so no completed capture exists yet.
 	if status := sendLiveGateFixtureInference(t, client, gate.server.URL, "synthetic-github-token", "synthetic-copilot-token"); status != http.StatusTooManyRequests {

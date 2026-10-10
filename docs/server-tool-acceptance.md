@@ -248,6 +248,17 @@ Its converter regression verifies the actual Read declaration, arguments, encode
 Privacy replacements preserve the carrier encoding and repeated path relationships.
 The real wrong-color answer and earlier unclassified read cause remain failed evidence.
 
+Both original PDF Read cycles are also retained as complete Messages and Responses request/SSE bodies.
+Their regressions preserve the genuine page selections, tool arguments, encoded IDs and rendered JPEG bytes.
+The historical render and validator failures remain separate from the reviewed successful body replay.
+
+The maintained original-client packet is opt-in through `CPA_LIVE_CLIENT_ATTACHMENTS=1`.
+It requires explicit isolated CPA binary/plugin, copied authentication, private diagnostics, sandbox and expected installed client versions.
+PDF cases additionally require the existing renderer, and Claude PDF preparation requires Fontconfig paths; fixture overrides must match the pinned source bytes.
+The offline `TestAttachmentOriginalClaudePDFReadOffline` probe exercises installed Claude Read against a loopback fixture without provider inference.
+The independently reviewed `TestAttachmentPacketCorrectedPDFReplay` reads retained evidence and writes a separate verdict without changing the original failure.
+Ordinary tests cover strict terminal schemas, ordered content-block lifecycles, successful renderer/result correlation, counted authentication recovery and capture failure retention.
+
 ## Native producer boundary
 
 The pinned SDK exposes original request bodies, headers, metadata and a host HTTP client to executors.

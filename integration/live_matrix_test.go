@@ -24,6 +24,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -783,7 +784,7 @@ func startLiveNativeHost(t *testing.T, binary string, storageJSON []byte, authMo
 	return startLiveNativeHostWithGate(t, binary, storageJSON, authMode, endpointOverrides, "")
 }
 
-func startLiveNativeHostWithGate(t *testing.T, binary string, storageJSON []byte, authMode string, endpointOverrides map[string]string, gateURL string) (string, func()) {
+func startLiveNativeHostWithGate(t *testing.T, binary string, storageJSON []byte, authMode string, endpointOverrides map[string]string, gateURL string, readiness ...func([]byte)) (string, func()) {
 	t.Helper()
 	root := t.TempDir()
 	if err := os.MkdirAll(root, 0700); err != nil {
@@ -881,7 +882,8 @@ func startLiveNativeHostWithGate(t *testing.T, binary string, storageJSON []byte
 		t.Fatal("could not create private host log")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	command := exec.CommandContext(ctx, binary, "--config", configPath, "--local-model")
+	commandPath, commandArgs := livePacketExecutable(binary, "--config", configPath, "--local-model")
+	command := exec.CommandContext(ctx, commandPath, commandArgs...)
 	command.Env = liveChildEnvironment(root)
 	if debugDirectory != "" {
 		command.Env = append(command.Env, "WRITABLE_PATH="+debugDirectory)
@@ -923,6 +925,33 @@ func startLiveNativeHostWithGate(t *testing.T, binary string, storageJSON []byte
 	}
 	t.Cleanup(stop)
 	base := fmt.Sprintf("http://127.0.0.1:%d", port)
+	if os.Getenv("CPA_LIVE_CLIENT_ATTACHMENTS") == "1" {
+		deadline := time.Now().Add(20 * time.Second)
+		for {
+			connection, dialErr := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 200*time.Millisecond)
+			if dialErr == nil {
+				_ = connection.Close()
+				break
+			}
+			if command.Process.Signal(syscall.Signal(0)) != nil || time.Now().After(deadline) {
+				t.Fatal("attachment packet host did not open its local port")
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		pollContext, pollCancel := context.WithTimeout(context.Background(), 95*time.Second)
+		defer pollCancel()
+		observed := func(body []byte) error {
+			if len(readiness) > 0 && readiness[0] != nil {
+				readiness[0](append([]byte(nil), body...))
+			}
+			return nil
+		}
+		_, polls, pollErr := pollFreshLocalRegistry(pollContext, &http.Client{Timeout: 3 * time.Second}, base, 300, 100*time.Millisecond, func() bool { return command.Process.Signal(syscall.Signal(0)) == nil }, observed)
+		if pollErr != nil {
+			t.Fatalf("attachment packet local registry failed after %d polls: %v", polls, pollErr)
+		}
+		return base, stop
+	}
 	client := &http.Client{Timeout: 3 * time.Second}
 	deadline := time.NewTimer(20 * time.Second)
 	defer deadline.Stop()

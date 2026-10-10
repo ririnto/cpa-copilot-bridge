@@ -116,7 +116,7 @@ func capturedClaudeGPTPNGReadSSEShape(t *testing.T, body []byte) any {
 	return map[string]any{"type": "sse", "frame_count": len(shapes), "frames": shapes}
 }
 
-func assertCapturedClaudeGPTPNGReadFixtureIntegrity(t *testing.T, name, kind string, body []byte) {
+func assertCapturedClaudeGPTReadFixtureIntegrity(t *testing.T, readFile func(*testing.T, string) []byte, name, kind string, body []byte) {
 	t.Helper()
 	var manifest struct {
 		PNGDecodedSHA256 string `json:"png_decoded_sha256"`
@@ -132,7 +132,7 @@ func assertCapturedClaudeGPTPNGReadFixtureIntegrity(t *testing.T, name, kind str
 			SourceShapeSHA256     string `json:"source_shape_sha256"`
 		} `json:"bodies"`
 	}
-	manifestBody := readCapturedClaudeGPTPNGReadFile(t, "manifest.json")
+	manifestBody := readFile(t, "manifest.json")
 	if err := json.Unmarshal(manifestBody, &manifest); err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +163,7 @@ func assertCapturedClaudeGPTPNGReadFixtureIntegrity(t *testing.T, name, kind str
 	if decoded, err := hex.DecodeString(record.SourceBodySHA256); err != nil || len(decoded) != sha256.Size {
 		t.Fatalf("original source hash is missing or malformed for %s", name)
 	}
-	shapeBody := readCapturedClaudeGPTPNGReadFile(t, record.Shape)
+	shapeBody := readFile(t, record.Shape)
 	var wantShape any
 	if err := json.Unmarshal(shapeBody, &wantShape); err != nil {
 		t.Fatal(err)
@@ -480,18 +480,19 @@ func capturedClaudeGPTPNGReadToolResultInRequest(t *testing.T, body []byte) map[
 	return outputs[0]
 }
 
-func capturedClaudeGPTPNGReadFindPNGHash(t *testing.T, value any) string {
+func capturedClaudeGPTAttachmentReadFindImageHash(t *testing.T, value any, mediaType string) string {
 	t.Helper()
 	var hashes []string
+	dataURLPrefix := "data:" + mediaType + ";base64,"
 	var visit func(any)
 	visit = func(current any) {
 		switch typed := current.(type) {
 		case map[string]any:
-			if capturedClaudeGPTPNGReadString(typed["media_type"]) == "image/png" {
+			if capturedClaudeGPTPNGReadString(typed["media_type"]) == mediaType {
 				if data := capturedClaudeGPTPNGReadString(typed["data"]); data != "" {
 					decoded, err := base64.StdEncoding.DecodeString(data)
 					if err != nil {
-						t.Fatalf("decode captured PNG payload: %v", err)
+						t.Fatalf("decode captured %s payload: %v", mediaType, err)
 					}
 					digest := sha256.Sum256(decoded)
 					hashes = append(hashes, hex.EncodeToString(digest[:]))
@@ -505,10 +506,10 @@ func capturedClaudeGPTPNGReadFindPNGHash(t *testing.T, value any) string {
 				visit(item)
 			}
 		case string:
-			if strings.HasPrefix(typed, "data:image/png;base64,") {
-				decoded, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(typed, "data:image/png;base64,"))
+			if strings.HasPrefix(typed, dataURLPrefix) {
+				decoded, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(typed, dataURLPrefix))
 				if err != nil {
-					t.Fatalf("decode captured PNG data URL: %v", err)
+					t.Fatalf("decode captured %s data URL: %v", mediaType, err)
 				}
 				digest := sha256.Sum256(decoded)
 				hashes = append(hashes, hex.EncodeToString(digest[:]))
@@ -521,13 +522,13 @@ func capturedClaudeGPTPNGReadFindPNGHash(t *testing.T, value any) string {
 	}
 	for _, hash := range hashes[1:] {
 		if hash != hashes[0] {
-			t.Fatalf("one captured body contains multiple different PNG payloads")
+			t.Fatalf("one captured body contains multiple different %s payloads", mediaType)
 		}
 	}
 	return hashes[0]
 }
 
-func capturedClaudeGPTPNGReadSourcePNG(t *testing.T, claudeRequest []byte) (string, map[string]any) {
+func capturedClaudeGPTAttachmentReadSourceImage(t *testing.T, claudeRequest []byte, mediaType string) (string, map[string]any) {
 	t.Helper()
 	messages := capturedClaudeGPTPNGReadArray(capturedClaudeGPTPNGReadDecodeObject(t, claudeRequest)["messages"])
 	for _, rawMessage := range messages {
@@ -546,14 +547,14 @@ func capturedClaudeGPTPNGReadSourcePNG(t *testing.T, claudeRequest []byte) (stri
 					continue
 				}
 				source := capturedClaudeGPTPNGReadNestedMap(content, "source")
-				if capturedClaudeGPTPNGReadString(source["media_type"]) != "image/png" || capturedClaudeGPTPNGReadString(source["type"]) != "base64" {
-					t.Fatalf("native tool result did not contain the captured base64 PNG")
+				if capturedClaudeGPTPNGReadString(source["media_type"]) != mediaType || capturedClaudeGPTPNGReadString(source["type"]) != "base64" {
+					t.Fatalf("native tool result did not contain captured base64 %s", mediaType)
 				}
-				return capturedClaudeGPTPNGReadFindPNGHash(t, source), block
+				return capturedClaudeGPTAttachmentReadFindImageHash(t, source, mediaType), block
 			}
 		}
 	}
-	t.Fatal("captured Claude tool_result did not contain a PNG image")
+	t.Fatalf("captured Claude tool_result did not contain a %s image", mediaType)
 	return "", nil
 }
 
@@ -617,7 +618,7 @@ func TestCapturedClaudeGPTPNGReadBodyShapeAndProvenance(t *testing.T) {
 			} else {
 				body = capturedClaudeGPTPNGReadSSE(t, name)
 			}
-			assertCapturedClaudeGPTPNGReadFixtureIntegrity(t, name, kind, body)
+			assertCapturedClaudeGPTReadFixtureIntegrity(t, readCapturedClaudeGPTPNGReadFile, name, kind, body)
 			assertCapturedClaudeGPTPNGReadPrivacySentinels(t, body, kind)
 		})
 	}
@@ -776,9 +777,9 @@ func TestCapturedClaudeGPTPNGReadRunsExistingMessagesToResponsesAndStreamConvert
 	requireLiveBodyJSONEqual(t, generatedArgs2JSON, claudeArgsJSON)
 	requireLiveBodyJSONEqual(t, capturedArgs2JSON, providerArgsJSON)
 
-	pngHash, _ := capturedClaudeGPTPNGReadSourcePNG(t, claudeRequest2)
-	generatedPNGHash := capturedClaudeGPTPNGReadFindPNGHash(t, generatedOutput2["output"])
-	capturedPNGHash := capturedClaudeGPTPNGReadFindPNGHash(t, capturedOutput2["output"])
+	pngHash, _ := capturedClaudeGPTAttachmentReadSourceImage(t, claudeRequest2, "image/png")
+	generatedPNGHash := capturedClaudeGPTAttachmentReadFindImageHash(t, generatedOutput2["output"], "image/png")
+	capturedPNGHash := capturedClaudeGPTAttachmentReadFindImageHash(t, capturedOutput2["output"], "image/png")
 	manifestBody := readCapturedClaudeGPTPNGReadFile(t, "manifest.json")
 	var mediaManifest struct {
 		PNGDecodedSHA256 string `json:"png_decoded_sha256"`
