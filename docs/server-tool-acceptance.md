@@ -133,7 +133,7 @@ Fresh outcomes, physical counts and unresolved cases must be recorded before exp
 ## Current native evidence
 
 Twelve native inference requests completed before the later isolated plugin startup.
-The later corrected isolated startup and five native capability probes bring observed totals to seventeen inference requests, ten authentication dispatches and six catalogue dispatches.
+The later corrected startup, five native capability probes and original-client attachment attempts bring observed totals to twenty-seven inference requests, fourteen authentication dispatches and ten catalogue dispatches.
 The authentication count includes one accidental credential-free test request that returned HTTP 404.
 Subsequent offline tests enforce loopback-only isolation.
 Native Claude PNG and PDF content assertions passed, as did native Gemini PNG content.
@@ -207,3 +207,59 @@ Claude execution recognizes the explicit native bash execution call/result varia
 These offline predicates and synthetic negatives validate acceptance checks rather than supplying missing provider capabilities.
 An incomplete private capture stops further dispatch as soon as its retained-body limit is exceeded, before stream completion or capture serialization.
 The partial body and truncation marker remain available for failure diagnosis.
+
+## Original-client attachment evidence
+
+The first cross-model packet uses Claude Code's built-in `Read` and Codex's original image or executable/view workflow.
+Original client bodies are captured before conversion, separately from converted public requests and both response streams.
+Claude's PNG read and converted Responses function result contain the original image bytes, with identical decoded SHA256.
+GPT nevertheless answered that both halves were red, so this visual case remains failed.
+The first PDF read reported `pdftoppm` unavailable in the isolated client environment.
+Both Codex cases rejected the empty model catalogue before inference.
+These preparation failures and all original bodies remain retained; they do not establish global model unavailability.
+Only demonstrated environment or instrumentation changes justify revalidation of these cases.
+
+The preparation retry preserves the earlier failures and uses separately recorded operation cells.
+Claude PDF now reaches the maintained renderer, but Read reports Fontconfig and image-output write errors.
+Both model responses complete cleanly, including the paired Read result; the final answer has no inspected PDF content.
+Codex PNG prepares the original bytes, then receives a local HTTP 422 because explicit image detail cannot be represented by Messages.
+Codex PDF receives a local HTTP 422 because its cached-only search declaration sets `external_web_access=false`, which Messages cannot represent.
+Neither refusal dispatches provider inference.
+The full original client and local error bodies remain retained separately from public provider captures.
+
+A later changed-environment run uses Claude Code 2.1.296 and its original PDF Read page-rendering path.
+The source PDF remains unchanged, while Read returns a JPEG page whose decoded bytes match the original follow-up and converted public request.
+The source PDF and rendered JPEG hashes are recorded separately.
+The first provider response ends with clean EOF.
+The second successful terminal is fully forwarded and flushed before captured downstream and outbound contexts report cancellation, establishing semantic completion separately from clean EOF.
+Visual inspection of the retained JPEG shows the blue rectangle but no printed code, matching the model's answer.
+That content assertion remains failed; it does not establish a model misreading of visible text.
+
+An existing installed Fontconfig configuration resolves the Helvetica substitution, and the original Read now renders the printed code with the blue rectangle.
+The changed-environment live case retains Read's genuine `pages: "1-20"` selection on the one-page fixture.
+It returns one correlated JPEG, with identical decoded client-prepared and public bytes, followed by the correct `Q7B9` and blue answer.
+Both provider streams complete with clean EOF.
+The initial validator wrongly requires the literal page selection `1` and therefore records a failure.
+That original verdict remains preserved, and a separate independently reviewed body replay passes the genuine range, exact tool arguments, single-page output, hashes and completed-response checks.
+No request modification or additional provider call substitutes for this replay.
+
+The checked-in original Claude-to-GPT PNG cycle contains both original Messages requests/local SSE streams and both converted Responses requests/provider SSE streams.
+Its converter regression verifies the actual Read declaration, arguments, encoded tool-ID carrier, paired result and unchanged PNG bytes across both hops.
+Privacy replacements preserve the carrier encoding and repeated path relationships.
+The real wrong-color answer and earlier unclassified read cause remain failed evidence.
+
+## Native producer boundary
+
+The pinned SDK exposes original request bodies, headers, metadata and a host HTTP client to executors.
+Authentically supplied request information can therefore be preserved without a new plugin ABI.
+The schema's source format does not identify an authenticated client runtime.
+The SDK does not supply Copilot's executable tool registry, attachment preparation callback or ACP session-loading state.
+Different original clients retain their own instructions and available executable tools.
+Literal native Copilot body and HTTP fingerprint equality cannot be claimed by copying its tool declarations or inventing lifecycle identifiers.
+Applicable interoperability checks retain exact models, authentic identity bindings, original attachment preparation, correlated tool results and continuation.
+
+The actual GPT search result entries have titles, URLs and snippets but no Anthropic encrypted result content.
+Its citation lacks an Anthropic encrypted index.
+CPA's existing converter cannot invent those replay values; an explicit unsupported result remains necessary where lossless conversion requires them.
+Native Claude bash execution likewise has no demonstrated lossless Python Code Interpreter equivalent in the pinned registry.
+The complete native capture fixtures preserve these actual fields and outcomes rather than supplying invented cross-format success.
