@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,79 +23,265 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-func TestNativeHostResponseInterruptUnsupported(t *testing.T) {
+func TestNativeHostResponseInterrupt(t *testing.T) {
 	binary := os.Getenv("CPA_BINARY")
 	if binary == "" {
-		t.Skip("set CPA_BINARY to the prepared CLIProxyAPI v8 server for this unsupported-control-frame diagnosis")
+		t.Skip("set CPA_BINARY to the prepared CLIProxyAPI v8 server for native host integration")
 	}
-	t.Run("PluginNormalization", func(t *testing.T) {
+	t.Run("PluginActiveHTTPStreamAndLateBoundary", func(t *testing.T) {
 		state := newNativeFixture(t)
 		upstream := httptest.NewServer(state)
 		t.Cleanup(upstream.Close)
 		base, stop := startNativeInterruptDiagnosticHost(t, binary, upstream.URL, true)
 		defer stop()
 		connection := dialNativeResponsesWebsocket(t, base)
-		request := nativeWebsocketRequest(t, "gpt-6-luna", "/responses")
-		if err := connection.WriteJSON(request); err != nil {
+		recordBody := newNativeInterruptBodyRecorder(t, "interrupt-plugin-wire")
+		request := map[string]any{
+			"type": "response.create", "model": "gpt-6-luna", "input": []any{map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "Wait for the synthetic interrupt"}}}},
+			"fixture_cancel": true,
+		}
+		requestBody, err := json.Marshal(request)
+		if err != nil {
 			t.Fatal(err)
 		}
-		completed := nativeCompletedResponse(t, readPluginResponsesWebsocket(t, connection))
-		before := upstreamRequestCount(state)
-		responseID, ok := completed["id"].(string)
-		if !ok || responseID == "" {
-			t.Fatal("plugin response did not expose its response ID")
+		recordBody("client-create-active.json", requestBody)
+		if err := connection.WriteMessage(websocket.TextMessage, requestBody); err != nil {
+			t.Fatal(err)
 		}
-		assertNativeInterruptRejection(t, connection, responseID)
-		if after := upstreamRequestCount(state); after != before {
-			t.Fatalf("unsupported interrupt dispatched %d extra upstream inference requests", after-before)
+		created, createdBody := readNativeInterruptEvent(t, connection)
+		recordBody("client-response-created.json", createdBody)
+		if created["type"] != "response.created" {
+			t.Fatalf("active plugin stream event = %+v, want response.created", created)
+		}
+		createdResponse, ok := created["response"].(map[string]any)
+		if !ok || createdResponse["id"] != "resp_cancel" {
+			t.Fatalf("active plugin response ID = %v, want resp_cancel", created["response"])
+		}
+		beforeInterrupt := upstreamRequestCount(state)
+		if beforeInterrupt != 1 {
+			t.Fatalf("active plugin stream opened %d upstream inference requests, want 1", beforeInterrupt)
+		}
+		captured, _ := lastUpstreamRequest(t, state)
+		if captured["fixture_cancel"] != true {
+			t.Fatalf("active plugin request did not reach the blocking fixture: %+v", captured)
+		}
+		interrupt := []byte(`{"type":"response.interrupt","response_id":"resp_cancel","mode":"discard_partial_items","extension":{"trace":"keep"}}`)
+		recordBody("client-interrupt-active.json", interrupt)
+		if err := connection.WriteMessage(websocket.TextMessage, interrupt); err != nil {
+			t.Fatal(err)
+		}
+		interrupted, interruptedBody := readNativeInterruptEvent(t, connection)
+		recordBody("client-response-interrupted.json", interruptedBody)
+		response, ok := interrupted["response"].(map[string]any)
+		if interrupted["type"] != "response.incomplete" || !ok || response["id"] != "resp_cancel" {
+			t.Fatalf("active plugin interrupt terminal = %+v, want response.incomplete for resp_cancel", interrupted)
+		}
+		details, _ := response["incomplete_details"].(map[string]any)
+		if details["reason"] != "interrupted" {
+			t.Fatalf("active plugin interrupt reason = %v, want interrupted", details["reason"])
+		}
+		select {
+		case <-state.canceled:
+		case <-time.After(5 * time.Second):
+			t.Fatal("active plugin interrupt did not cancel its upstream HTTP request")
+		}
+		if after := upstreamRequestCount(state); after != beforeInterrupt {
+			t.Fatalf("response.interrupt dispatched %d extra upstream inference requests", after-beforeInterrupt)
+		}
+		nextRequest := map[string]any{"type": "response.create", "model": "gpt-6-luna", "input": []any{map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "Continue on the same socket"}}}}}
+		nextRequestBody, err := json.Marshal(nextRequest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		recordBody("client-create-after-interrupt.json", nextRequestBody)
+		if err := connection.WriteMessage(websocket.TextMessage, nextRequestBody); err != nil {
+			t.Fatal(err)
+		}
+		nextEvents := readPluginResponsesWebsocket(t, connection)
+		nextEventsBody, err := json.Marshal(nextEvents)
+		if err != nil {
+			t.Fatal(err)
+		}
+		recordBody("client-response-after-interrupt.json", nextEventsBody)
+		completed := nativeCompletedResponse(t, nextEvents)
+		if completed["status"] != "completed" || completed["model"] != "gpt-6-luna" {
+			t.Fatalf("same-socket follow-up response = %+v", completed)
+		}
+		if after := upstreamRequestCount(state); after != beforeInterrupt+1 {
+			t.Fatalf("same-socket follow-up made %d upstream requests, want exactly one", after-beforeInterrupt)
+		}
+		completedID, ok := completed["id"].(string)
+		if !ok || completedID == "" {
+			t.Fatal("completed plugin response did not expose its response ID")
+		}
+		// A queued normalization error proves the previous forwarder has exited.
+		// Receiving response.completed alone can race its deferred lifecycle cleanup.
+		barrier := []byte(`{"type":"fixture.lifecycle_barrier"}`)
+		recordBody("client-lifecycle-barrier.json", barrier)
+		if err := connection.WriteMessage(websocket.TextMessage, barrier); err != nil {
+			t.Fatal(err)
+		}
+		barrierEvent, barrierBody := readNativeInterruptEvent(t, connection)
+		recordBody("client-response-lifecycle-barrier.json", barrierBody)
+		if barrierEvent["type"] != "error" {
+			t.Fatalf("lifecycle barrier did not return a normalization error: %s", barrierBody)
+		}
+		lateInterrupt, err := json.Marshal(map[string]string{"type": "response.interrupt", "response_id": completedID, "mode": "discard_partial_items"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		recordBody("client-interrupt-after-completed.json", lateInterrupt)
+		if err := connection.WriteMessage(websocket.TextMessage, lateInterrupt); err != nil {
+			t.Fatal(err)
+		}
+		lateEvent, lateEventBody := readNativeInterruptEvent(t, connection)
+		recordBody("client-response-late-interrupt.json", lateEventBody)
+		lateError, _ := lateEvent["error"].(map[string]any)
+		if lateEvent["type"] != "error" || lateEvent["status"] != float64(http.StatusBadRequest) || !strings.Contains(stringValue(lateError["message"]), "response.interrupt") {
+			t.Fatalf("late plugin interrupt = %+v, want the current truthful 400 unsupported-session boundary", lateEvent)
+		}
+		if after := upstreamRequestCount(state); after != beforeInterrupt+1 {
+			t.Fatalf("late response.interrupt dispatched an upstream inference request: count=%d", after)
 		}
 	})
 	t.Run("ActiveNativeDuplex", func(t *testing.T) {
 		requests := make(chan []byte, 4)
 		finished := make(chan struct{})
+		var finishedOnce sync.Once
+		var connections atomic.Int32
 		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 			connection, err := upgrader.Upgrade(w, r, nil)
 			if err != nil {
 				return
 			}
-			defer close(finished)
+			connections.Add(1)
+			defer finishedOnce.Do(func() { close(finished) })
 			defer connection.Close()
-			_, request, err := connection.ReadMessage()
-			if err != nil {
-				return
-			}
-			requests <- request
-			if err := writeNativeWebsocketJSON(connection, map[string]any{"type": "response.created", "sequence_number": 0, "response": map[string]any{"id": "resp-interrupted", "object": "response", "status": "in_progress", "model": "fixture-summary", "output": []any{}}}); err != nil {
-				return
-			}
+			interrupted := false
 			for {
 				_, request, err := connection.ReadMessage()
 				if err != nil {
 					return
 				}
-				requests <- request
+				requests <- append([]byte(nil), request...)
+				var event map[string]any
+				if err := json.Unmarshal(request, &event); err != nil {
+					return
+				}
+				if event["type"] == "response.interrupt" {
+					interrupted = true
+					if err := writeNativeWebsocketJSON(connection, map[string]any{"type": "response.incomplete", "sequence_number": 3, "response": map[string]any{"id": "resp-interrupted", "object": "response", "status": "incomplete", "incomplete_details": map[string]any{"reason": "interrupted"}, "output": []any{}}}); err != nil {
+						return
+					}
+					continue
+				}
+				if event["type"] != "response.create" {
+					return
+				}
+				responseID := "resp-interrupted"
+				if interrupted {
+					responseID = "resp-after-interrupt"
+				}
+				if err := writeNativeWebsocketJSON(connection, map[string]any{"type": "response.created", "sequence_number": 0, "response": map[string]any{"id": responseID, "object": "response", "status": "in_progress", "model": "fixture-summary", "output": []any{}}}); err != nil {
+					return
+				}
+				if responseID == "resp-interrupted" {
+					continue
+				}
+				output := map[string]any{"type": "message", "id": "msg-after-interrupt", "role": "assistant", "status": "completed", "content": []any{map[string]any{"type": "output_text", "text": "continued after interrupt"}}}
+				if err := writeNativeWebsocketJSON(connection, map[string]any{"type": "response.output_item.done", "sequence_number": 3, "output_index": 0, "response_id": responseID, "item": output}); err != nil {
+					return
+				}
+				if err := writeNativeWebsocketJSON(connection, map[string]any{"type": "response.completed", "sequence_number": 4, "response": map[string]any{"id": responseID, "object": "response", "status": "completed", "model": "fixture-summary", "output": []any{output}, "usage": map[string]any{"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}}}); err != nil {
+					return
+				}
 			}
 		}))
 		t.Cleanup(upstream.Close)
 		base, stop := startNativeInterruptDiagnosticHost(t, binary, upstream.URL, false)
 		defer stop()
 		connection := dialNativeResponsesWebsocket(t, base)
-		if err := connection.WriteJSON(map[string]any{"type": "response.create", "model": "fixture-summary", "input": []any{map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "Synthetic interrupt diagnosis."}}}}}); err != nil {
+		recordBody := newNativeInterruptBodyRecorder(t, "interrupt-codex-wire")
+		firstCreate := map[string]any{"type": "response.create", "model": "fixture-summary", "input": []any{map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "Synthetic interrupt diagnosis."}}}}}
+		firstCreateBody, err := json.Marshal(firstCreate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		recordBody("client-create-active.json", firstCreateBody)
+		if err := connection.WriteMessage(websocket.TextMessage, firstCreateBody); err != nil {
 			t.Fatal(err)
 		}
 		first := receiveNativeWebsocketRequest(t, requests)
-		if !strings.Contains(string(first), "response.create") {
+		recordBody("upstream-create-active.json", first)
+		var firstEvent map[string]any
+		if err := json.Unmarshal(first, &firstEvent); err != nil || firstEvent["type"] != "response.create" {
 			t.Fatalf("upstream initial frame was not response.create: %s", first)
 		}
-		var created map[string]any
-		if err := connection.ReadJSON(&created); err != nil {
-			t.Fatal(err)
-		}
+		created, createdBody := readNativeInterruptEvent(t, connection)
+		recordBody("client-response-created.json", createdBody)
 		if created["type"] != "response.created" {
 			t.Fatalf("initial event = %+v, want response.created", created)
 		}
-		assertNativeInterruptRejection(t, connection, "resp-interrupted")
+		interrupt := []byte(`{"type":"response.interrupt","response_id":"resp-interrupted","mode":"discard_partial_items","extension":{"keep":"unchanged"}}`)
+		recordBody("client-interrupt-active.json", interrupt)
+		if err := connection.WriteMessage(websocket.TextMessage, interrupt); err != nil {
+			t.Fatal(err)
+		}
+		forwarded := receiveNativeWebsocketRequest(t, requests)
+		recordBody("upstream-interrupt-active.json", forwarded)
+		if !bytes.Equal(forwarded, interrupt) {
+			t.Fatalf("native upstream interrupt changed: got %s, want %s", forwarded, interrupt)
+		}
+		interrupted, interruptedBody := readNativeInterruptEvent(t, connection)
+		recordBody("client-response-interrupted.json", interruptedBody)
+		response, ok := interrupted["response"].(map[string]any)
+		details, _ := response["incomplete_details"].(map[string]any)
+		if interrupted["type"] != "response.incomplete" || !ok || response["id"] != "resp-interrupted" || details["reason"] != "interrupted" {
+			t.Fatalf("native Codex interrupt event = %+v, want interrupted response resp-interrupted", interrupted)
+		}
+		nextCreate := map[string]any{"type": "response.create", "model": "fixture-summary", "previous_response_id": "resp-interrupted", "input": []any{map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "Continue after interrupt."}}}}}
+		nextCreateBody, err := json.Marshal(nextCreate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		recordBody("client-create-after-interrupt.json", nextCreateBody)
+		if err := connection.WriteMessage(websocket.TextMessage, nextCreateBody); err != nil {
+			t.Fatal(err)
+		}
+		upstreamNext := receiveNativeWebsocketRequest(t, requests)
+		recordBody("upstream-create-after-interrupt.json", upstreamNext)
+		var upstreamNextEvent map[string]any
+		if err := json.Unmarshal(upstreamNext, &upstreamNextEvent); err != nil || upstreamNextEvent["type"] != "response.create" {
+			t.Fatalf("native upstream continuation frame = %s, want response.create", upstreamNext)
+		}
+		if upstreamNextEvent["previous_response_id"] != nextCreate["previous_response_id"] {
+			t.Fatalf("native continuation lost response identity: %s", upstreamNext)
+		}
+		inputBody, err := json.Marshal(upstreamNextEvent["input"])
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantInputBody, err := json.Marshal(nextCreate["input"])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(inputBody, wantInputBody) {
+			t.Fatalf("native continuation changed input: %s", upstreamNext)
+		}
+		nextEvents := readNativeWebsocketResponse(t, connection)
+		nextEventsBody, err := json.Marshal(nextEvents)
+		if err != nil {
+			t.Fatal(err)
+		}
+		recordBody("client-response-after-interrupt.json", nextEventsBody)
+		completed := nativeCompletedResponse(t, nextEvents)
+		if completed["id"] != "resp-after-interrupt" || completed["status"] != "completed" {
+			t.Fatalf("native Codex continuation response = %+v", completed)
+		}
+		if got := connections.Load(); got != 1 {
+			t.Fatalf("native Codex interrupt/replay used %d upstream WebSocket connections, want 1", got)
+		}
 		if err := connection.Close(); err != nil {
 			t.Fatal(err)
 		}
@@ -103,23 +291,11 @@ func TestNativeHostResponseInterruptUnsupported(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("synthetic upstream reader did not terminate")
 		}
-		select {
-		case forwarded := <-requests:
-			t.Fatalf("host unexpectedly forwarded interrupt upstream: %s", forwarded)
-		default:
-		}
 	})
 }
 
-func assertNativeInterruptRejection(t *testing.T, connection *websocket.Conn, responseID string) {
+func readNativeInterruptEvent(t *testing.T, connection *websocket.Conn) (map[string]any, []byte) {
 	t.Helper()
-	request, err := json.Marshal(map[string]string{"type": "response.interrupt", "response_id": responseID, "mode": "discard_partial_items"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := connection.WriteMessage(websocket.TextMessage, request); err != nil {
-		t.Fatal(err)
-	}
 	if deadline, ok := t.Deadline(); ok {
 		if err := connection.SetReadDeadline(deadline.Add(-time.Second)); err != nil {
 			t.Fatal(err)
@@ -127,30 +303,28 @@ func assertNativeInterruptRejection(t *testing.T, connection *websocket.Conn, re
 	}
 	_, response, err := connection.ReadMessage()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("read Responses WebSocket event: %v", err)
 	}
-	var event struct {
-		Type   string `json:"type"`
-		Status int    `json:"status"`
-		Error  struct {
-			Message string `json:"message"`
-		} `json:"error"`
-	}
+	var event map[string]any
 	if err := json.Unmarshal(response, &event); err != nil {
-		t.Fatal(err)
+		t.Fatalf("decode Responses WebSocket event %s: %v", response, err)
 	}
-	if event.Type != "error" || event.Status != http.StatusBadRequest || event.Error.Message != "unsupported websocket request type: response.interrupt" {
-		t.Fatalf("unsupported interrupt response = %s", response)
-	}
-	if directory := liveDebugArtifactDirectory(t, "interrupt-body"); directory != "" {
-		for name, body := range map[string][]byte{"client-request.json": request, "client-response.json": response} {
-			if err := os.WriteFile(filepath.Join(directory, name), body, 0600); err != nil {
-				t.Fatal("could not retain synthetic interrupt wire bodies")
-			}
+	return event, response
+}
+
+func newNativeInterruptBodyRecorder(t *testing.T, prefix string) func(string, []byte) {
+	t.Helper()
+	directory := liveDebugArtifactDirectory(t, prefix)
+	return func(name string, body []byte) {
+		if directory == "" {
+			return
 		}
-		t.Logf("retained original synthetic interrupt wire bodies: %s", directory)
+		if err := os.WriteFile(filepath.Join(directory, name), body, 0600); err != nil {
+			t.Errorf("could not retain synthetic interrupt wire body %q: %v", name, err)
+			return
+		}
+		t.Logf("retained synthetic interrupt wire body %q: %s", name, directory)
 	}
-	t.Logf("diagnostic unsupported result; original client frame=%s original host error=%s", request, response)
 }
 
 func startNativeInterruptDiagnosticHost(t *testing.T, binary, upstream string, plugin bool) (string, func()) {

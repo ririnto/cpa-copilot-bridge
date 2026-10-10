@@ -8,7 +8,7 @@ For an end-to-end deployment and Claude Code configuration walkthrough, see
 To add only the plugin to an existing CLIProxyAPI installation, see
 [`docs/install-existing-deployment.md`](docs/install-existing-deployment.md).
 
-Initial, self-owned GitHub Copilot subscription provider for the official `router-for-me/CLIProxyAPI` v8.0.15 release (plugin ABI version 1).
+Initial, self-owned GitHub Copilot subscription provider for the official `router-for-me/CLIProxyAPI` v8.0.23 release (plugin ABI version 1).
 The repository also defines a strictly isolated Docker deployment that retains CLIProxyAPI's built-in Claude subscription OAuth support.
 
 This stack uses only:
@@ -17,7 +17,7 @@ This stack uses only:
 - host address: `127.0.0.1:8317`
 - auth volume: `cliproxyapi_official_copilot_dev_home`
 - repository-local config and plugin bind mounts
-- image: `eceasy/cli-proxy-api:v8.0.15`
+- image: `eceasy/cli-proxy-api:v8.0.23`
 
 It does not map ports 3458 or 54545 on the host.
 
@@ -59,7 +59,7 @@ Set `support-prompt-cache-key: false` in the plugin configuration to omit genera
 The plugin preserves explicit caller keys.
 Copilot's implicit cache lifetime can differ from Codex's.
 Responses compaction is optional and requires explicit configuration for the model.
-The official CLIProxyAPI v8.0.15 host supports both plugin compaction routes.
+The official CLIProxyAPI v8.0.23 host supports both plugin compaction routes.
 Claude token-count requests are estimated locally with the same O200k tokenizer
 approach used by CLIProxyAPI for translated Claude requests.
 The deployment lists model exclusions under CLIProxyAPI's native `oauth.excluded-models.copilot` setting.

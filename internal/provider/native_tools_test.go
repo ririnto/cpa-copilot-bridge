@@ -473,6 +473,12 @@ func TestNativeToolRepresentabilityFilter(t *testing.T) {
 	}{
 		{"openai-response", translate.EndpointChatCompletions, `{"tools":[{"type":"web_search"},{"type":"image_generation"},{"type":"function","name":"image_generation"}]}`, 1, false},
 		{"openai-response", translate.EndpointMessages, `{"tools":[{"type":"web_search","max_uses":2},{"type":"image_generation"}]}`, 1, false},
+		{"openai-response", translate.EndpointMessages, `{"tools":[{"type":"web_search","external_web_access":false}],"tool_choice":"auto"}`, 0, false},
+		{"openai-response", translate.EndpointMessages, `{"tools":[{"type":"web_search","external_web_access":false},{"type":"function","name":"lookup","parameters":{"type":"object"}}]}`, 1, false},
+		{"openai-response", translate.EndpointMessages, `{"tools":[{"type":"web_search","external_web_access":true}]}`, 1, false},
+		{"openai-response", translate.EndpointMessages, `{"tools":[{"type":"web_search","external_web_access":false}],"tool_choice":{"type":"web_search"}}`, 0, true},
+		{"openai-response", translate.EndpointMessages, `{"tools":[{"type":"web_search","external_web_access":false}],"tool_choice":{"type":"allowed_tools","mode":"auto","tools":[{"type":"web_search"}]}}`, 0, true},
+		{"openai-response", translate.EndpointMessages, `{"tools":[{"type":"web_search","external_web_access":false}],"tool_choice":"required"}`, 0, true},
 		{"openai-response", translate.EndpointResponses, `{"tools":[{"type":"web_search"},{"type":"image_generation"}]}`, 2, false},
 		{"claude", translate.EndpointResponses, `{"tools":[{"type":"web_search_20250305","name":"web_search"},{"name":"web_search","input_schema":{"type":"object"}}],"tool_choice":{"type":"tool","name":"web_search"}}`, 1, false},
 		{"openai-response", translate.EndpointChatCompletions, `{"tools":[{"type":"web_search"}],"tool_choice":"auto"}`, 0, false},

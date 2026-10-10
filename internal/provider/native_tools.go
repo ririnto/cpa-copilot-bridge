@@ -52,7 +52,7 @@ func filterUnrepresentableNativeTools(source, endpoint string, body []byte) ([]b
 				switch typ {
 				case "", "function", "custom", "namespace":
 				case "web_search", "web_search_preview":
-					unsupported = endpoint == translate.EndpointChatCompletions
+					unsupported = endpoint == translate.EndpointChatCompletions || endpoint == translate.EndpointMessages && tool.Get("external_web_access").Type == gjson.False
 				case "shell":
 					unsupported = endpoint == translate.EndpointMessages || endpoint == translate.EndpointChatCompletions && tool.Get("environment.type").String() != "local"
 				default:

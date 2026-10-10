@@ -254,10 +254,18 @@ The historical render and validator failures remain separate from the reviewed s
 
 The maintained original-client packet is opt-in through `CPA_LIVE_CLIENT_ATTACHMENTS=1`.
 It requires explicit isolated CPA binary/plugin, copied authentication, private diagnostics, sandbox and expected installed client versions.
-PDF cases additionally require the existing renderer, and Claude PDF preparation requires Fontconfig paths; fixture overrides must match the pinned source bytes.
+PDF cases additionally require the existing renderer and Fontconfig paths; fixture overrides must match the pinned source bytes.
 The offline `TestAttachmentOriginalClaudePDFReadOffline` probe exercises installed Claude Read against a loopback fixture without provider inference.
 The independently reviewed `TestAttachmentPacketCorrectedPDFReplay` reads retained evidence and writes a separate verdict without changing the original failure.
 Ordinary tests cover strict terminal schemas, ordered content-block lifecycles, successful renderer/result correlation, counted authentication recovery and capture failure retention.
+
+## CPA v8.0.23 Codex follow-up
+
+The earlier cached-only-search 422 is historical. The existing native-tool exclusion mechanism now excludes optional Responses search with `external_web_access=false` when targeting Messages, retaining ordinary functions and disclosing the exclusion. Forced excluded selection still fails before inference. Original request and paired response bodies are retained in a portable regression fixture; they do not establish clean EOF for the historical capture.
+
+The original Codex app-server was also run against the real isolated proxy with a loopback WebSocket recorder. Active interruption and a completed same-thread follow-up answer passed. The client closed the active socket and emitted no `response.interrupt` frame. The required native-host test separately exercises unchanged control-frame forwarding, plugin HTTP cancellation and same-socket continuation using CPA's existing implementation. After plugin forwarder cleanup, a late control frame remains unsupported.
+
+Codex PDF preparation keeps the original renderer and `view_image` tools. The original workspace-write CLI cannot launch nested Seatbelt inside the task-owned outer loopback-only sandbox. An alternate inner danger-full-access profile generates live search despite an explicit cached setting and receives the provider's HTTP 400. The installed CLI has no external-restricted sandbox mode, so the maintained packet retains workspace-write and full PDF completion remains unverified. Operating client settings remain unchanged. High image-detail semantics still have no verified lossless Messages representation.
 
 ## Native producer boundary
 

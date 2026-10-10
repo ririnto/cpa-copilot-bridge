@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/gorilla/websocket v1.5.3
-	github.com/router-for-me/CLIProxyAPI/v8 v8.0.15
+	github.com/router-for-me/CLIProxyAPI/v8 v8.0.23
 	github.com/tidwall/gjson v1.18.0
 	github.com/tidwall/sjson v1.2.5
 	github.com/tiktoken-go/tokenizer v0.8.1

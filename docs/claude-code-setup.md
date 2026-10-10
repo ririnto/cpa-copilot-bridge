@@ -95,7 +95,7 @@ Build the plugin shared library inside the pinned Go container:
 make build
 ```
 
-The Compose file pins the published CLIProxyAPI image tag `v8.0.15`.
+The Compose file pins the published CLIProxyAPI image tag `v8.0.23`.
 Compose pulls that image when it is absent locally.
 
 Start the stack. The `--env-file` flag passes the management password to the

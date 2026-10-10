@@ -6,9 +6,9 @@ REPO_DIR=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)
 TARGET_GOOS=${NATIVE_HOST_GOOS:-}
 TARGET_GOARCH=${NATIVE_HOST_GOARCH:-}
 HOST_MODULE=github.com/router-for-me/CLIProxyAPI/v8
-HOST_VERSION=v8.0.15
+HOST_VERSION=v8.0.23
 TEST_LIST_PATTERN='^(TestNativeHost|TestFilteredChildEnvironment)'
-REQUIRED_TESTS='TestNativeHostProtocolRoundTrips TestNativeHostOAuthContinuityPersistsAcrossRestart TestNativeHostOAuthExcludedModelsFilterPluginModels TestNativeHostOAuthSettingsOverrideCopilotModelContext TestFilteredChildEnvironment TestNativeHostCanonicalResponsesRouting TestNativeHostConfiguredCanonicalResponsesCompaction TestNativeHostPluginResponsesWebsocket'
+REQUIRED_TESTS='TestNativeHostProtocolRoundTrips TestNativeHostOAuthContinuityPersistsAcrossRestart TestNativeHostOAuthExcludedModelsFilterPluginModels TestNativeHostOAuthSettingsOverrideCopilotModelContext TestFilteredChildEnvironment TestNativeHostCanonicalResponsesRouting TestNativeHostConfiguredCanonicalResponsesCompaction TestNativeHostPluginResponsesWebsocket TestNativeHostResponseInterrupt'
 
 if [ -z "$TARGET_GOOS" ] || [ -z "$TARGET_GOARCH" ]; then
   case "$(uname -s)" in

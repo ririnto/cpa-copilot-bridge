@@ -160,7 +160,15 @@ Private values use placeholders while the protocol fields and events remain inta
 CPA's formatted SSE logs required reassembly at transport chunk boundaries; one lost instruction space was restored from the paired client response.
 Fixture notices record this reconstruction. Original diagnostics remain private and unchanged.
 
-## WebSocket interrupt limitation
+## CPA v8.0.23 compatibility follow-up
+
+The current host and SDK are pinned to v8.0.23. Existing CPA handling now cancels an active plugin HTTP stream on `response.interrupt`, emits `response.incomplete` with reason `interrupted`, and permits the next request on the same client WebSocket. Native Codex WebSocket sessions forward the original interrupt body unchanged and retain continuation identity. These paths have required synthetic native-host regressions. After the completed plugin HTTP forwarder has exited, a late interrupt still returns HTTP 400; the native Codex completed-session handling does not extend to the plugin executor.
+
+Codex Responses requests can declare optional `web_search` with `external_web_access: false`. When the selected endpoint is Claude Messages, the existing native-tool exclusion mechanism now removes this unrepresentable declaration and discloses it in `X-Copilot-Excluded-Native-Tools` and response metadata. Ordinary function tools remain intact. Forced selection of the excluded tool fails before inference. This does not implement cached-only search or change it to live web search.
+
+Original Codex 0.161.0 PNG and PDF requests were rerun with full private body captures. PNG still fails before inference because its `detail: high` has no verified lossless Claude Messages mapping. The PDF initial request now reaches the provider and returns an actual rendering function call; The existing strict cancellation proof now permits continuation after a fully forwarded function-call terminal while retaining the read-cancellation record. A subsequent original renderer attempt failed because nested Seatbelt could not launch shell commands. An alternate isolated `danger-full-access` attempt avoided nesting but changed the generated search declaration to `external_web_access=true`, even with an explicit cached-search setting; Copilot refused it with HTTP 400. Those failures and every physical call remain retained. The maintained packet keeps the original `workspace-write` profile and renderer/view tools. The installed CLI rejects an external-sandbox mode; the distinct app-server policy was not substituted for the original PDF CLI route. Full PDF rendering and attachment completion remain unverified. An isolated original app-server run through the real proxy also confirms that `turn/interrupt` ends an active turn and permits another turn in the same thread, but this client version closes its WebSocket without emitting `response.interrupt`. Synthetic wire-control coverage must not be presented as an original-client interrupt frame.
+
+## Historical WebSocket interrupt limitation
 
 The exact Codex `response.interrupt` frame is rejected by CPA before it reaches the plugin.
 Native diagnostics reproduce this for both plugin normalization and active upstream WebSocket duplex processing.
@@ -231,3 +239,5 @@ A native cooldown regression confirms that a repeated unsupported-model request 
 A broader supplemental native suite exposed an existing `TestNativeHostResponsesWebsocketCompactionReplay` failure involving instruction preservation.
 That supplemental failure remains outside this validation unit.
 Temporary client homes, authentication files, host configuration, and host processes were removed after the live checks.
+
+The follow-up recorded 11 additional inference, six authentication and six catalogue dispatches, bringing expanded totals to 38, 20 and 16. One alternate-profile retry occurred before the intended cached-setting edit matched the generated config; its repeated 400 and a separate private correction record are retained. These are measured counts, not limits.

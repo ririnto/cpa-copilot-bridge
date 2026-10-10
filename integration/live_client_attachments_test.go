@@ -148,7 +148,7 @@ func liveAttachmentArgs(candidate liveAttachmentCase, root string) ([]string, er
 }
 
 func liveAttachmentCodexConfiguration(base string) string {
-	return fmt.Sprintf("model = \"claude-haiku-5.5\"\nmodel_provider = \"task_proxy\"\n[model_providers.task_proxy]\nname = \"Task proxy\"\nbase_url = %q\nenv_key = \"TASK_PROXY_API_KEY\"\nwire_api = \"responses\"\nsupports_websockets = false\nrequest_max_retries = 0\nstream_max_retries = 0\n", base+"/v1")
+	return fmt.Sprintf("model = \"claude-haiku-5.5\"\nmodel_provider = \"task_proxy\"\nweb_search = \"cached\"\n[model_providers.task_proxy]\nname = \"Task proxy\"\nbase_url = %q\nenv_key = \"TASK_PROXY_API_KEY\"\nwire_api = \"responses\"\nsupports_websockets = false\nrequest_max_retries = 0\nstream_max_retries = 0\n", base+"/v1")
 }
 
 func liveAttachmentOperationCell(candidate liveAttachmentCase, attempt string) (string, error) {
@@ -225,9 +225,9 @@ func liveAttachmentSelectedCases(selection string) ([]liveAttachmentCase, error)
 func liveAttachmentChangedCondition(candidate liveAttachmentCase) string {
 	switch candidate.cell {
 	case "codex-claude-png":
-		return "removed invalid empty catalog override and placed prompt before greedy image flag"
+		return "CPA v8.0.23 host and explicit optional cached-only search exclusion; original high image detail remains unchanged"
 	case "codex-claude-pdf":
-		return "removed invalid empty catalog override"
+		return "CPA v8.0.23 host and explicit optional cached-only search exclusion; existing renderer and fonts with the original workspace-write CLI profile"
 	case "claude-gpt-pdf":
 		return "bound existing LibreOffice Fontconfig Helvetica resources and verified the original PDF Read JPEG page in the isolated child environment"
 	default:
@@ -283,7 +283,7 @@ func liveAttachmentRunCLI(t *testing.T, candidate liveAttachmentCase, base, root
 
 func liveAttachmentEnvironment(candidate liveAttachmentCase, base, root string) []string {
 	env := liveCLIEnvironment(candidate.client, base, root)
-	if candidate.client != "claude" || candidate.media != "pdf" {
+	if candidate.media != "pdf" {
 		return env
 	}
 	for index, value := range env {
@@ -400,8 +400,11 @@ func TestLiveCrossClientAttachmentsPacket(t *testing.T) {
 		}
 	}
 	fontConfigHash := ""
-	if rendererPageHashes["claude-gpt-pdf"] != "" {
-		fontConfigHash = livePacketFileSHA256(t, filepath.Join(attachmentMaintainedFonts, "fonts.conf"))
+	for _, candidate := range selected {
+		if candidate.media == "pdf" {
+			fontConfigHash = livePacketFileSHA256(t, filepath.Join(attachmentMaintainedFonts, "fonts.conf"))
+			break
+		}
 	}
 	expectedClaudeVersion := strings.TrimSpace(os.Getenv("CPA_LIVE_CLAUDE_EXPECTED_VERSION"))
 	if expectedClaudeVersion != "" && !regexp.MustCompile(`^\d+\.\d+\.\d+ \(Claude Code\)$`).MatchString(expectedClaudeVersion) {
@@ -507,7 +510,7 @@ func liveRunAttachmentCase(t *testing.T, gate *liveServerToolGate, base, packetD
 	if captureErr != nil || livePacketDeniedCount(gate) != 0 || !livePacketCatalogHasModel(readinessFromGate(t, gate), candidate.model) {
 		t.Fatal("candidate lost exact model or capture readiness")
 	}
-	livePacketWriteJSON(t, caseDirectory, "claim.json", map[string]any{"cell": cell, "prior_cell": "X/" + candidate.cell, "attempt": attempt, "changed_condition": liveAttachmentChangedCondition(candidate), "client": candidate.client, "model": candidate.model, "media": candidate.media, "original_fixture": candidate.fixture, "original_cli_args": args, "requested_effort": "medium", "expected_public_path": candidate.modelPath, "inference_before": before, "renderer_executable": map[bool]string{true: attachmentMaintainedPoppler, false: ""}[candidate.media == "pdf"], "renderer_sha256": rendererSHA, "fontconfig_file": map[bool]string{true: filepath.Join(attachmentMaintainedFonts, "fonts.conf"), false: ""}[candidate.cell == "claude-gpt-pdf"], "isolated_child_path": liveAttachmentPathValue(liveAttachmentEnvironment(candidate, base, root))})
+	livePacketWriteJSON(t, caseDirectory, "claim.json", map[string]any{"cell": cell, "prior_cell": "X/" + candidate.cell, "attempt": attempt, "changed_condition": liveAttachmentChangedCondition(candidate), "client": candidate.client, "model": candidate.model, "media": candidate.media, "original_fixture": candidate.fixture, "original_cli_args": args, "requested_effort": "medium", "expected_public_path": candidate.modelPath, "inference_before": before, "renderer_executable": map[bool]string{true: attachmentMaintainedPoppler, false: ""}[candidate.media == "pdf"], "renderer_sha256": rendererSHA, "fontconfig_file": map[bool]string{true: filepath.Join(attachmentMaintainedFonts, "fonts.conf"), false: ""}[candidate.media == "pdf"], "isolated_child_path": liveAttachmentPathValue(liveAttachmentEnvironment(candidate, base, root))})
 	phase, name, _ := strings.Cut(cell, "/")
 	if err := gate.setPhaseCell(phase, name); err != nil {
 		t.Fatal(err)
@@ -1216,7 +1219,8 @@ func inspectLiveOriginalClientAttachment(candidate liveAttachmentCase, captures 
 		requestURL, urlErr := url.Parse(capture.Request.URL)
 		var request map[string]any
 		parsed := json.Unmarshal([]byte(capture.Request.Body), &request) == nil
-		allIdentity = allIdentity && capture.Dispatched && capture.BodyComplete && capture.ErrorClass == "" && urlErr == nil && requestURL.Path == path && parsed && request["model"] == candidate.model
+		confirmedCancellation := capture.StreamOutcome == "semantic_complete_function_call_downstream_cancelled" && liveCompleteResponseFunctionCallTerminal([]byte(capture.Response.Body), candidate.model) && liveAttachmentIngressSemanticCancellation(capture, context.Canceled, context.Canceled)
+		allIdentity = allIdentity && capture.Dispatched && capture.BodyComplete && (capture.ErrorClass == "" || confirmedCancellation) && urlErr == nil && requestURL.Path == path && parsed && request["model"] == candidate.model
 		if candidate.client == "claude" {
 			config, _ := request["output_config"].(map[string]any)
 			allIdentity = allIdentity && config["effort"] == "medium"

@@ -22,12 +22,25 @@ import (
 )
 
 type liveAttachmentIngressCapture struct {
-	Sequence     int         `json:"sequence"`
-	Dispatched   bool        `json:"dispatched"`
-	Request      liveHTTPLog `json:"original_client_request"`
-	Response     liveHTTPLog `json:"local_host_response"`
-	ErrorClass   string      `json:"error_class,omitempty"`
-	BodyComplete bool        `json:"body_complete"`
+	Sequence                int         `json:"sequence"`
+	Dispatched              bool        `json:"dispatched"`
+	Request                 liveHTTPLog `json:"original_client_request"`
+	Response                liveHTTPLog `json:"local_host_response"`
+	ErrorClass              string      `json:"error_class,omitempty"`
+	BodyComplete            bool        `json:"body_complete"`
+	ResponseBodyComplete    bool        `json:"response_body_complete,omitempty"`
+	StreamReadErrorKind     string      `json:"stream_read_error_kind,omitempty"`
+	DownstreamContextState  string      `json:"downstream_context_state,omitempty"`
+	OutboundContextState    string      `json:"outbound_context_state,omitempty"`
+	StreamTerminalComplete  bool        `json:"stream_terminal_complete,omitempty"`
+	StreamTerminalFunction  bool        `json:"stream_terminal_function_call,omitempty"`
+	StreamTerminalForwarded bool        `json:"stream_terminal_forwarded,omitempty"`
+	StreamTerminalBytes     int         `json:"stream_terminal_bytes,omitempty"`
+	StreamForwardedBytes    int         `json:"stream_forwarded_bytes,omitempty"`
+	StreamFlushedBytes      int         `json:"stream_flushed_bytes,omitempty"`
+	StreamContextAtTerminal string      `json:"stream_context_at_terminal,omitempty"`
+	StreamOutcome           string      `json:"stream_outcome,omitempty"`
+	CaptureTruncated        bool        `json:"capture_truncated,omitempty"`
 }
 
 type liveAttachmentIngress struct {
@@ -110,7 +123,14 @@ func (i *liveAttachmentIngress) serveHTTP(writer http.ResponseWriter, request *h
 	const maxBody = 16 << 20
 	sequence, allowed := i.reserve(request.Method, request.URL.Path)
 	if !allowed {
-		capture := liveAttachmentIngressCapture{Sequence: sequence, Dispatched: false, Request: liveHTTPLog{Method: request.Method, URL: request.URL.String(), Host: request.Host, Proto: request.Proto, Headers: i.gate.redactedHeaders(request.Header), Body: "[DENIED BODY OMITTED]"}, Response: liveHTTPLog{Status: http.StatusForbidden}, ErrorClass: "original_client_path_not_prepared"}
+		body, readErr := io.ReadAll(io.LimitReader(request.Body, maxBody+1))
+		complete := readErr == nil && len(body) <= maxBody
+		retained := body[:min(len(body), maxBody)]
+		responseBody := []byte("original client path was not prepared\n")
+		capture := liveAttachmentIngressCapture{Sequence: sequence, Dispatched: false, Request: liveHTTPLog{Method: request.Method, URL: request.URL.String(), Host: request.Host, Proto: request.Proto, Headers: i.gate.redactedHeaders(request.Header), Body: i.gate.redactedBody(retained), ContentLength: request.ContentLength, ContentEncoding: request.Header.Get("Content-Encoding"), TransferEncoding: append([]string(nil), request.TransferEncoding...)}, Response: liveHTTPLog{Status: http.StatusForbidden, Body: i.gate.redactedBody(responseBody)}, ErrorClass: "original_client_path_not_prepared", BodyComplete: complete, ResponseBodyComplete: true}
+		if !complete {
+			i.fail(errors.New("original client denied request body capture was incomplete"))
+		}
 		if err := i.persist(capture); err != nil {
 			i.fail(errors.New("original client denial capture was not durable"))
 		}
@@ -164,6 +184,12 @@ func (i *liveAttachmentIngress) serveHTTP(writer http.ResponseWriter, request *h
 	capture.Response = liveHTTPLog{Proto: response.Proto, Status: response.StatusCode, Headers: i.gate.redactedHeaders(response.Header), ContentLength: response.ContentLength, ContentEncoding: response.Header.Get("Content-Encoding"), TransferEncoding: append([]string(nil), response.TransferEncoding...)}
 	var retained bytes.Buffer
 	chunk := make([]byte, 32<<10)
+	var requestModel struct {
+		Model string `json:"model"`
+	}
+	_ = json.Unmarshal(body, &requestModel)
+	streamEndedCleanly := false
+	forwardedBytes, flushedBytes := 0, 0
 	for {
 		n, readErr := response.Body.Read(chunk)
 		if n > 0 {
@@ -172,31 +198,144 @@ func (i *liveAttachmentIngress) serveHTTP(writer http.ResponseWriter, request *h
 				retained.Write(chunk[:min(n, remaining)])
 			}
 			if n > remaining {
-				capture.BodyComplete = false
+				capture.CaptureTruncated = true
 				i.fail(errors.New("original client response capture was truncated"))
 			}
-			if _, writeErr := writer.Write(chunk[:n]); writeErr != nil {
+			if !capture.CaptureTruncated && requestModel.Model != "" && liveCompleteResponseFunctionCallTerminal(retained.Bytes(), requestModel.Model) {
+				capture.StreamTerminalComplete = true
+				capture.StreamTerminalFunction = true
+				if capture.StreamTerminalBytes == 0 {
+					capture.StreamTerminalBytes = retained.Len()
+					capture.StreamContextAtTerminal = liveSafeStreamReadErrorKind(request.Context().Err())
+				}
+			}
+			written, writeErr := writer.Write(chunk[:n])
+			forwardedBytes += written
+			if writeErr != nil || written != n {
 				capture.ErrorClass = "original_client_response_write_error"
 				i.fail(errors.New("original client response write failed"))
 				break
 			}
 			if flusher, ok := writer.(http.Flusher); ok {
 				flusher.Flush()
+				flushedBytes = forwardedBytes
+			}
+			if capture.StreamTerminalComplete && capture.StreamContextAtTerminal == "active" && flushedBytes >= capture.StreamTerminalBytes && !capture.CaptureTruncated {
+				capture.StreamTerminalForwarded = true
 			}
 		}
 		if readErr == io.EOF {
+			streamEndedCleanly = true
 			break
 		}
 		if readErr != nil {
 			capture.ErrorClass = "local_host_response_read_error"
-			i.fail(errors.New("original client local host response read failed"))
+			capture.StreamReadErrorKind = liveSafeStreamReadErrorKind(readErr)
+			capture.DownstreamContextState = liveSafeStreamReadErrorKind(request.Context().Err())
+			capture.OutboundContextState = liveSafeStreamReadErrorKind(forward.Context().Err())
 			break
 		}
 	}
+	capture.ResponseBodyComplete = streamEndedCleanly && !capture.CaptureTruncated
+	capture.StreamForwardedBytes = forwardedBytes
+	capture.StreamFlushedBytes = flushedBytes
+	capture.StreamTerminalForwarded = capture.StreamTerminalForwarded && capture.StreamTerminalComplete && forwardedBytes >= capture.StreamTerminalBytes && flushedBytes >= capture.StreamTerminalBytes && !capture.CaptureTruncated
+	liveAttachmentIngressConfirmFinalTerminal(&capture, retained.Bytes(), requestModel.Model)
 	capture.Response.Body = i.gate.redactedBody(retained.Bytes())
+	switch {
+	case capture.ErrorClass == "local_host_response_read_error" && liveAttachmentIngressSemanticCancellation(capture, request.Context().Err(), forward.Context().Err()):
+		capture.StreamOutcome = "semantic_complete_function_call_downstream_cancelled"
+	case streamEndedCleanly && capture.ErrorClass == "" && !capture.CaptureTruncated:
+		capture.StreamOutcome = "clean_eof"
+	case capture.ErrorClass != "":
+		capture.StreamOutcome = "unconfirmed_stream_failure"
+		i.fail(errors.New("original client local host response read failed"))
+	case capture.CaptureTruncated:
+		capture.StreamOutcome = "unconfirmed_stream_failure"
+	default:
+		capture.StreamOutcome = "unconfirmed_stream_failure"
+		i.fail(errors.New("original client local host response did not reach a confirmed terminal"))
+	}
 	if err := i.persist(capture); err != nil {
 		i.fail(errors.New("original client response capture was not durable"))
 	}
+}
+
+func liveAttachmentIngressConfirmFinalTerminal(capture *liveAttachmentIngressCapture, body []byte, expectedModel string) {
+	if capture == nil {
+		return
+	}
+	if capture.CaptureTruncated || !liveCompleteResponseFunctionCallTerminal(body, expectedModel) {
+		capture.StreamTerminalComplete = false
+		capture.StreamTerminalFunction = false
+		capture.StreamTerminalForwarded = false
+		capture.StreamTerminalBytes = 0
+		capture.StreamContextAtTerminal = ""
+		return
+	}
+	capture.StreamTerminalComplete = true
+	capture.StreamTerminalFunction = true
+}
+
+func liveAttachmentIngressSemanticCancellation(capture liveAttachmentIngressCapture, downstream, outbound error) bool {
+	if capture.ErrorClass != "local_host_response_read_error" || !capture.BodyComplete || capture.ResponseBodyComplete || !capture.StreamTerminalFunction || capture.Response.Status < 200 || capture.Response.Status >= 300 || capture.DownstreamContextState != "context_canceled" || capture.OutboundContextState != "context_canceled" {
+		return false
+	}
+	proof := liveServerToolCapture{
+		ErrorClass:              "upstream_response_read_error",
+		StreamReadErrorKind:     capture.StreamReadErrorKind,
+		DownstreamContextState:  capture.DownstreamContextState,
+		OutboundContextState:    capture.OutboundContextState,
+		StreamTerminalComplete:  capture.StreamTerminalComplete,
+		StreamTerminalForwarded: capture.StreamTerminalForwarded,
+		StreamTerminalBytes:     capture.StreamTerminalBytes,
+		StreamForwardedBytes:    capture.StreamForwardedBytes,
+		StreamFlushedBytes:      capture.StreamFlushedBytes,
+		StreamContextAtTerminal: capture.StreamContextAtTerminal,
+		CaptureTruncated:        capture.CaptureTruncated,
+	}
+	return liveSemanticDownstreamCancellation(proof, downstream, outbound)
+}
+
+func liveCompleteResponseFunctionCallTerminal(body []byte, expectedModel string) bool {
+	if expectedModel == "" || !liveCompleteResponseTerminal(body, expectedModel) {
+		return false
+	}
+	normalized := bytes.ReplaceAll(body, []byte("\r\n"), []byte("\n"))
+	frames := bytes.Split(bytes.TrimRight(normalized, "\n"), []byte("\n\n"))
+	if len(frames) == 0 {
+		return false
+	}
+	lastFrame := len(frames) - 1
+	for lastFrame >= 0 && len(bytes.TrimSpace(frames[lastFrame])) == 0 {
+		lastFrame--
+	}
+	if lastFrame < 0 {
+		return false
+	}
+	var data string
+	for _, line := range bytes.Split(frames[lastFrame], []byte("\n")) {
+		if bytes.HasPrefix(line, []byte("data:")) {
+			data = strings.TrimSpace(string(bytes.TrimPrefix(line, []byte("data:"))))
+		}
+	}
+	var event struct {
+		Response struct {
+			Output []struct {
+				Type   string `json:"type"`
+				Status string `json:"status"`
+			} `json:"output"`
+		} `json:"response"`
+	}
+	if json.Unmarshal([]byte(data), &event) != nil {
+		return false
+	}
+	for _, item := range event.Response.Output {
+		if item.Type == "function_call" && item.Status == "completed" {
+			return true
+		}
+	}
+	return false
 }
 
 func (i *liveAttachmentIngress) persist(capture liveAttachmentIngressCapture) error {
@@ -256,7 +395,8 @@ func (i *liveAttachmentIngress) captures() ([]liveAttachmentIngressCapture, erro
 func TestAttachmentIngressRejectsUnpreparedPathsBeforeForwarding(t *testing.T) {
 	gate := newLiveServerToolGate(t, t.TempDir())
 	ingress := newLiveAttachmentIngress(t, gate, "http://127.0.0.1:1", t.TempDir(), "claude")
-	request, err := http.NewRequestWithContext(context.Background(), http.MethodPost, ingress.URL()+"/v1/responses", strings.NewReader(`{"model":"gpt-6-luna"}`))
+	requestBody := `{"model":"gpt-6-luna","tools":[{"type":"file_search"}]}`
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodPost, ingress.URL()+"/v1/responses", strings.NewReader(requestBody))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,9 +408,227 @@ func TestAttachmentIngressRejectsUnpreparedPathsBeforeForwarding(t *testing.T) {
 	if response.StatusCode != http.StatusForbidden {
 		t.Fatal("unprepared original-client path was forwarded")
 	}
+	responseBody, err := io.ReadAll(response.Body)
+	if err != nil || string(responseBody) != "original client path was not prepared\n" {
+		t.Fatal("unprepared original-client denial response body was not preserved")
+	}
 	denials, _ := ingress.state()
 	if denials != 1 {
 		t.Fatal("unprepared original-client path was not counted")
+	}
+	captures, err := ingress.captures()
+	if err != nil || len(captures) != 1 || captures[0].Dispatched || !captures[0].BodyComplete || !captures[0].ResponseBodyComplete || captures[0].Request.Body != gate.redactedBody([]byte(requestBody)) || captures[0].Response.Body != gate.redactedBody(responseBody) {
+		t.Fatal("denied original-client request and response bodies were not fully retained")
+	}
+}
+
+func TestAttachmentIngressContinuesAfterForwardedFunctionCallTerminalCancellation(t *testing.T) {
+	gate := newLiveServerToolGate(t, t.TempDir())
+	ingress := newLiveAttachmentIngress(t, gate, "http://127.0.0.1:1", t.TempDir(), "codex")
+	terminal := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"object\":\"response\",\"status\":\"completed\",\"model\":\"claude-haiku-5.5\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1},\"output\":[{\"type\":\"function_call\",\"status\":\"completed\",\"name\":\"Read\",\"call_id\":\"fixture-call\",\"arguments\":\"{\\\"file_path\\\":\\\"fixture.pdf\\\"}\"}]}}\n\n"
+	var calls atomic.Int32
+	ingress.client.Transport = liveToolRoundTrip(func(request *http.Request) (*http.Response, error) {
+		if calls.Add(1) == 1 {
+			reader, writer := io.Pipe()
+			go func() {
+				if _, err := io.WriteString(writer, terminal); err != nil {
+					return
+				}
+				<-request.Context().Done()
+				_ = writer.CloseWithError(request.Context().Err())
+			}()
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: reader, ContentLength: -1}, nil
+		}
+		return &http.Response{StatusCode: http.StatusNoContent, Header: make(http.Header), Body: http.NoBody, ContentLength: 0}, nil
+	})
+	firstBody := `{"model":"claude-haiku-5.5","stream":true}`
+	ctx, cancel := context.WithCancel(context.Background())
+	firstRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, ingress.URL()+"/v1/responses", strings.NewReader(firstBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstResponse, err := http.DefaultClient.Do(firstRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forwardedTerminal := make([]byte, len(terminal))
+	if _, err := io.ReadFull(firstResponse.Body, forwardedTerminal); err != nil || string(forwardedTerminal) != terminal {
+		cancel()
+		_ = firstResponse.Body.Close()
+		t.Fatal("function_call terminal was not fully forwarded before cancellation")
+	}
+	cancel()
+	_ = firstResponse.Body.Close()
+
+	var captures []liveAttachmentIngressCapture
+	var captureErr error
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		captures, captureErr = ingress.captures()
+		if captureErr == nil && len(captures) == 1 && captures[0].ErrorClass == "local_host_response_read_error" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if captureErr != nil || len(captures) != 1 {
+		t.Fatal("cancelled function_call response was not captured")
+	}
+	first := captures[0]
+	if !first.Dispatched || !first.BodyComplete || first.ResponseBodyComplete || first.ErrorClass != "local_host_response_read_error" || first.StreamReadErrorKind != "context_canceled" || first.StreamOutcome != "semantic_complete_function_call_downstream_cancelled" || !first.StreamTerminalComplete || !first.StreamTerminalFunction || !first.StreamTerminalForwarded || first.StreamContextAtTerminal != "active" || first.Response.Body != gate.redactedBody([]byte(terminal)) {
+		t.Fatal("function_call cancellation was mislabeled as clean EOF or its full body was not retained")
+	}
+	denials, failure := ingress.state()
+	if denials != 0 || failure != nil {
+		t.Fatal("proven function_call continuation was blocked")
+	}
+
+	secondRequest, err := http.NewRequest(http.MethodPost, ingress.URL()+"/v1/responses", strings.NewReader(firstBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondResponse, err := http.DefaultClient.Do(secondRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = secondResponse.Body.Close()
+	if secondResponse.StatusCode != http.StatusNoContent || calls.Load() != 2 {
+		t.Fatal("second original-client turn did not reach the local host")
+	}
+	captures, captureErr = ingress.captures()
+	if captureErr != nil || len(captures) != 2 || !captures[1].Dispatched || !captures[1].BodyComplete || !captures[1].ResponseBodyComplete || captures[1].ErrorClass != "" {
+		t.Fatal("second original-client turn was not retained as a complete local-host response")
+	}
+}
+
+func TestAttachmentIngressSemanticCancellationRejectsUnknownOrPartialFailures(t *testing.T) {
+	good := liveAttachmentIngressCapture{
+		BodyComplete: true, ErrorClass: "local_host_response_read_error", StreamReadErrorKind: "context_canceled",
+		DownstreamContextState: "context_canceled", OutboundContextState: "context_canceled", StreamTerminalComplete: true,
+		StreamTerminalFunction: true, StreamTerminalForwarded: true, StreamTerminalBytes: 10, StreamForwardedBytes: 10,
+		StreamFlushedBytes: 10, StreamContextAtTerminal: "active", Response: liveHTTPLog{Status: http.StatusOK},
+	}
+	if !liveAttachmentIngressSemanticCancellation(good, context.Canceled, context.Canceled) {
+		t.Fatal("fully framed and forwarded function_call cancellation was rejected")
+	}
+	for _, test := range []struct {
+		name       string
+		capture    liveAttachmentIngressCapture
+		downstream error
+		outbound   error
+	}{
+		{"partial", func() liveAttachmentIngressCapture { c := good; c.StreamTerminalComplete = false; return c }(), context.Canceled, context.Canceled},
+		{"not-function-call", func() liveAttachmentIngressCapture { c := good; c.StreamTerminalFunction = false; return c }(), context.Canceled, context.Canceled},
+		{"not-forwarded", func() liveAttachmentIngressCapture { c := good; c.StreamTerminalForwarded = false; return c }(), context.Canceled, context.Canceled},
+		{"truncated", func() liveAttachmentIngressCapture { c := good; c.CaptureTruncated = true; return c }(), context.Canceled, context.Canceled},
+		{"response-body-complete", func() liveAttachmentIngressCapture { c := good; c.ResponseBodyComplete = true; return c }(), context.Canceled, context.Canceled},
+		{"request-body-incomplete", func() liveAttachmentIngressCapture { c := good; c.BodyComplete = false; return c }(), context.Canceled, context.Canceled},
+		{"timeout", func() liveAttachmentIngressCapture {
+			c := good
+			c.StreamReadErrorKind = "context_deadline_exceeded"
+			return c
+		}(), context.DeadlineExceeded, context.DeadlineExceeded},
+		{"unexpected-eof", func() liveAttachmentIngressCapture { c := good; c.StreamReadErrorKind = "unexpected_eof"; return c }(), io.ErrUnexpectedEOF, io.ErrUnexpectedEOF},
+		{"other-read-error", func() liveAttachmentIngressCapture { c := good; c.StreamReadErrorKind = "other_read_error"; return c }(), errors.New("fixture"), errors.New("fixture")},
+		{"downstream-active", good, nil, context.Canceled},
+		{"outbound-active", good, context.Canceled, nil},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if liveAttachmentIngressSemanticCancellation(test.capture, test.downstream, test.outbound) {
+				t.Fatal("partial, unknown, timeout, or contradictory stream failure was accepted")
+			}
+		})
+	}
+}
+
+func TestAttachmentIngressCancellationRequiresStrictFinalFunctionCallTerminal(t *testing.T) {
+	terminal := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"object\":\"response\",\"status\":\"completed\",\"model\":\"claude-haiku-5.5\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1},\"output\":[{\"type\":\"function_call\",\"status\":\"completed\",\"name\":\"Read\",\"call_id\":\"fixture-call\",\"arguments\":\"{\\\"file_path\\\":\\\"fixture.pdf\\\"}\"}]}}\n\n"
+	incomplete := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"object\":\"response\",\"status\":\"incomplete\",\"model\":\"claude-haiku-5.5\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1},\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[]}}\n\n"
+	for _, test := range []struct {
+		name string
+		tail string
+	}{
+		{name: "error-event", tail: "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"fixture\"}}\n\n"},
+		{name: "incomplete-terminal", tail: incomplete},
+		{name: "partial-trailing-frame", tail: "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"object\":\"response\",\"status\":\"completed\"}"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			gate := newLiveServerToolGate(t, t.TempDir())
+			ingress := newLiveAttachmentIngress(t, gate, "http://127.0.0.1:1", t.TempDir(), "codex")
+			var calls atomic.Int32
+			ingress.client.Transport = liveToolRoundTrip(func(request *http.Request) (*http.Response, error) {
+				if calls.Add(1) != 1 {
+					return nil, errors.New("unexpected local host request")
+				}
+				reader, writer := io.Pipe()
+				go func() {
+					if _, err := io.WriteString(writer, terminal); err != nil {
+						return
+					}
+					if _, err := io.WriteString(writer, test.tail); err != nil {
+						return
+					}
+					<-request.Context().Done()
+					_ = writer.CloseWithError(request.Context().Err())
+				}()
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: reader, ContentLength: -1}, nil
+			})
+			requestBody := `{"model":"claude-haiku-5.5","stream":true}`
+			ctx, cancel := context.WithCancel(context.Background())
+			request, err := http.NewRequestWithContext(ctx, http.MethodPost, ingress.URL()+"/v1/responses", strings.NewReader(requestBody))
+			if err != nil {
+				t.Fatal(err)
+			}
+			response, err := http.DefaultClient.Do(request)
+			if err != nil {
+				cancel()
+				t.Fatal(err)
+			}
+			wantBody := terminal + test.tail
+			forwarded := make([]byte, len(wantBody))
+			if _, err := io.ReadFull(response.Body, forwarded); err != nil || string(forwarded) != wantBody {
+				cancel()
+				_ = response.Body.Close()
+				t.Fatal("fixture terminal and trailing bytes were not fully forwarded")
+			}
+			cancel()
+			_ = response.Body.Close()
+
+			var captures []liveAttachmentIngressCapture
+			var captureErr error
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) {
+				captures, captureErr = ingress.captures()
+				if captureErr == nil && len(captures) == 1 && captures[0].ErrorClass == "local_host_response_read_error" {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if captureErr != nil || len(captures) != 1 {
+				t.Fatal("cancelled response with trailing bytes was not captured")
+			}
+			capture := captures[0]
+			if capture.StreamOutcome != "unconfirmed_stream_failure" || capture.StreamReadErrorKind != "context_canceled" || capture.ResponseBodyComplete || capture.StreamTerminalComplete || capture.StreamTerminalFunction || capture.StreamTerminalForwarded || capture.StreamTerminalBytes != 0 || capture.StreamContextAtTerminal != "" || capture.Response.Body != gate.redactedBody([]byte(wantBody)) {
+				t.Fatal("a terminal followed by error, incomplete, or partial trailing data retained sticky terminal proof")
+			}
+			denials, failure := ingress.state()
+			if denials != 0 || failure == nil {
+				t.Fatal("invalid trailing stream was allowed to continue")
+			}
+
+			second, err := http.NewRequest(http.MethodPost, ingress.URL()+"/v1/responses", strings.NewReader(requestBody))
+			if err != nil {
+				t.Fatal(err)
+			}
+			secondResponse, err := http.DefaultClient.Do(second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _ = io.Copy(io.Discard, secondResponse.Body)
+			_ = secondResponse.Body.Close()
+			if secondResponse.StatusCode != http.StatusForbidden || calls.Load() != 1 {
+				t.Fatal("invalid trailing stream did not fail closed before the next local host dispatch")
+			}
+		})
 	}
 }
 
